@@ -1,140 +1,217 @@
 # KG-ProWeight
 
-> **Adaptive Process Supervision for Agentic RAG via Knowledge-Graph-Constrained Distillation and Dynamic Confidence Weighting.**
+> **Knowledge Graph-Anchored Process Rewards for Multi-Hop Retrieval-Augmented Generation**
+>
+> Three-phase training framework: Teacher Distillation → α-Gate → PPO with KG-verified process rewards.
 
-Reference implementation accompanying the paper *KG-ProWeight*. The repository
-provides:
-
-1. A self-contained Python package `kgproweight` that implements every method
-   component described in [`docs/paper_design.md`](docs/paper_design.md).
-2. A reproducible end-to-end pipeline (Phase 1 / Phase 2 / Phase 3) that runs
-   on a single **RTX PRO 6000 Blackwell (96 GB)** GPU in `bf16`.
-3. Evaluation runners for all baselines under a unified hybrid retrieval
-   (E5 + BM25 → RRF top-50) configuration, together with the paper's ablation
-   studies and rigorous-extension experiments (IHR LLM-as-Judge, multi-seed
-   significance testing, data efficiency curve, theorem-2 empirical
-   verification, α distribution analysis).
-
-The legacy implementation lives in [`../kg2`](../kg2) (operational guide only —
-do **not** depend on it for new experiments). This refactor preserves every
-result-producing component while:
-
-- fixing 14 semantic bugs documented in [`docs/refactor_notes.md`](docs/refactor_notes.md);
-- enforcing a single prompt schema across Teacher / SFT / PPO / inference;
-- adding the rigour pieces required by the paper (LLM-as-Judge IHR, paired
-  bootstrap, multi-seed, data-efficiency curve, theorem-2 variance log).
+Reference implementation for the KG-ProWeight paper. Provides an end-to-end pipeline for multi-hop RAG with knowledge-graph-grounded reinforcement learning.
 
 ---
 
-## 1. Quickstart (Pro 6000 Blackwell · 96 GB)
+## Quickstart
 
 ```bash
-# 1) Clone (and FlashRAG, an external dependency)
-git clone <your repo url> kgpaper
-cd kgpaper
-git clone https://github.com/RUC-NLPIR/FlashRAG.git third_party/FlashRAG
-
-# 2) Create env & install deps
-conda create -n kgpw python=3.10 -y && conda activate kgpw
-pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124
-pip install -e third_party/FlashRAG
+git clone <this-repo> kgpaper && cd kgpaper
+pip install -e flashrag_src
 pip install -e ".[dev]"
+```
 
-# 3) Environment variables (see .env.example)
+### Environment
+
+```bash
+export PYTHONPATH=$(pwd):$(pwd)/flashrag_src
 export KGPW_PROJECT_ROOT=$(pwd)
 export KGPW_DATA_DIR=$KGPW_PROJECT_ROOT/data
 export KGPW_INDEX_DIR=$KGPW_PROJECT_ROOT/indexes
 export KGPW_CHECKPOINT_DIR=$KGPW_PROJECT_ROOT/checkpoints
 export KGPW_OUTPUT_DIR=$KGPW_PROJECT_ROOT/outputs
-export KGPW_FLASHRAG_ROOT=$KGPW_PROJECT_ROOT/third_party/FlashRAG
-export KGPW_LLAMA3_PATH=meta-llama/Meta-Llama-3-8B-Instruct
-export KGPW_E5_PATH=intfloat/e5-base-v2
-export KGPW_REARAG_PATH=THU-KEG/ReaRAG-9B
-export OPENAI_API_KEY=sk-...   # required for IHR LLM-as-Judge
-export DEEPSEEK_API_KEY=sk-... # optional Teacher backend
+export KGPW_FLASHRAG_ROOT=$KGPW_PROJECT_ROOT/flashrag_src
 
-# 4) Build corpora and indices (one-time)
-make prepare-corpus
-make build-dense-index            # ~6h on Pro 6000 96GB
-make build-bm25-index             # ~1h
-make download-datasets
-
-# 5) End-to-end training (Phase 1 → 2 → 3)
-make phase1                       # ~6h with --max_workers 8 (DeepSeek-V3 backend)
-make phase2                       # ~3h
-make phase3-sft                   # ~2h
-make phase3-ppo                   # ~10h
-
-# 6) Evaluation
-make dropout                      # build D_dropout robustness set
-make eval-baselines               # ~24h serial; can parallelise across GPUs
-make eval-kgpw                    # 4 datasets + d_dropout
-make eval-ablations               # five paper ablations
-
-# 7) Rigor extensions
-make rigor-ihr                    # GPT-4o IHR + Cohen κ vs heuristic
-make rigor-data-eff               # F1-vs-N learning curve
-make rigor-variance               # advantage variance under fixed vs dynamic α
-
-# 8) Aggregate paper artefacts
-make summarize
+# Model paths (auto-detected from project_root/models/ or env vars)
+export KGPW_LLAMA3_PATH=/path/to/llama3-8b
+export KGPW_REARAG_PATH=/path/to/rearag-9b
 ```
 
-All outputs land under `outputs/` and `checkpoints/`; both directories are
-gitignored.
+Model paths are resolved automatically: checks `$PROJECT_ROOT/models/`, then `/root/autodl-tmp/models/`, then HuggingFace.
 
 ---
 
-## 2. Project structure
+## Training
+
+### Phase 1: Generate Silver Data (Teacher LLM → Wikidata-verified trajectories)
+
+```bash
+python scripts/train/phase1_generate_silver.py \
+  --config configs/training/phase1_silver.yaml \
+  --max_queries 25000 \
+  --teacher_model deepseek-chat
+```
+
+Produces `data/silver_data/silver_trajectories.jsonl` with three-valued labels (+1/-1/0).
+
+### Phase 2: Train α-Gate and PRM
+
+```bash
+python scripts/train/phase2_train_prm.py \
+  --config configs/training/phase2_prm.yaml \
+  --silver_path data/silver_data/silver_trajectories.jsonl
+```
+
+Trains process reward model and `alpha_gate.pt` in `checkpoints/prm_alpha_gate/`.
+
+### Phase 3a: Supervised Fine-Tuning (SFT)
+
+```bash
+python scripts/train/phase3_sft.py \
+  --config configs/training/phase3_sft.yaml \
+  --silver_path data/silver_data/silver_trajectories.jsonl \
+  --output_dir checkpoints/sft_student
+```
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `base_model` | llama3-8B-instruct | |
+| `lora_r` | 32 | LoRA rank |
+| `lora_alpha` | 64 | |
+| `learning_rate` | 2e-4 | |
+| `num_epochs` | 3 | |
+| `batch_size` | 4 | per-device |
+| `max_seq_length` | 4096 | |
+| `grad_accum` | 4 | effective batch = 16 |
+
+**Elite SFT variant** (2,000 quality-filtered samples): `checkpoints/sft_student_elite/final`
+
+**Full SFT** (all 9,839 silver samples): `checkpoints/sft_student/final`
+
+### Phase 3b: PPO with KG-Anchored Process Reward
+
+```bash
+python scripts/train/phase3_ppo.py \
+  --config configs/training/phase3_ppo.yaml \
+  --sft_checkpoint checkpoints/sft_student_elite/final \
+  --output_dir outputs/r8_experiment
+```
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `base_model` | llama3-8B-instruct | |
+| `lora_r` | 32 | LoRA rank |
+| `lora_alpha` | 64 | |
+| `learning_rate` | 1e-5 | PPO learning rate |
+| `batch_size` | 8 | Rollout batch size |
+| `mini_batch_size` | 1 | PPO mini-batch |
+| `ppo_epochs` | 4 | Epochs per batch |
+| `kl_coef` | 0.1 | Initial KL penalty |
+| `target_kl` | 8.0 | Adaptive KL controller target |
+| `kl_horizon` | 2000.0 | KL controller horizon |
+| `gamma` | 0.95 | Discount factor |
+| `lam` | 0.95 | GAE lambda |
+| `cliprange` | 0.2 | PPO clip |
+| `max_grad_norm` | 1.0 | |
+| `total_ppo_steps` | 2000 | Total trajectories seen |
+| `save_every_steps` | 500 | Checkpoint interval |
+| `max_new_tokens` | 384 | Generation length |
+| `temperature` | 1.0 | Rollout sampling |
+| `top_p` | 1.0 | No truncation (must match TRL) |
+| `max_input_length` | 6144 | Prompt truncation |
+
+**Reward parameters:**
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `outcome_weight` | 10.0 | EM bonus for correct answer |
+| `text_reward_scale` | 0.3 | Scale down ReaRAG text reward noise |
+| `min_valid_steps` | 1 | Min steps for trajectory validity |
+| `min_reasoning_chars` | 20 | Content-aware gate (R8) |
+| `sft_anchor_weight` | 0.05 | SFT anchor loss weight |
+| `sft_anchor_interval` | 10 | Anchor every N PPO steps |
+| `sft_replay_ratio` | 0.15 | SFT prompts in PPO batch (R8) |
+
+**Reward formula:**
+```
+R_t = α_t · R_KG(t) + (1-α_t) · R_text(t) · text_reward_scale
+
+Last step bonus (conditional on ValidTrajectory):
+  + outcome_weight × EM(pred, gold)  if trajectory valid
+  + 0                                 otherwise
+```
+
+**ValidTrajectory criteria (R8):**
+- ≥ `min_valid_steps` parsed `[Step N]` blocks
+- Extractable `[Final Answer]`
+- Sequential step indices
+- Non-empty text per step
+- **Reasoning content ≥ `min_reasoning_chars` characters per step** (content gate)
+
+---
+
+## Evaluation
+
+```bash
+# Single dataset × seed
+python scripts/eval/run_kg_proweight.py \
+  --checkpoint checkpoints/kg_proweight_R7B/final \
+  --datasets hotpotqa --seeds 42 --test_sample_num 100 \
+  --save_root outputs/eval --gpu_id 0
+
+# IHR (LLM-as-Judge)
+python scripts/eval/run_ihr_judge.py \
+  --predictions outputs/eval/<run>/intermediate_data.json \
+  --judge_model deepseek-chat --sample 200
+```
+
+See `docs/baselines.md` for full baseline comparison results.
+
+---
+
+## Monitoring (TensorBoard)
+
+```bash
+tensorboard --logdir outputs/<run>/tensorboard --port 6006 --bind_all
+```
+
+Key metrics:
+
+| Panel | Metric | Healthy range |
+|-------|--------|---------------|
+| `custom/mean_reward` | Average trajectory reward | 1.0–8.0 |
+| `custom/valid_rate` | Trajectory validity rate | 40–80% |
+| `custom/kl_divergence` | KL divergence | 0.5–20 |
+| `custom/clip_fraction` | PPO clip fraction | 0.05–0.30 |
+| `custom/sft_anchor_loss` | SFT anchor CE loss | 1–10 |
+| `r8/reasoning_content_rate` | Steps with content | > 60% |
+| `r8/step_rate` | Step-structured outputs | > 70% |
+
+---
+
+## Project Structure
 
 ```
 kgpaper/
-├── kgproweight/              # importable Python package
-│   ├── config/               # YAML+CLI loader + pydantic schemas
-│   ├── kg/                   # entity linker / Wikidata SPARQL / KG embeddings
-│   ├── reward/               # alpha-gate / PRM / text reward / IHR judge
-│   ├── data/                 # prompts, silver datasets, parsers, dropout loader
-│   ├── retrieval/            # hybrid RRF top-50 setting
+├── kgproweight/              # Core Python package
+│   ├── config/               # YAML loader + schemas
+│   ├── data/                 # prompts, parsers, silver dataset
+│   ├── eval/                 # metrics, baselines, stats, IHR
+│   ├── kg/                   # entity linker, Wikidata retriever, cache
 │   ├── pipeline/             # FlashRAG pipeline subclasses
-│   ├── training/             # phase1 distillation / phase2 PRM / phase3 SFT+PPO
-│   ├── eval/                 # metrics, alpha analysis, stats, variance, data-eff
-│   └── utils/                # paths, seeds, logging, FlashRAG bootstrap
-│
-├── configs/                  # YAML configs for every command
-├── scripts/{prepare,train,eval,utils}/  # thin CLI wrappers around the package
-├── docs/                     # paper design, operation guide, architecture
-└── tests/                    # pytest suite (alpha-gate, PRM annotator, …)
-```
-
-See [`docs/architecture.md`](docs/architecture.md) for the full dataflow.
-
----
-
-## 3. Documentation
-
-| File | Purpose |
-|------|---------|
-| [`docs/paper_design.md`](docs/paper_design.md) | Full methodology (formerly `KG-ProWeight_paper_design.txt`). |
-| [`docs/operation_guide.md`](docs/operation_guide.md) | Step-by-step commands tuned for Pro 6000 96 GB. |
-| [`docs/architecture.md`](docs/architecture.md) | Module diagram + dataflow (mermaid). |
-| [`docs/rigor_extensions.md`](docs/rigor_extensions.md) | Purpose of every rigour-extension script. |
-| [`docs/reproducibility.md`](docs/reproducibility.md) | Seed / version / API-pinning policy. |
-| [`docs/refactor_notes.md`](docs/refactor_notes.md) | Mapping kg2 → kgpaper with each fixed bug. |
-
----
-
-## 4. Citation
-
-```bibtex
-@article{kgproweight2026,
-  title  = {KG-ProWeight: Adaptive Process Supervision for Agentic RAG via Knowledge-Graph-Constrained Distillation and Dynamic Confidence Weighting},
-  author = {Anonymous},
-  year   = {2026}
-}
+│   ├── retrieval/            # hybrid RRF top-K
+│   ├── reward/               # α-gate, PRM, text reward, IHR judge
+│   ├── training/             # phase1/2/3, reward function, PPO trainer
+│   └── utils/                # paths, seeds, logging
+├── configs/                  # YAML configs (training, eval, ablation)
+├── flashrag_src/             # FlashRAG dependency (vendored)
+├── scripts/                  # CLI entry points
+│   ├── train/                # phase1_silver, phase2_prm, phase3_sft, phase3_ppo
+│   ├── eval/                 # run_kg_proweight, run_baselines, run_ihr_judge
+│   ├── prepare/              # corpus, indices, datasets, cache
+│   └── deploy/               # AutoDL deployment helpers
+├── docs/                     # Paper, baselines, architecture, logs
+├── tests/                    # pytest suite
+└── references/               # Related papers (PDF)
 ```
 
 ---
 
-## 5. License
+## License
 
 Apache 2.0. See [`LICENSE`](LICENSE).
