@@ -1,0 +1,10 @@
+includes:
+  - ../training/phase3_ppo.yaml
+
+# α ≡ 0.5: static equal mix. Mainly used for the Theorem-2 variance check
+# (variance should exceed dynamic-α). PPO is re-trained with α pinned.
+
+training:
+  alpha_override: 0.5
+  ppo:
+    total_ppo_steps: 1000

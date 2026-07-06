@@ -1,0 +1,41 @@
+# KG-ProWeight runtime requirements (RTX PRO 6000 Blackwell, 96 GB, bf16)
+#
+# Install order on a fresh machine:
+#   1. Install CUDA-matched torch first (this list assumes torch>=2.4 + CUDA 12.4+).
+#   2. pip install -r requirements.txt
+#   3. pip install -e .              # installs the kgproweight package
+#   4. pip install -e <FlashRAG path> # FlashRAG-main is an external dependency
+#
+# Optional extras (see pyproject.toml):
+#   pip install -e ".[kg-embeddings,genre,dev]"
+
+# ── Core ML ──────────────────────────────────────────────────────────────────
+torch>=2.4.0
+transformers>=4.44.0,<4.50
+accelerate>=0.33.0
+peft>=0.12.0
+bitsandbytes>=0.43.0
+trl==0.11.4
+datasets>=2.20.0
+
+# ── Retrieval ────────────────────────────────────────────────────────────────
+sentence-transformers>=3.0.1
+faiss-cpu>=1.8.0
+bm25s[core]==0.2.1
+langid>=1.1.6
+
+# ── KG / Entity linking ──────────────────────────────────────────────────────
+SPARQLWrapper>=2.0.0
+rapidfuzz>=3.9.0
+
+# ── External APIs ────────────────────────────────────────────────────────────
+openai>=1.40.0
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+numpy>=1.26.0
+scipy>=1.13.0
+tqdm>=4.66.0
+PyYAML>=6.0.1
+pydantic>=2.7.0
+rich>=13.7.0
+tiktoken>=0.7.0

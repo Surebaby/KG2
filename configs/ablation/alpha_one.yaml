@@ -1,0 +1,10 @@
+includes:
+  - ../training/phase3_ppo.yaml
+
+# α ≡ 1: KG-only reward branch. Should under-perform on D_dropout because
+# the severed subgraph no longer covers the answer path.
+
+training:
+  alpha_override: 1.0
+  ppo:
+    total_ppo_steps: 1000

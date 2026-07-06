@@ -1,0 +1,10 @@
+includes:
+  - ../base.yaml
+
+retrieval:
+  name: e5_only_top50
+  use_multi_retriever: false
+  merge_method: rrf  # ignored
+  retrieval_topk: 50
+  dense_model: e5
+  sparse_method: none

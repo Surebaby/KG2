@@ -1,0 +1,8 @@
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+baseline:
+  name: r1_searcher
+  pipeline_class: ReasoningPipeline
+  generator_model: r1-searcher

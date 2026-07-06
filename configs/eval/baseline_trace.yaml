@@ -1,0 +1,10 @@
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+baseline:
+  name: trace
+  pipeline_class: SequentialPipeline
+  generator_model: llama3-8B-instruct
+  extras:
+    refiner_name: kg_trace_refiner

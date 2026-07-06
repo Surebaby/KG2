@@ -1,0 +1,94 @@
+includes:
+  - ../base.yaml
+
+# Main RL training entry-point on the Pro 6000 Blackwell 96 GB box.
+# Uses PPO + GAE + Critic + reference model, all in bf16.
+# The SFT checkpoint produced by phase3_sft.yaml should be supplied via
+# CLI flag --resume_from_sft (also honours training.reference_model in the
+# YAML for fully declarative runs).
+
+training:
+  phase: phase3_ppo
+  base_model: llama3-8B-instruct
+  dtype: bf16
+  use_qlora: false
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  ppo:
+    learning_rate: 1.0e-5
+    batch_size: 8
+    # R4: increased from 1 to 2 for more stable gradient estimates.
+    # 2 rollout gradients are averaged per mini-batch, reducing noise while
+    # staying within VRAM budget (pure_EM: ~32GB, alpha-dynamic+ReaRAG: ~90GB).
+    mini_batch_size: 1
+    ppo_epochs: 4
+    cliprange: 0.2
+    cliprange_value: 0.2
+    # KL anchor: 0.1 is the midpoint between the locked-at-SFT 0.2
+    # (policy only rephrased) and the runaway 0.05 (policy dropped [Step N]
+    # structure). R7: combined with SFT anchor (not format bonus) to keep
+    # the reasoning format while giving PPO room to optimise answers.
+    kl_coef: 0.1
+    # Adaptive KL controller target + horizon.
+    target_kl: 8.0
+    kl_horizon: 2000.0
+    gamma: 0.95
+    lam: 0.95
+    max_grad_norm: 1.0
+    total_ppo_steps: 2000
+    vf_coef: 0.5
+    # R8: save every 500 steps — gives checkpoints at 500/1000/1500/2000 for
+    # periodic sampling and resumability. Each save includes adapter + history.
+    save_every_steps: 500
+    # R7: outcome reward is CONDITIONAL on ValidTrajectory (parseable steps,
+    # >=min_valid_steps, sequential indices, has Final Answer). The model can
+    # only earn the +10 EM bonus when it emits a well-structured reasoning
+    # trace. Plain "Final Answer: X" with correct EM gets ZERO outcome bonus.
+    outcome_weight: 10.0
+    # R5: scale R_text from (-1,1) down to (-0.3,0.3). ReaRAG's text coherence
+    # score is the dominant noise source — scaling it down lets EM and R_KG
+    # dominate while keeping the alpha-gate structure intact.
+    text_reward_scale: 0.3
+    # R7: TensorBoard for real-time training monitoring.
+    # TRL logs PPO losses/KL/clipfrac; custom metrics (valid_rate, sft_anchor_loss)
+    # are written via a separate SummaryWriter to the same logdir.
+    # Start with: tensorboard --logdir <output_dir>/tensorboard
+    log_with: tensorboard
+    # ------------------------------------------------------------------
+    # R7-B: Graduated Format-as-Constraint (R7-A learnings applied)
+    # ------------------------------------------------------------------
+    # R7-A (min_valid_steps=3, anchor interval=50, weight=0.02) failed:
+    #   - valid rate stuck at 9.2% with no upward trend over 1600 steps
+    #   - reward dead zone: writing steps but getting answers wrong = same
+    #     reward as not writing steps at all (≈0)
+    #   - SFT anchor too sparse: PPO drift outpaces correction
+    #
+    # R7-B fixes:
+    #   min_valid_steps=1: let model enter positive feedback loop by
+    #     writing just 1 step — then gradually raise the bar
+    #   sft_anchor_interval=10: 5x denser anchors (every 80 trajectories)
+    #   sft_anchor_weight=0.05: 2.5x stronger pullback force
+    min_valid_steps: 1
+    sft_anchor_weight: 0.05
+    sft_anchor_interval: 10
+    # ------------------------------------------------------------------
+    # R8: Content-Aware Gate + SFT Replay
+    # ------------------------------------------------------------------
+    # R8-A: minimum characters of actual reasoning content per step.
+    # PPO was exploiting the old gate by writing "[Step 1]\nReasoning: \nFinal Answer: X"
+    # (empty Reasoning but non-empty raw_text). Now "Reasoning:" content must
+    # have >= min_reasoning_chars of substantive text, or the trajectory is
+    # invalid (no outcome reward). Lower values (10-20) are more forgiving;
+    # higher values (30-50) enforce richer reasoning.
+    min_reasoning_chars: 20
+    # R8-D: SFT Replay — fraction of each PPO batch (0.0-1.0) sourced from
+    # SFT data with gold trajectories in context. Unlike the SFT anchor
+    # (separate backward pass), replay prompts are mixed directly into the
+    # PPO rollout pool. The model periodically sees well-formatted examples
+    # during exploration. Recommended: 0.10-0.20.
+    sft_replay_ratio: 0.15
+  # 6144 fits 15 passages (~3.7k tok) + KG block (30 triples) + generation so the
+  # KG context is never truncated. Consistent with SFT/eval top_k=15.
+  max_input_length: 6144

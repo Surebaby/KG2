@@ -1,0 +1,6 @@
+includes:
+  - ../base.yaml
+
+eval:
+  datasets: [musique]
+  split: dev

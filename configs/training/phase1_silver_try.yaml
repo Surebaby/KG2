@@ -1,0 +1,37 @@
+includes:
+  - ../base.yaml
+
+# Phase 1 (try variant) — improved silver-trajectory distillation.
+# Used by scripts/train/try/phase1_generate_silver_try.py.
+#
+# Key differences from configs/training/phase1_silver.yaml:
+#   * acceptance is stratified by KG density (no hard triple_rate/coverage cut),
+#   * the strict token_f1 gate is replaced by a lenient answer-match score,
+#   * coverage is a soft signal only.
+
+training:
+  phase: phase1
+  silver_data:
+    teacher_model: deepseek-chat
+    teacher_backend: deepseek
+    teacher_temperature: 0.3
+    max_queries: 25000
+    max_workers: 8
+    use_retrieval: true
+    retrieval_top_k: 50
+    output_path: null            # defaults to data/silver_data/silver_trajectories_try.jsonl
+
+    # --- universal quality gates (apply to every bucket) ------------------
+    min_steps: 3
+    max_steps: 7
+    min_answer_score: 0.3        # lenient answer match (substring/recall/F1), was min_token_f1: 0.5
+
+    # --- stratified KG-density buckets (extra fields, read via getattr) ----
+    rich_triple_rate: 0.5        # >= this  -> kg_rich   (always accepted)
+    medium_triple_rate: 0.15     # >= this  -> kg_medium (quota-limited)
+                                 # <  this  -> kg_sparse (quota-limited; α→0 region)
+    sparse_quota: 0.25           # up to 25% of accepted may be kg_sparse
+    medium_quota: 0.35           # up to 35% of accepted may be kg_medium
+
+    # NOTE: min_triple_rate / min_coverage from the original config are
+    # intentionally absent — they are no longer hard rejection thresholds.

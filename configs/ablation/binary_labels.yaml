@@ -1,0 +1,11 @@
+includes:
+  - ../training/phase3_ppo.yaml
+
+# Collapse the three-class PRM labels (+1/0/-1) to binary (+1/-1) to test
+# whether the neutral class adds value. PPO is re-trained from the same
+# SFT checkpoint.
+
+training:
+  binary_labels_only: true
+  ppo:
+    total_ppo_steps: 1000

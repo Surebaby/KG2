@@ -1,0 +1,6 @@
+includes:
+  - ../base.yaml
+
+eval:
+  datasets: [hotpotqa]
+  split: dev

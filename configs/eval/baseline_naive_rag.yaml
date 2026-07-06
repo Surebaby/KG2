@@ -1,0 +1,14 @@
+# Reference eval config for naive_rag (documentation mirror).
+# Runtime source of truth: kgproweight/eval/baselines.py
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+baseline:
+  name: naive_rag
+  pipeline_class: SequentialPipeline
+  generator_model: llama3-8B-instruct
+  system_prompt: "Answer the question based on the retrieved passages. Only give the answer."
+  user_prompt: "Reference passages:\n{reference}\n\nQuestion: {question}\nAnswer:"
+  extras:
+    use_retrieval: true

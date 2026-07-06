@@ -1,0 +1,12 @@
+includes:
+  - ../base.yaml
+
+retrieval:
+  name: hybrid_rrf_top50
+  use_multi_retriever: true
+  merge_method: rrf
+  rrf_k: 60
+  retrieval_topk: 50
+  dense_model: e5
+  sparse_method: bm25s
+  bm25_backend: bm25s

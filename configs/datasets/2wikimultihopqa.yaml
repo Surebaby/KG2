@@ -1,0 +1,6 @@
+includes:
+  - ../base.yaml
+
+eval:
+  datasets: [2wikimultihopqa]
+  split: dev

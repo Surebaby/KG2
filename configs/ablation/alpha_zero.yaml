@@ -1,0 +1,12 @@
+includes:
+  - ../training/phase3_ppo.yaml
+
+# α ≡ 0: text-only reward branch. This is THE key ablation — it removes the KG
+# branch entirely, making PPO rely purely on ReaRAG-9B text reward. Comparing
+# α=0 vs α=dynamic isolates the contribution of the KG factuality anchor.
+# total_ppo_steps is kept at 1500 to match the main R3 run for fair comparison.
+
+training:
+  alpha_override: 0.0
+  ppo:
+    total_ppo_steps: 1500

@@ -1,0 +1,8 @@
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+baseline:
+  name: rearag
+  pipeline_class: ReaRAGPipeline
+  generator_model: rearag

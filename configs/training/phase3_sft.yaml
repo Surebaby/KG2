@@ -1,0 +1,17 @@
+includes:
+  - ../base.yaml
+
+training:
+  phase: phase3_sft
+  base_model: llama3-8B-instruct
+  dtype: bf16
+  use_qlora: false
+  sft_epochs: 1
+  sft_lr: 2.0e-5
+  sft_batch_size: 4
+  sft_grad_accum: 8
+  sft_max_length: 4096
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]

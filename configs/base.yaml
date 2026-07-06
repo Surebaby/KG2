@@ -1,0 +1,85 @@
+name: kg_proweight
+
+# Project root resolved automatically by kgproweight.utils.paths from
+# KGPW_PROJECT_ROOT / KGPW_DATA_DIR / KGPW_INDEX_DIR / KGPW_CHECKPOINT_DIR /
+# KGPW_OUTPUT_DIR. The loader injects sane defaults when not provided.
+
+retrieval:
+  name: hybrid_rrf_top50
+  use_multi_retriever: true
+  merge_method: rrf
+  rrf_k: 60
+  retrieval_topk: 50
+  dense_model: e5
+  sparse_method: bm25s
+  bm25_backend: bm25s
+  retrieval_batch_size: 256
+  pooling_method: mean
+
+reward:
+  text_reward_backend: auto
+  text_reward_model: rearag
+  gamma_discount: 0.95
+  outcome_em_weight: 1.0
+  use_real_logprobs: true
+  alpha_gate:
+    initial_W: [1.0, 1.5, -0.8]
+    initial_b: -2.0
+    temperature: 0.5
+    calibration_weight: 0.1
+    feature_dim: 3
+
+training:
+  seed: 42
+  phase: phase3_ppo
+  base_model: llama3-8B-instruct
+  dtype: bf16
+  use_qlora: false
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  ppo:
+    learning_rate: 1.0e-5
+    batch_size: 64
+    mini_batch_size: 8
+    ppo_epochs: 4
+    cliprange: 0.2
+    cliprange_value: 0.2
+    kl_coef: 0.01
+    gamma: 0.95
+    lam: 0.95
+    max_grad_norm: 1.0
+    total_ppo_steps: 5000
+    vf_coef: 0.5
+  silver_data:
+    teacher_model: deepseek-chat
+    teacher_backend: deepseek
+    teacher_temperature: 0.3
+    max_queries: 25000
+    max_workers: 8
+    min_steps: 3
+    max_steps: 7
+    min_triple_rate: 0.4
+    min_coverage: 0.5
+    min_token_f1: 0.5
+    use_retrieval: true
+    retrieval_top_k: 50
+
+eval:
+  datasets: [hotpotqa, 2wikimultihopqa, musique]
+  split: dev
+  save_intermediate_data: true
+  save_metric_score: true
+  metrics: [em, f1, input_tokens]
+  gpu_id: "0"
+  seeds: [13, 42, 2024]
+  use_real_alpha: true
+
+flashrag:
+  use_fid: false
+  framework: hf
+  use_vllm: false
+  gpu_memory_utilization: 0.85
+  generator_batch_size: 4
+  use_data_parallel: false

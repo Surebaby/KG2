@@ -1,0 +1,11 @@
+includes:
+  - ../base.yaml
+
+# The D_dropout split is built by scripts/prepare/05_build_d_dropout.py
+# (50 % of HotpotQA dev with one answer-path triple severed). It is
+# loaded via kgproweight.data.d_dropout_loader, which always honours
+# item.metadata.dropout.modified_kg (bug-fix #5).
+
+eval:
+  datasets: [d_dropout]
+  split: dev

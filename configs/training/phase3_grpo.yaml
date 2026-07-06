@@ -1,0 +1,22 @@
+includes:
+  - ../base.yaml
+
+# Optional GRPO branch. No critic / no reference model.
+# Lighter on memory but loses the per-step bias-correction we get from GAE.
+# Kept for ablation studies and small-GPU users.
+
+training:
+  phase: phase3_grpo
+  base_model: llama3-8B-instruct
+  dtype: bf16
+  use_qlora: false
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  ppo:
+    learning_rate: 1.0e-5
+    batch_size: 32
+    mini_batch_size: 8
+    ppo_epochs: 4
+    total_ppo_steps: 5000

@@ -1,0 +1,18 @@
+includes:
+  - ../training/phase3_ppo.yaml
+
+# Pure EM reward ablation: skip R_KG, R_text, and α-gate entirely.
+# Reward = format_bonus per step + EM × outcome_weight on the final step.
+# This is the upper bound for "what PPO achieves when reward is perfectly
+# aligned with the evaluation metric".  Comparing pure_EM vs α-dynamic
+# isolates the contribution of the KG factuality anchor in training-time
+# reward signals.
+#
+# Inspired by Search-R1, R1-Searcher, and related works that show simple
+# outcome-based rewards suffice for retrieval-augmented RL.
+
+training:
+  ppo:
+    total_ppo_steps: 1500
+    pure_em_reward: true
+    outcome_weight: 10.0

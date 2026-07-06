@@ -1,0 +1,11 @@
+includes:
+  - ../base.yaml
+  - ../retrieval/e5_only_top50.yaml
+
+# Inference-only ablation: keep the trained α-gate / PRM / SFT+PPO model
+# but swap RRF top-50 for E5-only top-50. Compares Table 2 row #5.
+
+eval:
+  datasets: [hotpotqa, 2wikimultihopqa, musique, d_dropout]
+  metrics: [em, f1]
+  use_real_alpha: true

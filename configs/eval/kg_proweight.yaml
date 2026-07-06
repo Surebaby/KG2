@@ -1,0 +1,15 @@
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+# Main evaluation config for KG-ProWeight: hybrid RRF top-50 retrieval,
+# trained α-gate, plus α-distribution logging and heuristic IHR collection
+# in the pipeline. Use scripts/eval/run_kg_proweight.py with this config.
+
+eval:
+  datasets: [hotpotqa, 2wikimultihopqa, musique, d_dropout]
+  split: dev
+  save_intermediate_data: true
+  metrics: [em, f1]
+  use_real_alpha: true
+  seeds: [13, 42, 2024]

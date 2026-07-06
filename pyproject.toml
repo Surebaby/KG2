@@ -1,0 +1,118 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kgproweight"
+version = "1.0.0"
+description = "KG-ProWeight: Adaptive Process Supervision for Agentic RAG via KG-Constrained Distillation and Dynamic Confidence Weighting"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "KG-ProWeight Authors" },
+]
+keywords = ["rag", "knowledge-graph", "process-reward-model", "ppo", "llm", "agentic-rag"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Intended Audience :: Science/Research",
+]
+dependencies = [
+    "torch>=2.4.0",
+    "transformers>=4.44.0,<4.50",
+    "accelerate>=0.33.0",
+    "peft>=0.12.0",
+    "bitsandbytes>=0.43.0",
+    "trl==0.11.4",
+    "datasets>=2.20.0",
+    "sentence-transformers>=3.0.1",
+    "faiss-cpu>=1.8.0",
+    "bm25s[core]==0.2.1",
+    "langid>=1.1.6",
+    "SPARQLWrapper>=2.0.0",
+    "rapidfuzz>=3.9.0",
+    "openai>=1.40.0",
+    "numpy>=1.26.0",
+    "scipy>=1.13.0",
+    "tqdm>=4.66.0",
+    "PyYAML>=6.0.1",
+    "pydantic>=2.7.0",
+    "rich>=13.7.0",
+    "tiktoken>=0.7.0",
+]
+
+[project.optional-dependencies]
+kg-embeddings = [
+    "pykeen>=1.10.2",
+]
+genre = [
+    # GENRE entity linker (optional — uses local checkpoint if available)
+    "fairseq>=0.12.2",
+]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.5.0",
+    "black>=24.4.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+kgpw-phase1 = "scripts.train.phase1_generate_silver:main"
+kgpw-phase2 = "scripts.train.phase2_train_prm:main"
+kgpw-phase3-sft = "scripts.train.phase3_sft:main"
+kgpw-phase3-ppo = "scripts.train.phase3_ppo:main"
+kgpw-phase3-grpo = "scripts.train.phase3_grpo:main"
+kgpw-eval-baselines = "scripts.eval.run_baselines:main"
+kgpw-eval-kgpw = "scripts.eval.run_kg_proweight:main"
+kgpw-eval-ablations = "scripts.eval.run_ablations:main"
+kgpw-ihr-judge = "scripts.eval.run_ihr_judge:main"
+kgpw-data-efficiency = "scripts.eval.run_data_efficiency:main"
+kgpw-variance = "scripts.eval.run_variance_validation:main"
+kgpw-summarize = "scripts.eval.summarize_results:main"
+
+[project.urls]
+"Documentation" = "./docs"
+"Paper Design" = "./docs/paper_design.md"
+
+[tool.setuptools]
+packages = ["kgproweight"]
+
+[tool.setuptools.package-dir]
+kgproweight = "kgproweight"
+
+# ---------------------------------------------------------------------------
+# Tooling
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["third_party", "data", "indexes", "checkpoints", "outputs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["kgproweight"]
+omit = ["tests/*", "scripts/*"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true

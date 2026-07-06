@@ -1,0 +1,15 @@
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+# Inference-only ablation: route through the no-KG pipeline, i.e. the
+# model never sees the KG block. Reuses the trained policy checkpoint.
+
+eval:
+  datasets: [hotpotqa, 2wikimultihopqa, musique, d_dropout]
+  metrics: [em, f1]
+  use_real_alpha: false
+
+pipeline:
+  class: NoKGReasoningPipeline
+  module: kgproweight.pipeline.no_kg_pipeline

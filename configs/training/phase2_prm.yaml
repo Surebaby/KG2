@@ -1,0 +1,13 @@
+includes:
+  - ../base.yaml
+
+training:
+  phase: phase2
+  base_model: llama3-8B-instruct
+  dtype: bf16
+  use_qlora: false
+  prm_epochs: 3
+  prm_lr: 5.0e-5
+  prm_batch_size: 4
+  prm_grad_accum: 4
+  prm_max_length: 2048

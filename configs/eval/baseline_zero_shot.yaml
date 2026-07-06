@@ -1,0 +1,20 @@
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+# Zero-shot inference: the generator answers from its parametric memory
+# only. We still keep the hybrid RRF top-50 retrieval *available* in the
+# config (so baselines share the exact same FlashRAG plumbing), but the
+# pipeline ignores it.
+
+eval:
+  datasets: [hotpotqa, 2wikimultihopqa, musique]
+  metrics: [em, f1]
+  seeds: [13, 42, 2024]
+
+baseline:
+  name: zero_shot
+  pipeline_class: SequentialPipeline
+  generator_model: llama3-8B-instruct
+  extras:
+    use_retrieval: false

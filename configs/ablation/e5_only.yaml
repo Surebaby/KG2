@@ -1,0 +1,12 @@
+includes:
+  - ../base.yaml
+  - ../retrieval/e5_only_top50.yaml
+
+# Alias of single_retriever.yaml kept for clarity in the paper's table.
+# Use whichever name reads better in the manuscript; both refer to the
+# same evaluation configuration.
+
+eval:
+  datasets: [hotpotqa, 2wikimultihopqa, musique, d_dropout]
+  metrics: [em, f1]
+  use_real_alpha: true
