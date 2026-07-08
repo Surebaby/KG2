@@ -147,6 +147,8 @@ class KGProWeightRewardFunction:
         min_valid_steps: int = 3,
         # R8: minimum characters of actual reasoning content per step.
         min_reasoning_chars: int = 20,
+        step_reward_scale: float = 1.0,
+        subgraph_retriever = None,
     ) -> None:
         self.composite = CompositeRewardModel(
             alpha_gate=alpha_gate,
@@ -155,6 +157,7 @@ class KGProWeightRewardFunction:
             outcome_weight=outcome_weight,
             discount=discount,
             text_reward_scale=text_reward_scale,
+            step_reward_scale=step_reward_scale,
         )
         self.tokenizer = tokenizer
         self.alpha_override = alpha_override
@@ -163,6 +166,10 @@ class KGProWeightRewardFunction:
         self.min_valid_steps = min_valid_steps
         # R8: minimum reasoning content per step (content-aware gate).
         self.min_reasoning_chars = min_reasoning_chars
+        # R9: step reward scale for KG/Text composite.
+        self.step_reward_scale = step_reward_scale
+        # R9: dynamic KG subgraph from model output, not static silver data
+        self.subgraph_retriever = subgraph_retriever
         # Pure EM reward mode (ablation): ignore R_KG and R_text entirely;
         # reward is EM × outcome_weight on the final step (no per-step bonuses).
         # This is the upper bound for "what PPO can achieve when reward is
@@ -327,9 +334,35 @@ class KGProWeightRewardFunction:
             if len(logprobs_list) < len(steps):
                 logprobs_list += [None] * (len(steps) - len(logprobs_list))
 
+        # R9: dynamic KG subgraph — extract entities from the MODEL OUTPUT,
+        # not from the static silver-data spec. The old path used spec.kg_subgraph
+        # which contains entities relevant to the silver *question*, but the
+        # model's *generated text* mentions different entities — so graph_density
+        # was always 0 and α was stuck at 0.02.
+        dynamic_kg: List[Tuple[str, str, str]] = []
+        if self.subgraph_retriever is not None:
+            try:
+                from kgproweight.kg.entity_linker import extract_mentions
+                all_mentions = set()
+                for _s in steps:
+                    for m in (_s.mentioned_entities or []):
+                        if m:
+                            all_mentions.add(m)
+                if all_mentions:
+                    linker = self.composite.prm_annotator.entity_linker
+                    linked = {m: linker.link_single(m) for m in all_mentions}
+                    qids = [q for q in linked.values() if q]
+                    if qids:
+                        dynamic_kg = self.subgraph_retriever.fetch(qids) or []
+            except Exception as e:
+                logger.warning("Dynamic KG fetch failed: %s", e)
+
+        # Use dynamic KG if available, otherwise fall back to silver spec
+        kg_for_reward = dynamic_kg if dynamic_kg else spec.kg_subgraph
+
         records = self.composite.compute_trajectory_rewards(
             steps=steps,
-            kg_subgraph=spec.kg_subgraph,
+            kg_subgraph=kg_for_reward,
             text_reward_prompts=text_reward_prompts,
             logprobs_list=logprobs_list,
             predicted_answer=predicted_answer,

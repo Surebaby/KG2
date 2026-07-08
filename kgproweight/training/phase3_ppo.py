@@ -31,6 +31,7 @@ import torch
 from kgproweight.data.parsers import parse_steps
 from kgproweight.data.prompts import build_rl_messages, build_sft_messages
 from kgproweight.data.silver_dataset import SilverDatasetReader
+from kgproweight.kg.wikidata_retriever import WikidataSubgraphRetriever
 from kgproweight.reward.alpha_gate import AlphaGate
 from kgproweight.reward.prm_annotator import PRMAnnotator
 from kgproweight.reward.text_reward_model import build_text_reward_model
@@ -98,6 +99,10 @@ class Phase3PPOConfig:
     # R8: minimum characters of actual reasoning content per step. Empty
     # "Reasoning:\n" blocks are treated as invalid (content-aware gate).
     min_reasoning_chars: int = 20
+    # R9: scale up per-step composite reward to cover KL token cost.
+    # With KG online, max R_step ≈ 0.8; KL cost ≈ 5 per 100 tokens.
+    # Scale ×5 brings max R_step to ~4.0 so multi-step reasoning is net positive.
+    step_reward_scale: float = 5.0
     # R8: SFT Replay ratio — fraction of PPO prompts (0.0–1.0) sourced from
     # the SFT anchor data instead of the silver retrieval pool. Each SFT-replay
     # prompt includes the gold trajectory as the assistant response, so the
@@ -571,6 +576,8 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
         text_reward_scale=cfg.text_reward_scale,
         min_valid_steps=cfg.min_valid_steps,
         min_reasoning_chars=cfg.min_reasoning_chars,
+        step_reward_scale=cfg.step_reward_scale,
+        subgraph_retriever=WikidataSubgraphRetriever(max_hops=2, max_neighbors=30, offline=True),
         pure_em=cfg.pure_em_reward,
     )
 
@@ -681,38 +688,12 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     n_seen = 0
     history: List[Dict[str, float]] = []
     while n_seen < cfg.total_steps:
-        # R8: mix SFT replay prompts into the batch. For sft_replay_ratio of
-        # the batch, substitute silver retrieval prompts with SFT replay prompts
-        # (prompts that include the gold trajectory). This acts as experience
-        # replay — the model periodically sees well-formatted examples WITHOUT
-        # a separate backward pass.
-        n_replay = (
-            int(cfg.batch_size * cfg.sft_replay_ratio)
-            if sft_replay_prompts else 0
-        )
-        n_explore = cfg.batch_size - n_replay
-
-        batch_samples: List[Dict[str, Any]] = []
-        prompts: List[str] = []
-        specs: List[RewardSpec] = []
-
-        # Exploration: normal silver retrieval prompts.
-        if n_explore > 0:
-            explore_idx = torch.randint(0, len(samples), (n_explore,), generator=rng).tolist()
-            for i in explore_idx:
-                batch_samples.append(samples[i])
-                prompts.append(samples[i]["prompt"])
-                specs.append(samples[i]["spec"])
-
-        # Replay: SFT prompts with gold trajectory in context.
-        if n_replay > 0:
-            replay_idx = torch.randint(0, len(sft_replay_prompts), (n_replay,), generator=rng).tolist()
-            for i in replay_idx:
-                batch_samples.append({"prompt": sft_replay_prompts[i]})
-                prompts.append(sft_replay_prompts[i])
-                # Use a dummy spec — replay prompts are format-only, KG reward is
-                # not meaningful (the gold trajectory is already in the prompt).
-                specs.append(RewardSpec(query="", gold_answer="", kg_subgraph=[], retrieved_passages=[]))
+        # R9: SFT replay REMOVED. Dummy specs contaminated advantage computation
+        # (advantage_var stuck at 0). SFT anchor handles format preservation.
+        batch_idx = torch.randint(0, len(samples), (cfg.batch_size,), generator=rng).tolist()
+        batch_samples = [samples[i] for i in batch_idx]
+        prompts = [s["prompt"] for s in batch_samples]
+        specs: List[RewardSpec] = [s["spec"] for s in batch_samples]
 
         query_tensors, response_tensors, response_texts, logprobs_per_step_list = _generate(
             policy, tokenizer, prompts, cfg, device
