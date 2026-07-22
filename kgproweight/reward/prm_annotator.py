@@ -185,30 +185,49 @@ class PRMAnnotator:
         if not subgraph_usable:
             return self._log(step.index, NEUTRAL, f"subgraph too sparse ({len(kg_subgraph)})")
 
-        # 3b) verify each cited triple
-        verified_all = True
+        # 3b) verify each cited triple, count precision
+        verified_count = 0
         for triple in step.cited_triples:
-            if not triple_in_subgraph(triple, kg_subgraph, fuzzy_threshold=self.triple_fuzzy_threshold):
-                verified_all = False
-                break
+            if triple_in_subgraph(triple, kg_subgraph, fuzzy_threshold=self.triple_fuzzy_threshold):
+                verified_count += 1
 
         # 3c) contradiction always dominates (abstentions excluded)
         if self._is_contradiction(step.intermediate_conclusion, prev_conclusions):
             return self._log(step.index, NEGATIVE, "contradiction (with triples)")
 
-        if verified_all:
-            # 3d) a verified citation only earns +1 if at least one cited triple
-            # is actually relevant to the conclusion — otherwise it is a filler
-            # citation (triple is real & in-subgraph but supports nothing here).
-            if self.require_triple_relevance and not self._triple_relevant(
-                step.cited_triples, step.intermediate_conclusion
-            ):
-                return self._log(step.index, NEUTRAL, "verified but filler (triple unrelated to conclusion)")
-            return self._log(step.index, POSITIVE, "all triples verified")
+        # R9: precision-based R_KG = verified / total. Breaks the zero-signal
+        # deadlock: even partially-verified citations give non-zero reward,
+        # which provides gradient for the model to improve citation accuracy.
+        precision = verified_count / len(step.cited_triples) if step.cited_triples else 0.0
 
-        # cited but unverifiable in an otherwise usable subgraph:
-        # this is an incompleteness case, not a proven hallucination -> neutral
-        return self._log(step.index, NEUTRAL, "cited triple absent from subgraph")
+        # R9 v5: KG Utility = Precision × Relevance.
+        # Precision alone rewards "real triples" but ignores whether they help
+        # answer the question. Relevance measures how many cited triples actually
+        # touch the step's conclusion. A triple that is real but irrelevant
+        # (e.g. "Ed Wood, instance of, human" for a nationality question) should
+        # not earn the same reward as a directly useful triple.
+        relevance_ratio = 1.0  # default: assume relevant
+        if self.require_triple_relevance and step.cited_triples:
+            relevant_count = sum(
+                1 for triple in step.cited_triples
+                if self._triple_relevant(
+                    [triple],
+                    reasoning=step.raw_text,
+                    conclusion=step.intermediate_conclusion,
+                )
+            )
+            relevance_ratio = relevant_count / len(step.cited_triples)
+
+        r_kg = precision * relevance_ratio
+
+        if precision >= 1.0 and relevance_ratio >= 1.0:
+            return self._log(step.index, POSITIVE,
+                f"all {verified_count} verified + relevant, r_kg={r_kg:.2f}")
+        elif precision > 0:
+            return self._log(step.index, r_kg,
+                f"precision={precision:.2f} relevance={relevance_ratio:.2f} r_kg={r_kg:.2f}")
+        else:
+            return self._log(step.index, NEUTRAL, "cited triple absent from subgraph")
 
     def annotate_trajectory(
         self,
@@ -266,39 +285,61 @@ class PRMAnnotator:
             return False
         return self._contradicts(conclusion, prev_conclusions)
 
+    @staticmethod
+    def _phrase_match(phrase: str, text: str) -> bool:
+        """Normalized phrase match: lower-case, strip punctuation, word-boundary."""
+        p = phrase.strip().lower().translate(_PUNCT).strip()
+        t = text.lower().translate(_PUNCT)
+        if not p:
+            return False
+        return re.search(rf"\b{re.escape(p)}\b", t) is not None
+
     def _triple_relevant(
         self,
         cited_triples: List[Tuple[str, str, str]],
-        conclusion: Optional[str],
+        reasoning: Optional[str] = None,
+        conclusion: Optional[str] = None,
     ) -> bool:
-        """True if at least one cited triple's head/tail entity touches the conclusion.
+        """Lightweight surface-level evidence-overlap estimator.
 
-        A filler citation (real, in-subgraph, but supporting nothing in this step)
-        shares no content token with the conclusion. If we cannot read the
-        conclusion at all, default to True so we never *increase* false negatives.
+        Returns True if at least one cited triple's entities or relation appear
+        in the reasoning trajectory or final conclusion. This measures *lexical
+        evidence grounding* — whether the cited KG fact left a trace in the
+        model's output — not semantic entailment.
+
+        Scoring (per triple):
+          head OR tail phrase-match in text    → +1 (entity evidence)
+          relation phrase-match in text        → +0.5 (relation evidence, weaker)
+
+        A triple scores > 0 → relevant.
         """
-        if not conclusion:
-            return True
-        ctoks = _content_tokens(conclusion)
-        concl_lc = conclusion.lower()
-        for h, _r, t in cited_triples:
-            # token-overlap (handles len>=3 entities)
-            if ctoks and (_content_tokens(h) | _content_tokens(t)) & ctoks:
+        text = " ".join(s for s in (reasoning, conclusion) if s)
+        if not text:
+            return True  # cannot judge → default relevant
+
+        for h, r, t in cited_triples:
+            score = 0.0
+            # entity evidence (primary)
+            if self._phrase_match(h, text):
+                score += 1.0
+            if self._phrase_match(t, text):
+                score += 1.0
+            # relation evidence (secondary, lower weight)
+            if self._phrase_match(r, text):
+                score += 0.5
+            if score > 0:
                 return True
-            # short/numeric entities (len<3, e.g. "UK", years) won't survive
-            # _content_tokens, so also match the full entity as a phrase.
-            for ent in (h, t):
-                e = ent.strip().lower()
-                if e and re.search(rf"\b{re.escape(e)}\b", concl_lc):
-                    return True
-        # No content token AND no entity phrase matched -> default True so we
-        # never *increase* false negatives.
-        if not ctoks:
-            return True
         return False
 
-    def _log(self, idx: int, label: int, reason: str) -> int:
+    def _log(self, idx: int, label, reason: str):
         if self.verbose:
-            name = {POSITIVE: "+1", NEUTRAL: "0", NEGATIVE: "-1"}[label]
+            if label == POSITIVE:
+                name = "+1"
+            elif label == NEGATIVE:
+                name = "-1"
+            elif label == NEUTRAL:
+                name = "0"
+            else:
+                name = f"{label:.3f}"
             logger.debug("step %d -> %s (%s)", idx, name, reason)
         return label

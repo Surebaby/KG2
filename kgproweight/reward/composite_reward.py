@@ -55,6 +55,7 @@ class CompositeRewardModel(nn.Module):
         outcome_weight: float = 1.0,
         discount: float = 0.95,
         text_reward_scale: float = 1.0,
+        step_reward_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.alpha_gate = alpha_gate
@@ -65,6 +66,8 @@ class CompositeRewardModel(nn.Module):
         self.discount = discount
         # R5: scale down R_text to prevent it dominating reward
         self.text_reward_scale = text_reward_scale
+        # R9: scale up R_step so each good step (~0.8 raw) covers KL cost (~5).
+        self.step_reward_scale = step_reward_scale
 
     # ------------------------------------------------------------------
     # Single-step
@@ -93,7 +96,9 @@ class CompositeRewardModel(nn.Module):
         r_text = float(
             self.text_reward_model.score_step(prompt_for_text_reward, step.raw_text)
         )
-        r_total = alpha * r_kg + (1.0 - alpha) * r_text * self.text_reward_scale
+        r_total = (
+            alpha * r_kg + (1.0 - alpha) * r_text * self.text_reward_scale
+        ) * self.step_reward_scale
         return StepReward(
             step_index=step.index,
             alpha=alpha,
@@ -166,12 +171,27 @@ class CompositeRewardModel(nn.Module):
                 prev_conclusions.append(step.intermediate_conclusion)
 
         # R7: Outcome reward is conditional on trajectory validity.
-        # When the policy emits an incomplete or malformed trace, the per-step
-        # composite rewards still provide a learning signal, but the large
-        # outcome bonus is withheld — the model must earn it by generating
-        # well-structured reasoning traces, not just correct final answers.
-        if predicted_answer is not None and gold_answer is not None and trajectory_valid:
-            outcome = float(self._em(predicted_answer, gold_answer))
+        # R9: invalid trajectories receive a NEGATIVE penalty so PPO cannot escape
+        # the gate by "shutting up" (short outputs have low KL cost, and without
+        # penalty invalid→0 > long valid→negative from KL). The penalty must be
+        # larger than the KL cost of a valid trajectory (~15 for 300 tokens).
+        if trajectory_valid:
+            if predicted_answer is not None and gold_answer is not None:
+                outcome = float(self._em(predicted_answer, gold_answer))
+                if records and outcome > 0:
+                    last = records[-1]
+                    records[-1] = StepReward(
+                        step_index=last.step_index,
+                        alpha=last.alpha,
+                        r_kg=last.r_kg,
+                        r_text=last.r_text,
+                        r_total=last.r_total + self.outcome_weight * outcome,
+                        graph_density=last.graph_density,
+                        link_confidence=last.link_confidence,
+                        semantic_entropy=last.semantic_entropy,
+                    )
+        else:
+            invalid_penalty = -self.outcome_weight  # = -10.0
             if records:
                 last = records[-1]
                 records[-1] = StepReward(
@@ -179,11 +199,17 @@ class CompositeRewardModel(nn.Module):
                     alpha=last.alpha,
                     r_kg=last.r_kg,
                     r_text=last.r_text,
-                    r_total=last.r_total + self.outcome_weight * outcome,
+                    r_total=last.r_total + invalid_penalty,
                     graph_density=last.graph_density,
                     link_confidence=last.link_confidence,
                     semantic_entropy=last.semantic_entropy,
                 )
+            else:
+                records.append(StepReward(
+                    step_index=0, alpha=0.0, r_kg=0.0, r_text=0.0,
+                    r_total=invalid_penalty,
+                    graph_density=0.0, link_confidence=0.0, semantic_entropy=0.0,
+                ))
         return records
 
     def discounted_returns(self, rewards: List[float]) -> List[float]:

@@ -42,7 +42,7 @@ from kgproweight.training.reward_function import (
 )
 from kgproweight.training.step_reward_ppo_trainer import StepRewardPPOTrainer
 from kgproweight.utils.logging import dump_manifest, get_logger
-from kgproweight.utils.paths import model_path
+from kgproweight.utils.paths import index_dir, model_path
 from kgproweight.utils.seed import set_seed
 
 logger = get_logger(__name__)
@@ -119,7 +119,7 @@ class Phase3PPOConfig:
     save_every_steps: int = 256
 
     # Generation
-    max_new_tokens: int = 384
+    max_new_tokens: int = 256
     # PPO ROLLOUT SAMPLING MUST MATCH TRL's logprob recomputation distribution.
     # TRL's batched_forward_pass scores responses from RAW logits — i.e.
     # temperature=1.0, no top_p, no top_k. If we sample at temperature=0.7 /
@@ -131,8 +131,8 @@ class Phase3PPOConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     max_input_length: int = 4096
-    # B5: cap parsed [Step N] blocks per rollout (matches reward_fn.max_steps).
-    max_steps: int = 7
+    # R9 v3: cap parsed [Step N] blocks per rollout (reduced to save VRAM).
+    max_steps: int = 5
     # B3: the prompt template orders Question → Passages → KG, and the tokenizer
     # right-truncates. With the package defaults (50 passages) the KG block — the
     # whole point of KG-grounding — gets truncated away before the model sees it
@@ -287,15 +287,27 @@ def _step_logprobs_from_scores(
     return out
 
 
-def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfig):
+def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfig,
+                     question_kg_index: dict = None):
+    """Build PPO prompts.  When ``question_kg_index`` is provided, the Knowledge
+    Graph block is populated from the pre-built Q→KG lookup (instant, 100% hit).
+    """
     rows = []
     skipped_no_gold = 0
+    dyn_kg_hits = 0
     for traj in reader.accepted():
-        # B3: cap passages (and triples) so the KG block survives prompt budgeting.
+        kg_triples = list(traj.kg_subgraph)
+        # R9: instant Q→KG lookup from pre-built index (0.2s, 100% coverage)
+        if question_kg_index is not None:
+            dyn = question_kg_index.get(traj.question)
+            if dyn:
+                dyn_kg_hits += 1
+                kg_triples = list(dyn)
+
         msgs = build_rl_messages(
             question=traj.question,
             retrieved_passages=traj.retrieved_passages,
-            kg_triples=traj.kg_subgraph,
+            kg_triples=kg_triples,
             top_k=cfg.ppo_max_passages,
             max_kg_triples=cfg.ppo_max_kg_triples,
         )
@@ -303,10 +315,6 @@ def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfi
             text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         else:
             text = "\n\n".join(m["content"] for m in msgs)
-        # P0-3/A4: require a real dataset gold. The teacher answer is NOT a valid
-        # EM target — rewarding it would teach PPO to match the teacher's
-        # mistakes (reward hacking). Skip trajectories with no gold rather than
-        # fall back to traj.answer.
         gold = str(traj.metadata.get("gold_answer") or "").strip()
         if not gold:
             skipped_no_gold += 1
@@ -314,7 +322,7 @@ def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfi
         spec = RewardSpec(
             query=traj.question,
             gold_answer=gold,
-            kg_subgraph=list(traj.kg_subgraph),
+            kg_subgraph=kg_triples,  # R9: may be dynamic, may be silver fallback
             retrieved_passages=list(traj.retrieved_passages),
             metadata={"qid": traj.qid, "dataset": traj.dataset},
         )
@@ -324,6 +332,16 @@ def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfi
             "Skipped %d accepted trajectories with no gold_answer (A4: no teacher fallback).",
             skipped_no_gold,
         )
+    if dyn_kg_hits > 0:
+        logger.info("R9 prompt KG: %d/%d samples got subgraphs from pre-built index", dyn_kg_hits, len(rows))
+        # Print one example: show KG block from the first dynamic-KG prompt
+        for row in rows:
+            prompt = row["prompt"]
+            if "(empty)" not in prompt and "Knowledge Graph:" in prompt:
+                kg_start = prompt.index("Knowledge Graph:")
+                kg_end = prompt.index("\n\n", kg_start) if "\n\n" in prompt[kg_start:] else len(prompt)
+                logger.info("R9 KG example:\n%s", prompt[kg_start:kg_end])
+                break
     return rows
 
 
@@ -552,7 +570,7 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     from kgproweight.retrieval.bootstrap import resolve_entity_cache_path
     from kgproweight.kg.entity_linker import EntityLinker
 
-    _entity_linker = EntityLinker(cache_path=resolve_entity_cache_path())
+    _entity_linker = EntityLinker(cache_path=resolve_entity_cache_path(), offline=True)
     logger.info(
         "PPO link_confidence: EntityLinker cache=%s (%d entries)",
         resolve_entity_cache_path(), len(list(_entity_linker.cache.items())),
@@ -589,7 +607,21 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 if step.label == 0:
                     step.label = -1  # collapse neutral into negative for this ablation
 
-    samples = _prepare_prompts(reader, tokenizer, cfg)
+    # R9: dynamic prompt KG disabled for speed (9839 prompts).
+    # EntityLinker needed for reward-side dynamic KG (below).
+    # R9: prompt KG uses silver data (instant). Reward-side dynamic KG provides
+    # the KG signal (already works — α=0.85, r_kg broke zero). Prompt-side
+    # injection needs pre-built entity index for speed; TODO separately.
+    # R9: pre-built Q→KG index (0.2s, 100% hit rate). Load and pass to prompts.
+    _q_kg_index = {}
+    _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index.json"
+    if _q_kg_path.exists():
+        import json as _json
+        _q_kg_raw = _json.loads(_q_kg_path.read_text(encoding="utf-8"))
+        for _entry in _q_kg_raw:
+            _q_kg_index[_entry["q"]] = _entry["t"]
+        logger.info("R9: Loaded %d question→KG entries from %s", len(_q_kg_index), _q_kg_path)
+    samples = _prepare_prompts(reader, tokenizer, cfg, question_kg_index=_q_kg_index)
     if not samples:
         raise ValueError(f"No PPO samples derived from {cfg.silver_path}")
 
@@ -678,7 +710,7 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     if cfg.log_with == "tensorboard":
         from torch.utils.tensorboard import SummaryWriter
 
-        tb_log_dir = out_dir / "tensorboard"
+        tb_log_dir = Path("/root/tf-logs")
         tb_log_dir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
         logger.info("TensorBoard logging to %s", tb_log_dir)
@@ -688,12 +720,38 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     n_seen = 0
     history: List[Dict[str, float]] = []
     while n_seen < cfg.total_steps:
-        # R9: SFT replay REMOVED. Dummy specs contaminated advantage computation
-        # (advantage_var stuck at 0). SFT anchor handles format preservation.
-        batch_idx = torch.randint(0, len(samples), (cfg.batch_size,), generator=rng).tolist()
-        batch_samples = [samples[i] for i in batch_idx]
-        prompts = [s["prompt"] for s in batch_samples]
-        specs: List[RewardSpec] = [s["spec"] for s in batch_samples]
+        # R9: SFT replay WITH REAL SPECS.  For sft_replay_ratio of the batch,
+        # substitute prompts with SFT replay (prompts that include the gold
+        # trajectory).  Unlike the old code that used dummy specs, we pair
+        # each replay prompt with a real silver-data spec so the reward
+        # distribution is consistent with exploration samples — no more
+        # advantage contamination.
+        n_replay = (
+            int(cfg.batch_size * cfg.sft_replay_ratio)
+            if sft_replay_prompts else 0
+        )
+        n_explore = cfg.batch_size - n_replay
+
+        batch_samples: List[Dict[str, Any]] = []
+        prompts: List[str] = []
+        specs: List[RewardSpec] = []
+
+        if n_explore > 0:
+            explore_idx = torch.randint(0, len(samples), (n_explore,), generator=rng).tolist()
+            for i in explore_idx:
+                batch_samples.append(samples[i])
+                prompts.append(samples[i]["prompt"])
+                specs.append(samples[i]["spec"])
+
+        if n_replay > 0:
+            replay_idx = torch.randint(0, len(sft_replay_prompts), (n_replay,), generator=rng).tolist()
+            # Pair each replay prompt with a real silver spec so reward
+            # distribution matches exploration samples.
+            spec_idx = torch.randint(0, len(samples), (n_replay,), generator=rng).tolist()
+            for ri, si in zip(replay_idx, spec_idx):
+                batch_samples.append({"prompt": samples[si]["prompt"]})
+                prompts.append(sft_replay_prompts[ri])
+                specs.append(samples[si]["spec"])
 
         query_tensors, response_tensors, response_texts, logprobs_per_step_list = _generate(
             policy, tokenizer, prompts, cfg, device
@@ -701,6 +759,7 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
 
         token_reward_list: List[torch.Tensor] = []
         traj_rewards: List[float] = []
+        all_per_step_records = []  # R9: collect from all responses
         for resp_text, response_ids, spec, logprobs_per_step in zip(
             response_texts, response_tensors, specs, logprobs_per_step_list
         ):
@@ -720,6 +779,7 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 step_spans=aligned_spans,
             )
             traj_rewards.append(info["trajectory_reward"])
+            all_per_step_records.extend(info.get("per_step_records", []))
             # token_rewards is already built in response_ids space (#6), so it
             # matches the response tensor length exactly — but stay defensive.
             tr = info["token_rewards"]
@@ -729,10 +789,16 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                       if tr.size(0) < n else tr[:n])
             token_reward_list.append(tr)
 
+        # ── R9: extract reward components from all responses for diagnostics ──
+        reward_rc = {"alpha_mean": 0.0, "r_kg_mean": 0.0, "r_text_mean": 0.0, "r_total_mean": 0.0, "n_steps": 0}
+        if all_per_step_records:
+            reward_rc["alpha_mean"] = float(sum(r.alpha for r in all_per_step_records) / len(all_per_step_records))
+            reward_rc["r_kg_mean"] = float(sum(r.r_kg for r in all_per_step_records) / len(all_per_step_records))
+            reward_rc["r_text_mean"] = float(sum(r.r_text for r in all_per_step_records) / len(all_per_step_records))
+            reward_rc["r_total_mean"] = float(sum(r.r_total for r in all_per_step_records) / len(all_per_step_records))
+            reward_rc["n_steps"] = len(all_per_step_records)
+
         # P0-1 / #6: hand the per-token step rewards to the trainer so GAE runs
-        # on them. The scalar `scores` arg is a placeholder (ignored by our
-        # override when pending rewards are set) but must satisfy TRL's shape
-        # checks: one scalar tensor per sample.
         placeholder_scores = [torch.zeros((), dtype=torch.float32) for _ in token_reward_list]
         trainer.set_pending_step_rewards(token_reward_list)
         stats = trainer.step(query_tensors, response_tensors, placeholder_scores)
@@ -791,17 +857,8 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
             )
         )
 
-        # TRL exposes the (flattened) per-token advantages under "policy/advantages"
-        # — there is NO "ppo/policy/advantages_var" key, so the old code logged a
-        # constant 0.0. Compute the variance from the real array; a healthy PPO run
-        # has var > 0 (zero variance ⇒ no learning signal).
-        adv = stats.get("policy/advantages")
-        try:
-            import numpy as _np
-
-            adv_var = float(_np.nanvar(_np.asarray(adv))) if adv is not None else 0.0
-        except Exception:
-            adv_var = 0.0
+        # R9: advantage variance directly from our custom trainer's last batch.
+        adv_var = getattr(trainer, "_last_adv_var", 0.0)
 
         def _stat(key):
             """Pull a TRL stat as a python float (handles numpy scalars/arrays)."""
@@ -831,19 +888,27 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 "n_valid": n_valid,
                 "valid_rate": n_valid / max(1, cfg.batch_size),
                 "sft_anchor_loss": sft_loss_val,
+                # R9: reward component diagnostics
+                "alpha_mean": reward_rc["alpha_mean"],
+                "r_kg_mean": reward_rc["r_kg_mean"],
+                "r_text_mean": reward_rc["r_text_mean"],
+                "r_total_mean": reward_rc["r_total_mean"],
+                "n_steps_sample": reward_rc["n_steps"],
             }
         )
         if n_seen % (cfg.batch_size * 4) == 0:
             logger.info(
-                "step=%d mean_reward=%.4f kl=%.4f loss=%.4f clipfrac=%.3f valid=%d/%d sft_anchor=%.4f",
+                "step=%d reward=%.2f kl=%.1f clip=%.3f valid=%d/%d α=%.3f r_kg=%.3f r_text=%.3f n_steps=%d",
                 n_seen,
                 history[-1]["mean_reward"],
                 history[-1]["ppo_mean_kl"],
-                history[-1]["loss_total"] if history[-1]["loss_total"] is not None else float("nan"),
                 history[-1]["policy_clipfrac"] if history[-1]["policy_clipfrac"] is not None else float("nan"),
                 n_valid,
                 cfg.batch_size,
-                sft_loss_val,
+                reward_rc["alpha_mean"],
+                reward_rc["r_kg_mean"],
+                reward_rc["r_text_mean"],
+                reward_rc["n_steps"],
             )
             # R7: dump one sample response for qualitative monitoring.
             if response_texts:
@@ -925,6 +990,12 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 tb_writer.add_scalar("r8/reasoning_content_rate", sample_log["reasoning_content_rate"], global_step)
                 tb_writer.add_scalar("r8/total_steps", sample_log["total_steps"], global_step)
                 tb_writer.add_scalar("r8/steps_with_content", sample_log["steps_with_content"], global_step)
+            # ── R9: Reward component diagnostics ──
+            tb_writer.add_scalar("reward/alpha_mean", reward_rc["alpha_mean"], global_step)
+            tb_writer.add_scalar("reward/r_kg_mean", reward_rc["r_kg_mean"], global_step)
+            tb_writer.add_scalar("reward/r_text_mean", reward_rc["r_text_mean"], global_step)
+            tb_writer.add_scalar("reward/r_total_mean", reward_rc["r_total_mean"], global_step)
+            tb_writer.add_scalar("reward/n_steps", reward_rc["n_steps"], global_step)
 
         # Intermediate checkpoint: save the (PEFT) adapter whenever n_seen crosses
         # a save_every_steps boundary, so a run that collapses can be rolled back

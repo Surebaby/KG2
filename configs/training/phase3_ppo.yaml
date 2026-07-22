@@ -17,20 +17,16 @@ training:
   lora_dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj]
   ppo:
-    learning_rate: 1.0e-5
+    learning_rate: 1.0e-6
     batch_size: 8
     # R4: increased from 1 to 2 for more stable gradient estimates.
-    # 2 rollout gradients are averaged per mini-batch, reducing noise while
-    # staying within VRAM budget (pure_EM: ~32GB, alpha-dynamic+ReaRAG: ~90GB).
     mini_batch_size: 1
-    ppo_epochs: 4
+    ppo_epochs: 2
     cliprange: 0.2
     cliprange_value: 0.2
-    # KL anchor: 0.1 is the midpoint between the locked-at-SFT 0.2
-    # (policy only rephrased) and the runaway 0.05 (policy dropped [Step N]
-    # structure). R7: combined with SFT anchor (not format bonus) to keep
-    # the reasoning format while giving PPO room to optimise answers.
-    kl_coef: 0.1
+    # R9: kl_coef 0.1→0.15 for tighter KL control. Combined with lr 1e-6
+    # to reduce per-step policy drift and prevent 400-step collapse.
+    kl_coef: 0.15
     # Adaptive KL controller target + horizon.
     target_kl: 8.0
     kl_horizon: 2000.0
@@ -70,8 +66,8 @@ training:
     #     writing just 1 step — then gradually raise the bar
     #   sft_anchor_interval=10: 5x denser anchors (every 80 trajectories)
     #   sft_anchor_weight=0.05: 2.5x stronger pullback force
-    min_valid_steps: 1
-    sft_anchor_weight: 0.05
+    min_valid_steps: 2
+    sft_anchor_weight: 0.10
     sft_anchor_interval: 10
     # ------------------------------------------------------------------
     # R8: Content-Aware Gate + SFT Replay
@@ -83,12 +79,9 @@ training:
     # invalid (no outcome reward). Lower values (10-20) are more forgiving;
     # higher values (30-50) enforce richer reasoning.
     min_reasoning_chars: 20
-    # R8-D: SFT Replay — fraction of each PPO batch (0.0-1.0) sourced from
-    # SFT data with gold trajectories in context. Unlike the SFT anchor
-    # (separate backward pass), replay prompts are mixed directly into the
-    # PPO rollout pool. The model periodically sees well-formatted examples
-    # during exploration. Recommended: 0.10-0.20.
-    sft_replay_ratio: 0.15
+    # R9: precision PRM already breaks the zero-signal deadlock.
+    # Lower scale lets KL penalty do its job of preventing SFT forgetting.
+    step_reward_scale: 0.3
   # 6144 fits 15 passages (~3.7k tok) + KG block (30 triples) + generation so the
   # KG context is never truncated. Consistent with SFT/eval top_k=15.
   max_input_length: 6144

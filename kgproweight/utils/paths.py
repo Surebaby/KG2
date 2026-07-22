@@ -25,6 +25,7 @@ DEFAULT_MODEL_ENV = {
     "rearag": ("KGPW_REARAG_PATH", "THU-KEG/ReaRAG-9B"),
     "r1-searcher": ("KGPW_R1SEARCHER_PATH", "XXsongLALA/Qwen-2.5-7B-base-RAG-RL"),
     "selfrag": ("KGPW_SELFRAG_PATH", "selfrag/selfrag_llama2_7b"),
+    "corag": ("KGPW_CORAG_PATH", "corag/CoRAG-Llama3.1-8B-MultihopQA"),
 }
 
 

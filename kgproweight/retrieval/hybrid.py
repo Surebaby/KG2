@@ -130,6 +130,7 @@ def build_flashrag_config(
             "rearag": model_path("rearag"),
             "r1-searcher": model_path("r1-searcher"),
             "selfrag": model_path("selfrag"),
+            "corag": model_path("corag"),
         },
         "model2pooling": {"e5": "mean", "bge": "cls", "contriever": "mean"},
         # Default single retriever (used when use_multi_retriever=False)
@@ -151,8 +152,8 @@ def build_flashrag_config(
         "generator_batch_size": 1,
         "generation_params": {
             "max_tokens": EVAL_GENERATION_MAX_TOKENS,
-            "temperature": 0.7,
-            "do_sample": True,
+            "temperature": 0.0,
+            "do_sample": False,
         },
         "gpu_memory_utilization": 0.80,
         # Metrics

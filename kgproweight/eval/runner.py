@@ -145,7 +145,7 @@ def run_evaluation(
             logger.warning("after_run callback failed: %s", exc)
 
     final_dir: Optional[Path] = None
-    save_dir = cfg.get("save_dir")
+    save_dir = cfg["save_dir"] if "save_dir" in cfg else None
     if save_dir:
         final_dir = Path(save_dir)
         export_metric_json(final_dir)

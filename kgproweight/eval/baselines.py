@@ -19,6 +19,43 @@ from kgproweight.retrieval.hybrid import build_flashrag_config
 RunMode = Literal["standard", "naive"]
 
 
+def corag_extract_answer(dataset):
+    """CoRAG pred processing: extract first non-empty content line."""
+    for item in dataset:
+        pred = getattr(item, "pred", "") or ""
+        lines = [l.strip() for l in pred.split("\n") if l.strip()]
+        for line in lines:
+            if not line.startswith("Question:") and not line.startswith("Answer:"):
+                if len(line) > 3:
+                    item.pred = line
+                    break
+        else:
+            item.pred = lines[0] if lines else ""
+    return dataset
+
+
+def r1_extract_answer(dataset):
+    """R1-Searcher pred processing: extract content inside <answer> tags."""
+    import re
+    for item in dataset:
+        pred = getattr(item, "pred", "") or ""
+        # Try <answer>...</answer> first
+        m = re.search(r"<answer>\s*(.*?)\s*</answer>", pred, re.DOTALL | re.IGNORECASE)
+        if m:
+            item.pred = m.group(1).strip()
+            continue
+        # Fallback: try to find "answer:" or "Answer:" line
+        lines = [l.strip() for l in pred.split("\n") if l.strip()]
+        for line in lines:
+            if re.match(r"^(answer|final answer)\s*[:：]\s*", line, re.IGNORECASE):
+                item.pred = re.sub(r"^(answer|final answer)\s*[:：]\s*", "", line, flags=re.IGNORECASE).strip()
+                break
+        else:
+            # Last resort: last non-empty line
+            item.pred = lines[-1] if lines else ""
+    return dataset
+
+
 @dataclass
 class BaselineSpec:
     name: str
@@ -60,19 +97,36 @@ BASELINES: List[BaselineSpec] = [
     ),
     BaselineSpec(
         name="trace",
-        pipeline_class="SequentialPipeline",
-        pipeline_module="flashrag.pipeline.pipeline",
+        pipeline_class="IRCOTPipeline",
+        pipeline_module="flashrag.pipeline.active_pipeline",
         generator_model="llama3-8B-instruct",
-        system_prompt="Answer the question based on the retrieved passages.",
-        user_prompt="Reference passages:\n{reference}\n\nQuestion: {question}\nAnswer:",
-        extras={"refiner_name": "kg_trace_refiner"},
+        is_reasoning=True,
     ),
     BaselineSpec(
         name="r1_searcher",
-        pipeline_class="ReasoningPipeline",
-        pipeline_module="flashrag.pipeline.reasoning_pipeline",
+        pipeline_class="SequentialPipeline",
+        pipeline_module="flashrag.pipeline.pipeline",
         generator_model="r1-searcher",
-        is_reasoning=True,
+        is_reasoning=False,
+        system_prompt=(
+            "You are a helpful assistant. Answer the question based on the provided reference passages. "
+            "Put your final answer within <answer> </answer> tags."
+        ),
+        user_prompt="Reference passages:\n{reference}\n\nQuestion: {question}\n\n<think>",
+        extras={
+            "pred_process_fun": r1_extract_answer,
+            "generation_params": {"max_tokens": 1024, "temperature": 0.6, "top_p": 0.9},
+        },
+    ),
+    BaselineSpec(
+        name="corag",
+        pipeline_class="SequentialPipeline",
+        pipeline_module="flashrag.pipeline.pipeline",
+        generator_model="corag",
+        is_reasoning=False,
+        system_prompt="Answer the question based on the retrieved passages. Give only the answer.",
+        user_prompt="Reference passages:\n{reference}\n\nQuestion: {question}\nAnswer:",
+        extras={"pred_process_fun": corag_extract_answer},
     ),
     BaselineSpec(
         name="rearag",

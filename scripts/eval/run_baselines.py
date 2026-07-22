@@ -68,6 +68,7 @@ def main():
                         run_mode=spec.run_mode,
                         system_prompt=spec.system_prompt,
                         user_prompt=spec.user_prompt,
+                        pred_process_fun=spec.extras.get("pred_process_fun"),
                     )
                 except Exception as exc:
                     logger.error("Eval failed for %s/%s seed=%d: %s", method, ds, seed, exc)

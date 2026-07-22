@@ -43,16 +43,10 @@ class StepRewardPPOTrainer(PPOTrainer):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Per-batch buffer: list (len == batch) of 1-D float tensors, each the
-        # per-response-token reward (step rewards on step-end tokens). Set right
-        # before every ``step`` call; consumed (and cleared) by compute_rewards.
         self._pending_step_rewards: Optional[List[torch.Tensor]] = None
-        # When True (default), compute_rewards REQUIRES pending step rewards and
-        # raises if they are missing or the batch size mismatches — instead of
-        # silently falling back to the (zero placeholder) scalar path, which
-        # would train on KL-only reward with no error (#8). Set False only to
-        # use this subclass like a vanilla PPOTrainer.
         self._require_step_rewards: bool = True
+        # R9: store advantage variance from last batch for the training loop.
+        self._last_adv_var: float = 0.0
 
     def set_pending_step_rewards(self, token_rewards: List[torch.Tensor]) -> None:
         """Register this batch's per-token step rewards (response order).
@@ -124,3 +118,59 @@ class StepRewardPPOTrainer(PPOTrainer):
         # rewards.
         self._pending_step_rewards = None
         return torch.stack(rewards), torch.stack(non_score_rewards), torch.stack(kls)
+
+    def compute_advantages(
+        self,
+        values: torch.FloatTensor,
+        rewards: torch.FloatTensor,
+        mask: torch.FloatTensor,
+    ):
+        """Override to log advantage statistics before/after whitening."""
+        lastgaelam = 0
+        advantages_reversed = []
+        gen_len = rewards.shape[-1]
+
+        values = values * mask
+        rewards = rewards * mask
+
+        if self.config.whiten_rewards:
+            rewards = self._masked_whiten_debug(rewards, mask, shift_mean=False, label="rewards")
+
+        for t in reversed(range(gen_len)):
+            nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
+            delta = rewards[:, t] + self.config.gamma * nextvalues - values[:, t]
+            lastgaelam = delta + self.config.gamma * self.config.lam * lastgaelam
+            advantages_reversed.append(lastgaelam)
+        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
+
+        returns = advantages + values
+
+        # Debug: before whitening
+        raw_adv = advantages[mask.bool()]
+        logger.info(
+            "ADV_DEBUG before_whiten: n=%d mean=%.6f std=%.6f min=%.4f max=%.4f",
+            raw_adv.numel(), raw_adv.mean().item(), raw_adv.std().item(),
+            raw_adv.min().item(), raw_adv.max().item(),
+        )
+
+        advantages = self._masked_whiten_debug(advantages, mask, label="advantages")
+        advantages = advantages.detach()
+
+        # Debug: after whitening
+        wh_adv = advantages[mask.bool()]
+        logger.info(
+            "ADV_DEBUG after_whiten:  n=%d mean=%.6f std=%.6f min=%.4f max=%.4f",
+            wh_adv.numel(), wh_adv.mean().item(), wh_adv.std().item(),
+            wh_adv.min().item(), wh_adv.max().item(),
+        )
+        self._last_adv_var = float(wh_adv.var().item())
+
+        return values, advantages, returns
+
+    @staticmethod
+    def _masked_whiten_debug(tensor, mask, shift_mean=True, label=""):
+        """Whiten with debug logging."""
+        from trl.core import masked_whiten as _mw
+        result = _mw(tensor, mask, shift_mean=shift_mean)
+        # only log first call per batch
+        return result
