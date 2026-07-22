@@ -160,7 +160,25 @@ python scripts/eval/run_ihr_judge.py \
   --judge_model deepseek-chat --sample 200
 ```
 
-See `docs/baselines.md` for full baseline comparison results.
+See `docs/baselines_final.md` for full baseline comparison.
+
+## R9 v5 Results (July 2026)
+
+| Baseline | EM avg | HotpotQA | 2Wiki | MuSiQue |
+|---|---|---|---|---|
+| Full SFT | 0.291 | 0.397 | 0.303 | 0.173 |
+| Elite SFT | 0.257 | 0.353 | 0.273 | 0.143 |
+| **R9 v5 (500 steps)** | **0.240** | 0.34 | 0.25 | 0.13 |
+| CoRAG | 0.167 | 0.367 | 0.133 | 0.000 |
+| R1-Searcher | 0.154 | 0.310 | 0.143 | 0.010 |
+| Zero-shot | 0.103 | 0.203 | 0.080 | 0.027 |
+| Naive RAG | 0.061 | 0.177 | 0.007 | 0.000 |
+
+Key R9 v5 innovations:
+- **Precision × Relevance**: KG reward filters irrelevant triples via lexical evidence overlap
+- **outcome_weight=10.0**: Restores answer correctness as primary training signal
+- **step_reward_scale=0.3**: Prevents citation reward from dominating outcome
+- **Dynamic KG Cache**: 8493 pre-built Q→KG entries, 100% hit rate
 
 ---
 
