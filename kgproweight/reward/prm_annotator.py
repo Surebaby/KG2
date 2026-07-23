@@ -206,13 +206,22 @@ class PRMAnnotator:
         # touch the step's conclusion. A triple that is real but irrelevant
         # (e.g. "Ed Wood, instance of, human" for a nationality question) should
         # not earn the same reward as a directly useful triple.
+        # R9 v6: strip Knowledge Used section from text used for relevance.
+        # The triple was extracted from "Knowledge Used:" which is part of raw_text,
+        # so phrase-matching against raw_text always succeeds (self-citation).
+        # Extract only the reasoning body to judge whether the triple's content
+        # actually appears in the model's independent reasoning.
+        reasoning_only = step.raw_text
+        if "Knowledge Used:" in reasoning_only:
+            reasoning_only = reasoning_only.split("Knowledge Used:", 1)[0]
+
         relevance_ratio = 1.0  # default: assume relevant
         if self.require_triple_relevance and step.cited_triples:
             relevant_count = sum(
                 1 for triple in step.cited_triples
                 if self._triple_relevant(
                     [triple],
-                    reasoning=step.raw_text,
+                    reasoning=reasoning_only,
                     conclusion=step.intermediate_conclusion,
                 )
             )

@@ -106,11 +106,14 @@ class PPOConfig(_Base):
     kl_horizon: float = 2000.0  # adaptive KL controller horizon (TRL default 10000)
     outcome_weight: float = 8.0  # R5: stronger EM signal for hard examples
     text_reward_scale: float = 0.3  # R5: scale down R_text so EM+R_KG dominate
+    step_reward_scale: float = 1.0  # R9 v5: scale per-step composite reward (tuned to 0.3)
     # R7: format bonus REMOVED. Format is a constraint (ValidTrajectory gate),
     # not a reward target. See docs/problem_and_solutions.md and docs/R7_experiment_log.md.
     min_valid_steps: int = 3  # min parsed [Step N] blocks for outcome eligibility
+    min_reasoning_chars: int = 20  # R8: minimum chars in Reasoning field for content gate
     sft_anchor_weight: float = 0.02  # λ: lightweight format-preservation anchor
     sft_anchor_interval: int = 50  # run SFT anchor every N PPO steps
+    sft_replay_ratio: float = 0.15  # R8: fraction of PPO batch from SFT data
     pure_em_reward: bool = False  # skip R_KG+R_text — reward = EM (conditional on ValidTrajectory)
     vf_coef: float = 0.5
     max_input_length: int = 4096

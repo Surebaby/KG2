@@ -161,7 +161,7 @@ class CompositeRewardModel(nn.Module):
                     alpha=a,
                     r_kg=sr.r_kg,
                     r_text=sr.r_text,
-                    r_total=a * sr.r_kg + (1.0 - a) * sr.r_text * self.text_reward_scale,
+                    r_total=(a * sr.r_kg + (1.0 - a) * sr.r_text * self.text_reward_scale) * self.step_reward_scale,
                     graph_density=sr.graph_density,
                     link_confidence=sr.link_confidence,
                     semantic_entropy=sr.semantic_entropy,

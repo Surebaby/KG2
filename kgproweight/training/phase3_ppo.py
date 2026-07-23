@@ -612,15 +612,25 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     # R9: prompt KG uses silver data (instant). Reward-side dynamic KG provides
     # the KG signal (already works — α=0.85, r_kg broke zero). Prompt-side
     # injection needs pre-built entity index for speed; TODO separately.
-    # R9: pre-built Q→KG index (0.2s, 100% hit rate). Load and pass to prompts.
+    # R9 v6: pre-built Q→KG index with filtered & ranked triples.
     _q_kg_index = {}
-    _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index.json"
+    _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index_v2.json"
+    if not _q_kg_path.exists():
+        _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index.json"
     if _q_kg_path.exists():
         import json as _json
         _q_kg_raw = _json.loads(_q_kg_path.read_text(encoding="utf-8"))
+        is_v2 = "builder_version" in (_q_kg_raw[0] if _q_kg_raw else {})
         for _entry in _q_kg_raw:
-            _q_kg_index[_entry["q"]] = _entry["t"]
-        logger.info("R9: Loaded %d question→KG entries from %s", len(_q_kg_index), _q_kg_path)
+            _q = _entry.get("question", _entry.get("q", ""))
+            if is_v2:
+                # v2 rich format: triples is list of dicts {h, pid, r, t, score}
+                _q_kg_index[_q] = [(t["h"], t["r"], t["t"]) for t in _entry["triples"]]
+            else:
+                # v1 format: t is list of lists [h, r, t]
+                _q_kg_index[_q] = _entry["t"]
+        logger.info("R9 v6: Loaded %d question→KG entries from %s (v%s)",
+                    len(_q_kg_index), _q_kg_path, "2" if is_v2 else "1")
     samples = _prepare_prompts(reader, tokenizer, cfg, question_kg_index=_q_kg_index)
     if not samples:
         raise ValueError(f"No PPO samples derived from {cfg.silver_path}")

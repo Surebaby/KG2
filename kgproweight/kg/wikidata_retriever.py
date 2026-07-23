@@ -74,7 +74,7 @@ class WikidataSubgraphRetriever:
         limit = self.max_neighbors
         filter_clause = ""
         if self.relation_filter:
-            pids = " ".join(f"wd:{p}" for p in self.relation_filter)
+            pids = " ".join(f"wdt:{p}" for p in self.relation_filter)
             filter_clause = f"FILTER(?prop IN ({pids}))"
         return f"""
 SELECT ?headLabel ?propLabel ?tailLabel WHERE {{
@@ -84,11 +84,15 @@ SELECT ?headLabel ?propLabel ?tailLabel WHERE {{
   wd:{qid} rdfs:label ?headLabel . FILTER(LANG(?headLabel)="en")
   ?tail rdfs:label ?tailLabel . FILTER(LANG(?tailLabel)="en")
   {filter_clause}
-}} LIMIT {limit}
+}} ORDER BY ?prop LIMIT {limit}
 """
 
     def _build_2hop_query(self, qid: str) -> str:
         limit = self.max_neighbors
+        filter_clause = ""
+        if self.relation_filter:
+            pids = " ".join(f"wdt:{p}" for p in self.relation_filter)
+            filter_clause = f"FILTER(?p1 IN ({pids}) && ?p2 IN ({pids}))"
         return f"""
 SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
   wd:{qid} ?p1 ?mid .
@@ -100,7 +104,8 @@ SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
   ?p2Ent wikibase:directClaim ?p2 .
   ?p2Ent rdfs:label ?p2Label . FILTER(LANG(?p2Label)="en")
   ?tail rdfs:label ?tailLabel . FILTER(LANG(?tailLabel)="en")
-}} LIMIT {limit}
+  {filter_clause}
+}} ORDER BY ?p1 ?p2 LIMIT {limit}
 """
 
     # ------------------------------------------------------------------
@@ -113,7 +118,8 @@ SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
         seen: Set[Tuple[str, str, str]] = set()
 
         for qid in entity_ids:
-            cache_key = f"{qid}_{self.max_hops}"
+            filter_tag = "_".join(sorted(self.relation_filter)) if self.relation_filter else "all"
+            cache_key = f"{qid}_{self.max_hops}_{self.max_neighbors}_{filter_tag}"
             cached = self.cache.get(cache_key)
             if cached is not None:
                 for triple in cached:

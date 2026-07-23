@@ -59,8 +59,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _build_retriever(dataset_name: str):
-    """Build a FlashRAG hybrid retriever (RRF top-50)."""
+def _build_retriever(dataset_name: str, topk: int = DEFAULT_TOPK):
+    """Build a FlashRAG hybrid retriever (RRF top-K)."""
     setup_flashrag()
     from flashrag.utils import get_retriever
 
@@ -69,6 +69,7 @@ def _build_retriever(dataset_name: str):
         save_note="phase1_silver",
         save_dir=str(data_dir() / "silver_data" / "_runtime"),
         split="train",
+        topk=topk,
     )
     cfg = flashrag_config(flashrag_cfg)
     return get_retriever(cfg)
@@ -148,7 +149,7 @@ def main() -> None:
     else:
         items = _load_items(args.dataset, args.split, max_queries)
 
-    retriever = _build_retriever(args.dataset)
+    retriever = _build_retriever(args.dataset, topk=retrieval_top_k)
 
     entity_cache = resolve_entity_cache_path()
     kg_cache_dir = resolve_kg_cache_dir()

@@ -22,14 +22,26 @@ from kgproweight.retrieval.bootstrap import (
 )
 from kgproweight.utils.paths import data_dir, model_path
 
-# Passages included in the prompt + retrieved per query.
-# Was 50, but 50 passages ≈ 10.7k tokens (median) — they cannot fit the 4096
-# context, so 100% of SFT examples had their answer truncated away (the Student
-# then learned to echo passages and never emit [Final Answer]). 15 passages
-# ≈ 3.5k tokens, leaving room for the (short, ~210-token median) answer trace.
+# Two-stage retrieval architecture (R9 v6).
+# Stage 1: dense + sparse → RRF → candidate pool
+# Stage 2: reranker → top-K → token-budgeted prompt
+DEFAULT_DENSE_CANDIDATE_TOPK = 100
+DEFAULT_SPARSE_CANDIDATE_TOPK = 100
+DEFAULT_RRF_CANDIDATE_TOPK = 50
+DEFAULT_RERANK_TOPK = 10
+DEFAULT_PROMPT_TOKEN_BUDGET = 3860
+
+# Legacy: single retrieval_topk (used when two-stage is disabled)
 DEFAULT_TOPK = 15
 DEFAULT_RRF_K = 60
 DEFAULT_PER_RETRIEVER_TOPK = 100
+
+# Prompt budget reserved for non-passage content.
+PROMPT_RESERVED_TOKENS = (
+    700   # instruction + question
+    + 1200  # KG block (30 triples × ~40 chars/triple ÷ 4 chars/token)
+    + 384   # generation budget
+)
 
 # Shared eval token budget (paper Appendix A / FlashRAG defaults).
 EVAL_GENERATOR_MAX_INPUT_LEN = 4096

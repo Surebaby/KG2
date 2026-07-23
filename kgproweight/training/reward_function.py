@@ -357,8 +357,10 @@ class KGProWeightRewardFunction:
             except Exception as e:
                 logger.warning("Dynamic KG fetch failed: %s", e)
 
-        # Use dynamic KG if available, otherwise fall back to silver spec
-        kg_for_reward = dynamic_kg if dynamic_kg else spec.kg_subgraph
+        # Merge dynamic KG with question-anchored KG instead of replacing it.
+        # Dynamic KG alone enables reward hacking: model generates wrong entity,
+        # system fetches its real KG, model cites it → verified → positive reward.
+        kg_for_reward = list(set(tuple(t) for t in (spec.kg_subgraph + dynamic_kg)))
 
         records = self.composite.compute_trajectory_rewards(
             steps=steps,
