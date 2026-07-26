@@ -95,36 +95,75 @@ def main():
         all_ok &= check(label, ok, size if ok else str(path))
 
     # ── 5. question_kg_index deep check ──
-    kg_cache_path = index_dir() / "kg_cache" / "question_kg_index.json"
+    # Prefer v2 (filtered), fall back to v1
+    kg_cache_path = index_dir() / "kg_cache" / "question_kg_index_v2.json"
+    if not kg_cache_path.exists():
+        kg_cache_path = index_dir() / "kg_cache" / "question_kg_index.json"
     if kg_cache_path.exists():
         section("5. question_kg_index Deep Check")
         raw = json.loads(kg_cache_path.read_text(encoding="utf-8"))
         all_ok &= check("entries > 0", len(raw) > 0, f"{len(raw)} entries")
 
-        # Structure
+        # Detect v1 vs v2 format
         sample = raw[0]
-        all_ok &= check('has "q" field', "q" in sample)
-        all_ok &= check('has "t" field (triples)', "t" in sample)
-        if "t" in sample:
-            all_ok &= check("triples are list of lists", isinstance(sample["t"], list) and len(sample["t"]) > 0)
-            if sample["t"]:
-                all_ok &= check("triple format [subj, rel, obj]", len(sample["t"][0]) == 3, str(sample["t"][0]))
+        is_v2 = "builder_version" in sample
+        has_q = "q" in sample or "question" in sample
+        all_ok &= check("has question field", has_q, f"v{'2' if is_v2 else '1'} format")
+
+        # Triple accessor
+        def _get_triples(entry):
+            if "triples" in entry:  # v2: list of dicts
+                return entry["triples"]
+            return entry.get("t", [])  # v1: list of lists
+
+        def _get_relation(triple):
+            if isinstance(triple, dict):
+                return triple.get("r", "")
+            return triple[1] if len(triple) >= 2 else ""
+
+        triples_list = _get_triples(sample)
+        all_ok &= check("has triples", len(triples_list) > 0, f"{len(triples_list)} triples")
+        all_ok &= check("format ok", _get_relation(triples_list[0]) != "", str(triples_list[0])[:80])
 
         # De-duplication
-        questions = [e["q"] for e in raw]
+        questions = [e.get("q", e.get("question", "")) for e in raw]
         unique = set(questions)
         all_ok &= check("no duplicate questions", len(unique) == len(questions),
                         f"{len(unique)}/{len(questions)} unique")
 
         # Load speed
         t0 = time.time()
-        q_kg_index = {e["q"]: e["t"] for e in raw}
+        q_kg_index = {e.get("q", e.get("question", "")): _get_triples(e) for e in raw}
         elapsed = time.time() - t0
         all_ok &= check("index build < 0.5s", elapsed < 0.5, f"{elapsed:.3f}s")
 
         # Triple stats
-        avg_t = sum(len(e["t"]) for e in raw) / max(1, len(raw))
-        all_ok &= check("avg triples/question > 5", avg_t > 5, f"{avg_t:.1f}")
+        avg_t = sum(len(_get_triples(e)) for e in raw) / max(1, len(raw))
+        all_ok &= check("avg triples/question > 5" if not is_v2 else "avg triples/question > 3",
+                        avg_t > (5 if not is_v2 else 3), f"{avg_t:.1f}")
+
+        # R9 v6: quality checks
+        taxonomic = {"instance of", "subclass of"}
+        tax_count = sum(1 for e in raw for t in _get_triples(e)
+                        if _get_relation(t) in taxonomic)
+        total_t = sum(len(_get_triples(e)) for e in raw)
+        tax_ratio = tax_count / max(1, total_t) * 100
+        threshold = 15 if is_v2 else 30
+        all_ok &= check(f"taxonomic ratio < {threshold}%", tax_ratio < threshold,
+                        f"{tax_ratio:.1f}% (target < {threshold}%)")
+
+        # Builder/policy version
+        if is_v2:
+            all_ok &= check("builder_version", True, sample["builder_version"])
+        else:
+            all_ok &= check("v1→v2 rebuild recommended", True,
+                          "run scripts/prepare/06_build_question_kg_index.py")
+
+        # KG token budget
+        p95_triples = sorted(len(_get_triples(e)) for e in raw)[int(len(raw) * 0.95)]
+        p95_tokens = p95_triples * 40 // 4
+        all_ok &= check("P95 KG tokens < 1200", p95_tokens <= 1200,
+                        f"P95={p95_triples} triples ≈ {p95_tokens} tokens")
 
     # ── 6. Datasets ──
     section("6. Datasets")

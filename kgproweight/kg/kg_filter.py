@@ -495,45 +495,38 @@ def score_triple(
 ) -> float:
     """Score a triple's relevance to the question (0.0–1.0).
 
-    Scoring formula (R9 v6 improved):
-      score = 0.15 * entity_anchor         (reduced: being in question ≠ useful)
-            + 0.20 * path_connectivity     (NEW: connects question entities)
-            + 0.20 * relation_question_similarity
-            + 0.20 * relation_utility      (NEW: inherent usefulness of relation)
-            + 0.15 * triple_question_similarity
-            + 0.10 * entity_mention_quality (NEW: reward multi-word proper names)
+    Scoring formula (R9 v6, per §2.3):
+      score = 0.30 * entity_anchor
+            + 0.25 * relation_question_similarity
+            + 0.25 * triple_question_similarity
+            + 0.10 * path_connectivity
+            + 0.10 * retrieved_evidence_support
             - taxonomic_penalty
     """
     q_lower = question.lower()
     h, r, t = triple
     pid = pid or _pid_for_triple(triple)
 
-    # entity_anchor: 0.15 (reduced from 0.30)
+    # entity_anchor: 0.30 — head/tail from high-confidence question entities
     entity_score = max(_entity_in_question(h, q_lower), _entity_in_question(t, q_lower))
 
-    # path_connectivity: 0.20 (NEW)
-    entities = question_entities or []
-    path_score = _path_connectivity_score(triple, entities)
-
-    # relation_question_similarity: 0.20
+    # relation_question_similarity: 0.25 — PID matches question type
     rel_score = _relation_question_score(pid, q_lower)
 
-    # relation_utility: 0.20 (NEW — baseline quality of the relation type)
-    utility = _relation_utility_baseline(pid, r)
-
-    # triple_question_similarity: 0.15 — relation label word overlap
+    # triple_question_similarity: 0.25 — semantic overlap with question
     triple_score = 0.0
     r_lower = r.lower()
     for word in r_lower.split():
         if len(word) > 2 and word in q_lower:
-            triple_score = 0.15
+            triple_score = 0.25
             break
 
-    # entity_mention_quality: 0.10 (NEW — reward proper multi-word entities)
-    mention_score = 0.0
-    for ent in (h, t):
-        if " " in ent.strip() and len(ent.strip()) > 8:  # multi-word proper name
-            mention_score = max(mention_score, 0.10)
+    # path_connectivity: 0.10 — connects two question entities
+    entities = question_entities or []
+    path_score = _path_connectivity_score(triple, entities)
+
+    # retrieved_evidence_support: 0.10 — placeholder (passage-aware in future)
+    evidence_score = 0.05  # baseline: assume moderate support
 
     # taxonomic penalty
     taxonomic_penalty = 0.0
@@ -545,12 +538,11 @@ def score_triple(
         taxonomic_penalty = 0.15
 
     return (
-        0.15 * entity_score
-        + 0.20 * path_score
-        + 0.20 * rel_score
-        + 0.20 * utility
-        + 0.15 * triple_score
-        + 0.10 * mention_score
+        0.30 * entity_score
+        + 0.25 * rel_score
+        + 0.25 * triple_score
+        + 0.10 * path_score
+        + 0.10 * evidence_score
         - taxonomic_penalty
     )
 

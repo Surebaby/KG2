@@ -144,7 +144,7 @@ class Phase3PPOConfig:
     # for activations at batch_size=8 / mini_batch_size=1 + gradient checkpointing.
     # If OOM: drop batch_size 8→4, then ppo_max_kg_triples 30→20, then passages.
     ppo_max_passages: int = 15
-    ppo_max_kg_triples: int = 30
+    ppo_max_kg_triples: int = 50
 
     # LoRA on policy
     use_lora: bool = True
