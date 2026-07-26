@@ -1,12 +1,25 @@
-includes:
-  - ../base.yaml
-
+# Two-stage retrieval config (R9 v6)
+# Stage 1: E5@100 + BM25@100 → RRF(k=60) → top-50 candidates
+# Stage 2: BM25 reranker → top-10 → token-budgeted prompt
 retrieval:
-  name: hybrid_rrf_top50
+  name: hybrid_rrf_two_stage
   use_multi_retriever: true
   merge_method: rrf
   rrf_k: 60
-  retrieval_topk: 50
+
+  # Stage 1: candidate recall
+  dense_candidate_topk: 100
+  sparse_candidate_topk: 100
+  rrf_candidate_topk: 50
+
+  # Stage 2: reranker
+  rerank_method: bm25
+  cross_encoder_model: "BAAI/bge-reranker-v2-m3"
+  rerank_topk: 10
+
+  # Prompt budget
+  prompt_passage_token_budget: 3860
+
   dense_model: e5
   sparse_method: bm25s
   bm25_backend: bm25s

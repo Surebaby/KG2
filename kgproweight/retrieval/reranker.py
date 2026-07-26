@@ -76,25 +76,95 @@ def _passage_text(passage: Dict[str, Any]) -> str:
 
 
 class RetrievalConfig:
-    """Two-stage retrieval configuration."""
+    """Two-stage retrieval configuration.
+
+    All top-k values are independent — no single value controls multiple stages.
+    """
 
     def __init__(
         self,
         dense_candidate_topk: int = 100,
         sparse_candidate_topk: int = 100,
+        rrf_k: int = 60,
         rrf_candidate_topk: int = 50,
         rerank_topk: int = 10,
         prompt_passage_token_budget: int = 3860,
-        rerank_method: str = "bm25",  # or "cross-encoder"
+        rerank_method: str = "bm25",
         cross_encoder_model: str = "BAAI/bge-reranker-v2-m3",
     ):
         self.dense_candidate_topk = dense_candidate_topk
         self.sparse_candidate_topk = sparse_candidate_topk
+        self.rrf_k = rrf_k
         self.rrf_candidate_topk = rrf_candidate_topk
         self.rerank_topk = rerank_topk
         self.prompt_passage_token_budget = prompt_passage_token_budget
         self.rerank_method = rerank_method
         self.cross_encoder_model = cross_encoder_model
+
+    def log_string(self) -> str:
+        return (
+            f"dense@{self.dense_candidate_topk} + sparse@{self.sparse_candidate_topk} "
+            f"→ RRF(k={self.rrf_k})@{self.rrf_candidate_topk} "
+            f"→ {self.rerank_method}@{self.rerank_topk} "
+            f"→ prompt≤{self.prompt_passage_token_budget}tok"
+        )
+
+
+class RRFRerankRetriever:
+    """Two-stage retriever wrapping FlashRAG dense + sparse retrievers.
+
+    Stage 1: dense@100 + sparse@100 → RRF merge → top-50 candidates
+    Stage 2: reranker (BM25 or cross-encoder) → top-10 for prompt
+    """
+
+    def __init__(
+        self,
+        dense_retriever,
+        sparse_retriever,
+        config: RetrievalConfig,
+    ):
+        self.dense = dense_retriever
+        self.sparse = sparse_retriever
+        self.config = config
+
+    def batch_search(self, questions: List[str]) -> List[List[Dict[str, Any]]]:
+        """Two-stage search: dense+sparse → RRF → rerank."""
+        # Stage 1: dense + sparse retrieval
+        dense_results = self.dense.batch_search(questions)
+        sparse_results = self.sparse.batch_search(questions)
+
+        # RRF merge (handles dedup + score accumulation)
+        all_candidates = []
+        for d_res, s_res in zip(dense_results, sparse_results):
+            # Simple RRF: combine with source tracking, dedup by id
+            id2doc = {}
+            scores: Dict[str, float] = {}
+            k = self.config.rrf_k
+
+            for rank, doc in enumerate(d_res[:self.config.dense_candidate_topk], start=1):
+                did = doc.get("id", str(rank))
+                id2doc[did] = doc
+                scores[did] = scores.get(did, 0) + 1.0 / (k + rank)
+
+            for rank, doc in enumerate(s_res[:self.config.sparse_candidate_topk], start=1):
+                did = doc.get("id", str(rank))
+                if did not in id2doc:
+                    id2doc[did] = doc
+                scores[did] = scores.get(did, 0) + 1.0 / (k + rank)
+
+            # Sort by RRF score, take top candidates
+            sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
+            candidate_ids = sorted_ids[:self.config.rrf_candidate_topk]
+            candidates = [id2doc[did] for did in candidate_ids]
+            all_candidates.append(candidates)
+
+        # Stage 2: rerank
+        if self.config.rerank_method == "bm25":
+            return rerank_with_bm25(questions, all_candidates, topk=self.config.rerank_topk)
+
+        # Cross-encoder rerank (placeholder)
+        logger.warning("Cross-encoder not implemented, falling back to top-K truncation")
+        return [c[:self.config.rerank_topk] for c in all_candidates]
 
 
 def pack_passages_by_token_budget(

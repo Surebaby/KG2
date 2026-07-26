@@ -41,6 +41,8 @@ def parse_args():
     p.add_argument("--seeds", type=int, nargs="+", default=[13, 42, 2024])
     p.add_argument("--gpu_id", default="0")
     p.add_argument("--save_root", default=None)
+    p.add_argument("--no_kg", action="store_true", help="Disable KG injection (alpha=0 ablation)")
+    p.add_argument("--rerank", type=int, default=0, help="Rerank top-K after RRF (0=disabled)")
     return p.parse_args()
 
 
@@ -107,6 +109,16 @@ def main():
                 "kg_cache_dir": args.kg_cache_dir,
                 "record_alpha": record_alpha,
             }
+            if args.no_kg:
+                pipeline_kwargs["inject_kg"] = False
+            if args.rerank > 0:
+                pipeline_kwargs["rerank_topk"] = args.rerank
+                pipeline_kwargs["retrieval_topk"] = 50  # RRF candidate pool
+                logger.info(
+                    "Two-stage retrieval: dense@100 + sparse@100 → RRF@50 → rerank@%d → prompt≤%dtok",
+                    args.rerank,
+                    3860,
+                )
 
             def _after_run(pipe, save_dir=save_dir):  # noqa: ARG001
                 if not record_alpha:

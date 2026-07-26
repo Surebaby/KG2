@@ -414,52 +414,143 @@ def _entity_in_question(entity: str, question_lower: str) -> float:
 
 
 def _relation_question_score(pid: str, question_lower: str) -> float:
-    """Score based on question keywords mapping to this PID."""
+    """Score based on question keywords mapping to this PID (0.0–1.0)."""
     if not pid:
         return 0.0
     for keyword, pids in _QUESTION_KEYWORD_TO_PID.items():
         if pid in pids and keyword in question_lower:
             return 1.0
+    # Partial match: keyword parts in question
+    for keyword, pids in _QUESTION_KEYWORD_TO_PID.items():
+        if pid in pids:
+            kw_parts = keyword.split()
+            if any(p in question_lower for p in kw_parts if len(p) > 2):
+                return 0.5
     return 0.0
+
+
+def _path_connectivity_score(
+    triple: Tuple[str, str, str],
+    question_entities: List[str],
+) -> float:
+    """Score 1.0 if triple connects two question entities, 0.5 if connects one."""
+    h_lower = triple[0].strip().lower()
+    t_lower = triple[2].strip().lower()
+    q_entities_lower = [e.strip().lower() for e in question_entities]
+
+    h_match = any(h_lower == e or e in h_lower or h_lower in e for e in q_entities_lower)
+    t_match = any(t_lower == e or e in t_lower or t_lower in e for e in q_entities_lower)
+
+    if h_match and t_match:
+        return 1.0  # connects two question entities → highly relevant
+    if h_match or t_match:
+        return 0.5  # connects one question entity
+    return 0.0
+
+
+def _relation_utility_baseline(pid: str, r: str) -> float:
+    """Score how inherently useful a relation is for QA (0.0–1.0).
+
+    Wikidata metadata relations get 0.0. Core factual relations get 1.0.
+    Unknown/unmapped relations get 0.1 (likely noise).
+    """
+    if not pid:
+        # Unknown relation — check for noise patterns
+        r_lower = r.lower()
+        noise_patterns = [
+            "maintained by", "model item", "topic's main", "has template",
+            "different from", "said to be the same", "properties for this type",
+            "described by source", "topic's main category",
+            "Wikimedia", "Wikimedia", "page banner", "street address",
+            "postal code", "external data", "ID", "username",
+        ]
+        for pattern in noise_patterns:
+            if pattern.lower() in r_lower:
+                return -0.30  # heavy penalty for noise
+        return 0.05  # unknown, assume mostly useless
+
+    # Core factual relations
+    core_pids = {
+        "P27", "P19", "P20", "P569", "P570",  # nationality, birth, death
+        "P106", "P39", "P108",                 # occupation, position, employer
+        "P26", "P22", "P25", "P40",            # family
+        "P57", "P58", "P161", "P162", "P50",   # film/creative
+        "P17", "P131", "P159", "P276", "P36",   # location
+        "P112", "P127", "P176", "P355",        # organization
+        "P69", "P54", "P118", "P463",          # education, sports, membership
+        "P136", "P407", "P138",                # genre, language, named after
+        "P571", "P576",                        # inception, dissolution
+    }
+    if pid in core_pids:
+        return 0.25  # baseline reward for being a useful relation type
+
+    return 0.05  # mapped but not core → low utility
 
 
 def score_triple(
     triple: Tuple[str, str, str],
     question: str,
     pid: str = "",
+    question_entities: Optional[List[str]] = None,
 ) -> float:
-    """Score a triple's relevance to the question (0.0–1.0)."""
+    """Score a triple's relevance to the question (0.0–1.0).
+
+    Scoring formula (R9 v6 improved):
+      score = 0.15 * entity_anchor         (reduced: being in question ≠ useful)
+            + 0.20 * path_connectivity     (NEW: connects question entities)
+            + 0.20 * relation_question_similarity
+            + 0.20 * relation_utility      (NEW: inherent usefulness of relation)
+            + 0.15 * triple_question_similarity
+            + 0.10 * entity_mention_quality (NEW: reward multi-word proper names)
+            - taxonomic_penalty
+    """
     q_lower = question.lower()
     h, r, t = triple
     pid = pid or _pid_for_triple(triple)
 
-    # entity_anchor: 0.30 weight
+    # entity_anchor: 0.15 (reduced from 0.30)
     entity_score = max(_entity_in_question(h, q_lower), _entity_in_question(t, q_lower))
-    # relation_question_similarity: 0.25 weight
+
+    # path_connectivity: 0.20 (NEW)
+    entities = question_entities or []
+    path_score = _path_connectivity_score(triple, entities)
+
+    # relation_question_similarity: 0.20
     rel_score = _relation_question_score(pid, q_lower)
-    # triple_question_similarity: 0.25 weight — simplified: relation label overlap
+
+    # relation_utility: 0.20 (NEW — baseline quality of the relation type)
+    utility = _relation_utility_baseline(pid, r)
+
+    # triple_question_similarity: 0.15 — relation label word overlap
     triple_score = 0.0
     r_lower = r.lower()
     for word in r_lower.split():
         if len(word) > 2 and word in q_lower:
-            triple_score = 0.25
+            triple_score = 0.15
             break
 
-    # Taxonomic penalty: instance_of / subclass_of / has_part are rarely useful
-    # Penalty must offset entity_anchor (0.30) so these only survive with
-    # additional question-relevance signal (relation or triple similarity).
+    # entity_mention_quality: 0.10 (NEW — reward proper multi-word entities)
+    mention_score = 0.0
+    for ent in (h, t):
+        if " " in ent.strip() and len(ent.strip()) > 8:  # multi-word proper name
+            mention_score = max(mention_score, 0.10)
+
+    # taxonomic penalty
     taxonomic_penalty = 0.0
-    if pid in ("P31", "P279"):  # instance of, subclass of
+    if pid in ("P31", "P279"):
         taxonomic_penalty = 0.35
-    elif pid == "P527":  # has part(s)
+    elif pid == "P527":
         taxonomic_penalty = 0.20
-    elif pid == "P361":  # part of
+    elif pid == "P361":
         taxonomic_penalty = 0.15
 
     return (
-        0.30 * entity_score
-        + 0.25 * rel_score
-        + 0.25 * triple_score
+        0.15 * entity_score
+        + 0.20 * path_score
+        + 0.20 * rel_score
+        + 0.20 * utility
+        + 0.15 * triple_score
+        + 0.10 * mention_score
         - taxonomic_penalty
     )
 
@@ -470,6 +561,7 @@ def filter_and_rank_triples(
     pid_map: Optional[Dict[Tuple[str, str, str], str]] = None,
     max_keep: int = 30,
     rich: bool = False,
+    question_entities: Optional[List[str]] = None,
 ) -> List:
     """Full pipeline: hard delete → quota → score → rank → top-K.
 
@@ -478,6 +570,11 @@ def filter_and_rank_triples(
     """
     if pid_map is None:
         pid_map = {t: _pid_for_triple(t) for t in triples}
+
+    # Extract question entities for path_connectivity scoring
+    if question_entities is None:
+        from kgproweight.kg.entity_linker import extract_mentions
+        question_entities = extract_mentions(question, max_n=5)
 
     # Layer 1: hard delete
     surviving = [
@@ -490,7 +587,8 @@ def filter_and_rank_triples(
 
     # Layer 3: score and rank
     scored = [
-        (score_triple(t, question, pid=pid_map.get(t, "")), t)
+        (score_triple(t, question, pid=pid_map.get(t, ""),
+                       question_entities=question_entities), t)
         for t in after_quota
     ]
     scored.sort(key=lambda x: x[0], reverse=True)

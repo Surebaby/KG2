@@ -25,15 +25,16 @@ from kgproweight.utils.paths import data_dir, model_path
 # Two-stage retrieval architecture (R9 v6).
 # Stage 1: dense + sparse → RRF → candidate pool
 # Stage 2: reranker → top-K → token-budgeted prompt
+#   All top-k values are INDEPENDENT — no single value controls multiple stages.
 DEFAULT_DENSE_CANDIDATE_TOPK = 100
 DEFAULT_SPARSE_CANDIDATE_TOPK = 100
 DEFAULT_RRF_CANDIDATE_TOPK = 50
 DEFAULT_RERANK_TOPK = 10
 DEFAULT_PROMPT_TOKEN_BUDGET = 3860
+DEFAULT_RRF_K = 60
 
 # Legacy: single retrieval_topk (used when two-stage is disabled)
 DEFAULT_TOPK = 15
-DEFAULT_RRF_K = 60
 DEFAULT_PER_RETRIEVER_TOPK = 100
 
 # Prompt budget reserved for non-passage content.
@@ -44,7 +45,7 @@ PROMPT_RESERVED_TOKENS = (
 )
 
 # Shared eval token budget (paper Appendix A / FlashRAG defaults).
-EVAL_GENERATOR_MAX_INPUT_LEN = 4096
+EVAL_GENERATOR_MAX_INPUT_LEN = 6144  # increased for two-stage retrieval
 EVAL_GENERATION_MAX_TOKENS = 512
 EVAL_RETRIEVAL_QUERY_MAX_LENGTH = 128
 

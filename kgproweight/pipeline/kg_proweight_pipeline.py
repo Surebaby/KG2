@@ -27,6 +27,7 @@ from kgproweight.kg.entity_linker import EntityLinker, extract_mentions
 from kgproweight.kg.wikidata_retriever import WikidataSubgraphRetriever
 from kgproweight.retrieval.hybrid import DEFAULT_TOPK
 from kgproweight.reward.alpha_gate import AlphaGate, compute_features
+from kgproweight.utils.paths import index_dir
 from kgproweight.reward.prm_annotator import PRMAnnotator
 from kgproweight.utils.flashrag_bootstrap import setup_flashrag
 from kgproweight.utils.logging import get_logger
@@ -53,6 +54,7 @@ class KGProWeightPipeline(BasicPipeline):
         max_kg_triples: int = 50,
         max_mentions: int = 5,
         retrieval_topk: Optional[int] = None,
+        rerank_topk: int = 0,  # 0 = disabled
         generator=None,
         retriever=None,
         **kwargs,
@@ -64,6 +66,7 @@ class KGProWeightPipeline(BasicPipeline):
         self.max_mentions = max_mentions
         _cfg_topk = config["retrieval_topk"] if "retrieval_topk" in config else DEFAULT_TOPK
         self.retrieval_topk = retrieval_topk or int(_cfg_topk)
+        self.rerank_topk = rerank_topk
         self._alpha_records: List[Dict] = []
 
         self.generator = generator if generator is not None else get_generator(config)
@@ -80,6 +83,25 @@ class KGProWeightPipeline(BasicPipeline):
             max_hops=2, max_neighbors=30, cache_dir=kg_cache_dir, offline=_kg_offline
         )
         self.prm_annotator = PRMAnnotator(entity_linker=self.entity_linker, verbose=False)
+
+        # R9 v6: load pre-built question→KG index (v2 filtered cache) to align
+        # inference KG quality with training. Falls back to live Wikidata on miss.
+        self._q_kg_index: Dict[str, List[Tuple[str, str, str]]] = {}
+        _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index_v2.json"
+        if not _q_kg_path.exists():
+            _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index.json"
+        if _q_kg_path.exists():
+            import json as _json
+            _q_kg_raw = _json.loads(_q_kg_path.read_text(encoding="utf-8"))
+            is_v2 = "builder_version" in (_q_kg_raw[0] if _q_kg_raw else {})
+            for _entry in _q_kg_raw:
+                _q = _entry.get("question", _entry.get("q", ""))
+                if is_v2:
+                    self._q_kg_index[_q] = [(t["h"], t["r"], t["t"]) for t in _entry["triples"]]
+                else:
+                    self._q_kg_index[_q] = [tuple(t) for t in _entry["t"]]
+            logger.info("Loaded %d question→KG entries from %s (v%s, inference)",
+                        len(self._q_kg_index), _q_kg_path.name, "2" if is_v2 else "1")
 
         self.alpha_gate = AlphaGate()
         if alpha_gate_path and Path(alpha_gate_path).exists():
@@ -112,9 +134,20 @@ class KGProWeightPipeline(BasicPipeline):
         if dropout is not None:
             return list(dropout)
 
+        # R9 v6: prefer pre-built filtered KG cache (aligned with training).
+        # Falls back to live Wikidata lookup only on cache miss.
+        cached = self._q_kg_index.get(item.question)
+        if cached:
+            return list(cached[:self.max_kg_triples])
+
         mentions = extract_mentions(item.question, max_n=self.max_mentions)
-        linked = self.entity_linker.link(mentions)
-        qids = [q for q in linked.values() if q]
+        qids = []
+        for m in mentions:
+            result = self.entity_linker.link_single(
+                m, question=item.question,
+            )
+            if not result.abstained and result.selected_qid:
+                qids.append(result.selected_qid)
         return self.kg_retriever.fetch(qids) if qids else []
 
     # ------------------------------------------------------------------
@@ -127,6 +160,25 @@ class KGProWeightPipeline(BasicPipeline):
                     len(questions), self.retrieval_topk, self.inject_kg)
 
         retrieval_results = self.retriever.batch_search(questions)
+
+        # R9 v6: two-stage retrieval with reranker
+        if self.rerank_topk > 0 and retrieval_results and len(retrieval_results[0]) > self.rerank_topk:
+            from kgproweight.retrieval.reranker import (
+                RetrievalConfig, rerank_with_bm25, pack_passages_by_token_budget,
+            )
+            rcfg = RetrievalConfig(
+                rrf_candidate_topk=len(retrieval_results[0]),
+                rerank_topk=self.rerank_topk,
+                prompt_passage_token_budget=3860,
+            )
+            logger.info("R9 v6 retrieval: %s", rcfg.log_string())
+            retrieval_results = rerank_with_bm25(questions, retrieval_results, topk=self.rerank_topk)
+            # Apply token budget to each question's passages
+            retrieval_results = [
+                pack_passages_by_token_budget(passages, rcfg.prompt_passage_token_budget)
+                for passages in retrieval_results
+            ]
+
         dataset.update_output("retrieval_result", retrieval_results)
 
         prompts: List[str] = []
