@@ -14,6 +14,7 @@ Config fields (set in hybrid.py or YAML):
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from kgproweight.utils.logging import get_logger
@@ -89,8 +90,8 @@ class RetrievalConfig:
         rrf_candidate_topk: int = 50,
         rerank_topk: int = 10,
         prompt_passage_token_budget: int = 3860,
-        rerank_method: str = "bm25",
-        cross_encoder_model: str = "BAAI/bge-reranker-v2-m3",
+        rerank_method: str = "cross-encoder",
+        cross_encoder_model: str = "models/bge-reranker-v2-m3",
     ):
         self.dense_candidate_topk = dense_candidate_topk
         self.sparse_candidate_topk = sparse_candidate_topk
@@ -162,9 +163,41 @@ class RRFRerankRetriever:
         if self.config.rerank_method == "bm25":
             return rerank_with_bm25(questions, all_candidates, topk=self.config.rerank_topk)
 
-        # Cross-encoder rerank (placeholder)
-        logger.warning("Cross-encoder not implemented, falling back to top-K truncation")
+        # Cross-encoder rerank
+        if self.config.rerank_method == "cross-encoder":
+            return self._cross_encoder_rerank(questions, all_candidates)
+
+        logger.warning("Unknown rerank method '%s', falling back to top-K truncation",
+                       self.config.rerank_method)
         return [c[:self.config.rerank_topk] for c in all_candidates]
+
+    def _cross_encoder_rerank(
+        self, questions: List[str], candidates: List[List[Dict[str, Any]]],
+    ) -> List[List[Dict[str, Any]]]:
+        """Rerank candidates using a cross-encoder model."""
+        from sentence_transformers import CrossEncoder
+
+        model_path = str(Path(self.config.cross_encoder_model))
+        if not Path(model_path).exists():
+            # Try local models dir
+            local = Path("/home/zjulab/kgpaper/models") / self.config.cross_encoder_model.split("/")[-1]
+            if local.exists():
+                model_path = str(local)
+            else:
+                model_path = self.config.cross_encoder_model  # HF download
+
+        model = CrossEncoder(model_path)
+        results = []
+        for q, cands in zip(questions, candidates):
+            if not cands:
+                results.append([])
+                continue
+            pairs = [(q, _passage_text(c)) for c in cands]
+            scores = model.predict(pairs, show_progress_bar=False)
+            scored = list(zip(scores, cands))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            results.append([c for _, c in scored[:self.config.rerank_topk]])
+        return results
 
 
 def pack_passages_by_token_budget(
