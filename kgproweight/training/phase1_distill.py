@@ -328,15 +328,31 @@ class TeacherClient:
 class _RetrievalAdapter:
     """Minimal adapter around FlashRAG's retriever for Phase 1.
 
-    A real call to the FlashRAG retriever is heavy (loads e5 + FAISS); we
-    therefore allow callers to pass in any object with a ``search(query)``
-    method that returns a list of ``{"contents": str}`` dicts. This is
-    used both in unit tests and in :mod:`scripts.train.phase1_generate_silver`.
+    R9 v6: when ``rerank_topk > 0``, applies cross-encoder reranking after RRF
+    retrieval. The retriever returns top-50 candidates, then the cross-encoder
+    re-ranks and selects the top-K for the Teacher prompt.
     """
 
-    def __init__(self, retriever: Any, top_k: int = DEFAULT_TOPK) -> None:
+    def __init__(self, retriever: Any, top_k: int = DEFAULT_TOPK,
+                 rerank_topk: int = 0, cross_encoder_model: str = "",
+                 questions: list = None) -> None:
         self.retriever = retriever
         self.top_k = top_k
+        self.rerank_topk = rerank_topk
+        self.cross_encoder_model = cross_encoder_model
+        self._ce_model = None
+        self._questions = questions or []
+
+    def _get_ce(self):
+        if self._ce_model is None and self.cross_encoder_model:
+            from sentence_transformers import CrossEncoder
+            from pathlib import Path
+            model_path = self.cross_encoder_model
+            local = Path("/home/zjulab/kgpaper/models") / model_path.split("/")[-1]
+            if local.exists():
+                model_path = str(local)
+            self._ce_model = CrossEncoder(model_path)
+        return self._ce_model
 
     def __call__(self, query: str) -> List[Dict[str, Any]]:
         if hasattr(self.retriever, "search"):
@@ -345,6 +361,19 @@ class _RetrievalAdapter:
             results = self.retriever.batch_search([query])[0]
         else:
             return []
+
+        # R9 v6: cross-encoder reranking
+        if self.rerank_topk > 0 and len(results) > self.rerank_topk:
+            ce = self._get_ce()
+            if ce is not None:
+                candidates = list(results)
+                pairs = [(query, (c.get("contents", "") or c.get("text", ""))[:1200])
+                         for c in candidates]
+                scores = ce.predict(pairs, show_progress_bar=False)
+                scored = list(zip(scores, candidates))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                return [c for _, c in scored[:self.rerank_topk]]
+
         return list(results)[: self.top_k]
 
 
@@ -481,6 +510,8 @@ class Phase1Config:
     prm_annotator: Optional[PRMAnnotator] = None
     top_k: int = DEFAULT_TOPK
     max_kg_triples: int = 50
+    rerank_topk: int = 0  # R9 v6: 0=disabled, >0 enables cross-encoder rerank
+    cross_encoder_model: str = "models/bge-reranker-v2-m3"
     max_workers: int = 1
     accept_filter: StratifiedSilverFilter = field(default_factory=StratifiedSilverFilter)
     seed: int = 42
@@ -674,7 +705,11 @@ def run_phase1(cfg: Phase1Config) -> Dict[str, Any]:
 
     # Build a single retriever object once (heavy).
     retriever = cfg.retriever_factory() if callable(cfg.retriever_factory) else cfg.retriever_factory
-    retrieval_call = _RetrievalAdapter(retriever, top_k=cfg.top_k)
+    retrieval_call = _RetrievalAdapter(
+        retriever, top_k=cfg.top_k,
+        rerank_topk=cfg.rerank_topk,
+        cross_encoder_model=cfg.cross_encoder_model,
+    )
 
     accepted = 0
     total = 0

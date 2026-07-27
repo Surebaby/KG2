@@ -56,6 +56,8 @@ def parse_args() -> argparse.Namespace:
         help="KG/entity lookups: 'on'=cache-only (no Wikidata, misses return empty instantly); "
         "'off'=always call Wikidata; 'auto'=probe once and pick (default).",
     )
+    p.add_argument("--rerank", type=int, default=0,
+                   help="Enable cross-encoder rerank after RRF (e.g. --rerank 10)")
     return p.parse_args()
 
 
@@ -182,7 +184,12 @@ def main() -> None:
         logger.info("Offline mode forced %s by --offline=%s.", "ON" if offline else "OFF", args.offline)
 
     linker = EntityLinker(cache_path=entity_cache, offline=offline)
-    kg_retr = WikidataSubgraphRetriever(max_hops=2, max_neighbors=30, cache_dir=kg_cache_dir, offline=offline)
+    from kgproweight.kg.wikidata_retriever import _QA_RELATION_FILTER
+
+    kg_retr = WikidataSubgraphRetriever(
+        max_hops=2, max_neighbors=30, cache_dir=kg_cache_dir, offline=offline,
+        relation_filter=_QA_RELATION_FILTER,
+    )
     annotator = PRMAnnotator(entity_linker=linker, verbose=False)
 
     teacher = TeacherClient(
@@ -203,6 +210,7 @@ def main() -> None:
         prm_annotator=annotator,
         top_k=retrieval_top_k,
         max_kg_triples=50,
+        rerank_topk=args.rerank,
         max_workers=max_workers,
         accept_filter=accept,
         seed=args.seed,
