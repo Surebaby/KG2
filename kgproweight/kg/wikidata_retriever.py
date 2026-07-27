@@ -116,15 +116,42 @@ SPARQL_HEADERS = {
 REQUEST_DELAY = 0.5
 
 
+def _apply_relation_filter(
+    triples: List[Tuple[str, str, str]], relation_filter: set,
+) -> List[Tuple[str, str, str]]:
+    """Filter triples in Python by QA-relevant relation PIDs (Layer 1 post-filter)."""
+    from kgproweight.kg.kg_filter import _RELATION_LABEL_TO_PID
+    import re
+    filtered = []
+    for t in triples:
+        pid = _RELATION_LABEL_TO_PID.get(t[1].lower(), "")
+        if not pid:
+            m = re.match(r"^(P\d+)", t[1])
+            pid = m.group(1) if m else ""
+        if pid in relation_filter:
+            filtered.append(t)
+    return filtered
+
+
 def _sparql_query(query: str, retries: int = 3, timeout: int = 30) -> Optional[dict]:
+    # Use POST for long queries (GET URL length limit ~8000 chars)
+    use_post = len(query) > 2000
     for attempt in range(retries):
         try:
-            resp = requests.get(
-                SPARQL_ENDPOINT,
-                params={"query": query, "format": "json"},
-                headers=SPARQL_HEADERS,
-                timeout=timeout,
-            )
+            if use_post:
+                resp = requests.post(
+                    SPARQL_ENDPOINT,
+                    data={"query": query, "format": "json"},
+                    headers={**SPARQL_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+                    timeout=timeout,
+                )
+            else:
+                resp = requests.get(
+                    SPARQL_ENDPOINT,
+                    params={"query": query, "format": "json"},
+                    headers=SPARQL_HEADERS,
+                    timeout=timeout,
+                )
             resp.raise_for_status()
             return resp.json()
         except requests.RequestException as exc:
@@ -168,11 +195,6 @@ class WikidataSubgraphRetriever:
 
     def _build_1hop_query(self, qid: str) -> str:
         limit = self.max_neighbors
-        filter_clause = ""
-        if self.relation_filter:
-            pids = " ".join(f"wdt:{p}" for p in self.relation_filter)
-            filter_clause = f"FILTER(?prop IN ({pids}))"
-        rel_order = _build_relation_order_case()
         return f"""
 SELECT ?headLabel ?propLabel ?tailLabel WHERE {{
   wd:{qid} ?prop ?tail .
@@ -180,18 +202,11 @@ SELECT ?headLabel ?propLabel ?tailLabel WHERE {{
   ?propEntity rdfs:label ?propLabel . FILTER(LANG(?propLabel)="en")
   wd:{qid} rdfs:label ?headLabel . FILTER(LANG(?headLabel)="en")
   ?tail rdfs:label ?tailLabel . FILTER(LANG(?tailLabel)="en")
-  {filter_clause}
-  BIND({rel_order} AS ?propScore)
-}} ORDER BY DESC(?propScore) LIMIT {limit}
+}} LIMIT {limit}
 """
 
     def _build_2hop_query(self, qid: str) -> str:
         limit = self.max_neighbors
-        filter_clause = ""
-        if self.relation_filter:
-            pids = " ".join(f"wdt:{p}" for p in self.relation_filter)
-            filter_clause = f"FILTER(?p1 IN ({pids}) && ?p2 IN ({pids}))"
-        rel_order = _build_relation_order_case()
         return f"""
 SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
   wd:{qid} ?p1 ?mid .
@@ -203,11 +218,7 @@ SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
   ?p2Ent wikibase:directClaim ?p2 .
   ?p2Ent rdfs:label ?p2Label . FILTER(LANG(?p2Label)="en")
   ?tail rdfs:label ?tailLabel . FILTER(LANG(?tailLabel)="en")
-  {filter_clause}
-  BIND({rel_order} AS ?p1Score)
-  BIND({_build_relation_order_case("?p2")} AS ?p2Score)
-  BIND(IF(?p1Score > ?p2Score, ?p1Score, ?p2Score) AS ?maxPropScore)
-}} ORDER BY DESC(?maxPropScore) LIMIT {limit}
+}} LIMIT {limit}
 """
 
     # ------------------------------------------------------------------
@@ -224,17 +235,33 @@ SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
             cache_key = f"{qid}_{self.max_hops}_{self.max_neighbors}_{filter_tag}"
             cached = self.cache.get(cache_key)
             if cached is not None:
-                for triple in cached:
+                triples = cached
+                if self.relation_filter:
+                    triples = _apply_relation_filter(triples, self.relation_filter)
+                for triple in triples:
                     if triple not in seen:
                         all_triples.append(triple)
                         seen.add(triple)
                 continue
 
             triples = self._fetch_single(qid)
-            # In offline mode a miss yields []; do NOT persist that empty result,
-            # so a later networked run still fetches it for real (no cache poison).
-            if not (self.offline and not triples):
+            # Fallback to unfiltered cache (key="all") if filtered query misses
+            if self.relation_filter and not triples and self.offline:
+                unfiltered_key = f"{qid}_{self.max_hops}_{self.max_neighbors}_all"
+                unfiltered = self.cache.get(unfiltered_key)
+                if unfiltered:
+                    triples = _apply_relation_filter(unfiltered, self.relation_filter)
+            elif self.relation_filter and triples:
+                # Only filter SPARQL results (offline fallback already filtered above)
+                triples = _apply_relation_filter(triples, self.relation_filter)
+
+            # Cache only non-empty results. Filtering can legitimately produce [] from
+            # a valid SPARQL result — don't cache that, so future filter changes retry.
+            if triples and not (self.offline and not triples):
                 self.cache.set(cache_key, triples)
+            elif triples:
+                pass  # offline, already from cache — don't re-persist
+            # empty triples: never cache, so future runs retry
             for triple in triples:
                 if triple not in seen:
                     all_triples.append(triple)
