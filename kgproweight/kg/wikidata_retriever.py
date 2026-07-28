@@ -97,13 +97,6 @@ _QA_RELATION_FILTER: set[str] = {
 }
 
 
-def _build_relation_order_case(var: str = "?prop") -> str:
-    """Build a SPARQL CASE expression for relation importance ordering."""
-    cases = []
-    for pid, score in sorted(_RELATION_PRIORITY.items(), key=lambda x: -x[1]):
-        if score > 0:
-            cases.append(f"    WHEN({var} = wdt:{pid}) THEN {score} ")
-    return "CASE\n" + "\n".join(cases) + "\n    ELSE 0\nEND"
 from kgproweight.utils.logging import get_logger
 
 logger = get_logger(__name__)

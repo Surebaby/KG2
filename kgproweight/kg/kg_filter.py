@@ -545,20 +545,29 @@ def score_triple(
     # relation_question_similarity: 0.25 — PID matches question type
     rel_score = _relation_question_score(pid, q_lower)
 
-    # triple_question_similarity: 0.25 — semantic overlap with question
+    # triple_question_similarity: 0.25 — relation/tail overlap with question
     triple_score = 0.0
     r_lower = r.lower()
+    t_lower = t.lower()
     for word in r_lower.split():
         if len(word) > 2 and word in q_lower:
-            triple_score = 0.25
+            triple_score = 0.15
+            break
+    # Also check tail entity overlap (e.g. "United States" in "same nationality?")
+    for word in t_lower.split():
+        if len(word) > 3 and word in q_lower:
+            triple_score = max(triple_score, 0.15)
             break
 
-    # path_connectivity: 0.10 — connects two question entities
+    # path_connectivity: 0.10 — connects question entities, stronger when both match
     entities = question_entities or []
     path_score = _path_connectivity_score(triple, entities)
 
-    # retrieved_evidence_support: 0.10 — placeholder (passage-aware in future)
-    evidence_score = 0.05  # baseline: assume moderate support
+    # retrieved_evidence_support: 0.10 — lexical overlap with question words
+    tail_words = set(t_lower.split())
+    q_words = set(q_lower.split())
+    word_overlap = tail_words & q_words
+    evidence_score = 0.10 * min(1.0, len(word_overlap) / max(1, len(tail_words)))
 
     # taxonomic penalty
     taxonomic_penalty = 0.0
