@@ -602,16 +602,14 @@ def _process_one(
     # coverage is now a *soft* signal only (recorded, never rejects)
     coverage = coverage_score(mentions, linked) if mentions else 0.0
 
-    # Build teacher prompt
+    # R9 v6: apply v2 scoring (3-layer filter) before Teacher sees KG
+    from kgproweight.kg.kg_filter import filter_and_rank_triples
+    teacher_kg = filter_and_rank_triples(triples, question=question, max_keep=cfg.max_kg_triples)
+
     messages = build_teacher_messages(
         question=question,
         retrieved_passages=passages,
-        kg_triples=_select_relevant_triples(
-            question=question,
-            passages=passages,
-            triples=triples,
-            top_n=cfg.max_kg_triples,
-        ),
+        kg_triples=teacher_kg,
         top_k=cfg.top_k,
         max_kg_triples=cfg.max_kg_triples,
     )
@@ -643,7 +641,7 @@ def _process_one(
         answer=final_answer,
         dataset=cfg.dataset_name,
         steps=parsed_steps,
-        kg_subgraph=triples,
+        kg_subgraph=teacher_kg,
         retrieved_passages=passages,
         teacher_output=raw_output,
         teacher_model=cfg.teacher_client.model,
