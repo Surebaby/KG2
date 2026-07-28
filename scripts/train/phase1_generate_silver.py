@@ -122,9 +122,9 @@ def main() -> None:
         teacher_model = silver.teacher_model
         teacher_backend = silver.teacher_backend
         temperature = silver.teacher_temperature
-        max_queries = silver.max_queries
+        max_queries = args.max_queries if args.max_queries is not None else silver.max_queries
         max_workers = silver.max_workers
-        out_path = silver.output_path or str(Path(data_dir()) / "silver_data" / "silver_trajectories.jsonl")
+        out_path = args.output or silver.output_path or str(Path(data_dir()) / "silver_data" / "silver_trajectories.jsonl")
         # Stratified acceptance: bucket by KG density with quotas instead of
         # hard-rejecting low-coverage/low-triple-rate traces, so the α-gate sees
         # genuine α→0 fallback examples. Only step bounds map from the legacy
