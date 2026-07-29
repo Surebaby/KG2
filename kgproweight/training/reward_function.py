@@ -226,6 +226,9 @@ class KGProWeightRewardFunction:
                 )[0].strip()
                 if len(reasoning) < min_reasoning_chars:
                     return False
+            else:
+                # R9 v6: step without "Reasoning:" field is invalid
+                return False
             expected += 1
         return True
 
@@ -350,8 +353,12 @@ class KGProWeightRewardFunction:
                             all_mentions.add(m)
                 if all_mentions:
                     linker = self.composite.prm_annotator.entity_linker
-                    linked = {m: linker.link_single(m) for m in all_mentions}
-                    qids = [q for q in linked.values() if q]
+                    linked = {}
+                    for m in all_mentions:
+                        r = linker.link_single(m)
+                        if r.selected_qid:
+                            linked[m] = r.selected_qid
+                    qids = list(linked.values())
                     if qids:
                         dynamic_kg = self.subgraph_retriever.fetch(qids) or []
             except Exception as e:

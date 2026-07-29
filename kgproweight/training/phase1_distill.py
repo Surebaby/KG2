@@ -532,7 +532,7 @@ def _annotate_steps(
             SilverStepRecord(
                 index=step.index,
                 text=step.raw_text,
-                label=int(label),
+                label=float(label),
                 cited_triples=list(step.cited_triples),
                 token_logprobs=None,
             )
@@ -589,11 +589,13 @@ def _process_one(
     # R9 v6: pass question context to entity linker for disambiguation
     mentions = extract_mentions_robust(question, passages=passages, max_n=8)
     qids = []
+    linked = {}  # mention → QID (for coverage + metadata)
     if mentions:
         for m in mentions:
             result = cfg.entity_linker.link_single(m, question=question)
             if result.selected_qid and not result.abstained:
                 qids.append(result.selected_qid)
+                linked[m] = result.selected_qid
 
     # ---- SPARQL degrade: empty subgraph is allowed -----------------------
     triples: List = []
