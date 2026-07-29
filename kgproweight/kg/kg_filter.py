@@ -567,7 +567,7 @@ def score_triple(
     tail_words = set(t_lower.split())
     q_words = set(q_lower.split())
     word_overlap = tail_words & q_words
-    evidence_score = 0.10 * min(1.0, len(word_overlap) / max(1, len(tail_words)))
+    evidence_score = min(1.0, len(word_overlap) / max(1, len(tail_words)))
 
     # taxonomic penalty
     taxonomic_penalty = 0.0
