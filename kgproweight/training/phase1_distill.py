@@ -363,7 +363,7 @@ class _RetrievalAdapter:
             return []
 
         # R9 v6: cross-encoder reranking
-        if self.rerank_topk > 0 and len(results) > self.rerank_topk:
+        if self.rerank_topk > 0 and len(results) >= self.rerank_topk:
             ce = self._get_ce()
             if ce is not None:
                 candidates = list(results)
@@ -586,9 +586,14 @@ def _process_one(
         passages = []
 
     # ---- robust mentions: NER/regex + passage titles ---------------------
+    # R9 v6: pass question context to entity linker for disambiguation
     mentions = extract_mentions_robust(question, passages=passages, max_n=8)
-    linked = cfg.entity_linker.link(mentions) if mentions else {}
-    qids = [q for q in linked.values() if q]
+    qids = []
+    if mentions:
+        for m in mentions:
+            result = cfg.entity_linker.link_single(m, question=question)
+            if result.selected_qid and not result.abstained:
+                qids.append(result.selected_qid)
 
     # ---- SPARQL degrade: empty subgraph is allowed -----------------------
     triples: List = []

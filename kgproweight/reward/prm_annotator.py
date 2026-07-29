@@ -320,6 +320,12 @@ class PRMAnnotator:
           head OR tail phrase-match in text    → +1 (entity evidence)
           relation phrase-match in text        → +0.5 (relation evidence, weaker)
 
+        **R9 v6**: taxonomic relations (instance_of, subclass_of) are NEVER
+        considered relevant, regardless of entity overlap. A triple like
+        (Ed Wood, instance of, human) is real but never helps answer a question.
+        Head entity overlap alone does not make it relevant — the relation
+        must carry useful information.
+
         A triple scores > 0 → relevant.
         """
         text = " ".join(s for s in (reasoning, conclusion) if s)
@@ -327,6 +333,10 @@ class PRMAnnotator:
             return True  # cannot judge → default relevant
 
         for h, r, t in cited_triples:
+            # Taxonomic relations are never QA-relevant
+            if r.lower() in ("instance of", "subclass of"):
+                return False
+
             score = 0.0
             # entity evidence (primary)
             if self._phrase_match(h, text):
