@@ -12,9 +12,12 @@ retrieval:
   sparse_candidate_topk: 100
   rrf_candidate_topk: 50
 
-  # Stage 2: reranker
-  rerank_method: bm25
-  cross_encoder_model: "BAAI/bge-reranker-v2-m3"
+  # Stage 2: reranker.
+  # Was `bm25` — the hand-rolled TF-IDF scorer — even though
+  # models/bge-reranker-v2-m3 is downloaded and Phase 1 already used it. That
+  # made silver-data passages and eval passages come from different rerankers.
+  rerank_method: cross-encoder
+  cross_encoder_model: "models/bge-reranker-v2-m3"
   rerank_topk: 10
 
   # Prompt budget

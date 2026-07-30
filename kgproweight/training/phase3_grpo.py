@@ -126,8 +126,10 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
     if cfg.binary_labels_only:
         for traj in reader.trajectories:
             for step in traj.steps:
-                if step.label == 0:
-                    step.label = -1
+                # Labels are continuous r_kg; anything not clearly positive
+                # collapses to negative for this ablation.
+                if float(step.label) < 0.5:
+                    step.label = -1.0
 
     prompts_pool: List[Dict[str, Any]] = []
     for traj in reader.accepted():

@@ -1,10 +1,14 @@
 # ---------------------------------------------------------------------------
 # Large experiment artifacts — never commit
 # ---------------------------------------------------------------------------
-data/
-indexes/
-checkpoints/
-outputs/
+# Anchored to the repo root with a leading slash. Unanchored `data/` matched at
+# ANY depth, so it also ignored the `kgproweight/data/` SOURCE package — new
+# modules added there were silently untracked (already-tracked files kept
+# working, which is why this went unnoticed).
+/data/
+/indexes/
+/checkpoints/
+/outputs/
 .cache/
 *.bin
 *.safetensors

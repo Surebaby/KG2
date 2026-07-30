@@ -38,6 +38,17 @@ class RetrievalConfig(_Base):
     instruction: Optional[str] = None
     retrieval_batch_size: int = 256
     pooling_method: Optional[str] = "mean"
+    # ── Two-stage retrieval (R9 v6) ──
+    # These were present in configs/retrieval/hybrid_rrf_top50.yaml but MISSING
+    # from this schema, so any load through `validate=ProjectConfig` dropped
+    # them and the run reverted to single-stage top-k.
+    dense_candidate_topk: int = 100
+    sparse_candidate_topk: int = 100
+    rrf_candidate_topk: int = 50
+    rerank_method: Literal["cross-encoder", "bm25", "none"] = "cross-encoder"
+    cross_encoder_model: str = "models/bge-reranker-v2-m3"
+    rerank_topk: int = 10
+    prompt_passage_token_budget: int = 3860
 
 
 # ---------------------------------------------------------------------------

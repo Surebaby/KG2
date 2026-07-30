@@ -52,7 +52,7 @@ logger = get_logger(__name__)
 @dataclass
 class _StepSample:
     text: str
-    label: int                       # +1 / 0 / -1
+    label: float                     # r_kg in [-1, 1] (continuous, not just ±1/0)
     label_class: int                 # 0 / 1 / 2 — index for cross-entropy
     kg_subgraph: List[tuple]
     coverage: float                  # holds step-level link_confidence (Finding 2)
@@ -70,8 +70,26 @@ class _SampleWithProvenance:
     step_idx: int
 
 
-def _label_to_class(label: int) -> int:
-    return {-1: 0, 0: 1, 1: 2}.get(label, 1)
+def _label_to_class(label: float) -> int:
+    """Map a step label to the 3-way CE target.
+
+    ``PRMAnnotator.label`` returns a CONTINUOUS r_kg = precision × relevance in
+    (0, 1) for partially-verified citations, not just {-1, 0, +1}. The previous
+    ``int(step.label)`` truncation sent every such value to 0 → NEUTRAL
+    (int(0.5)=0, int(0.75)=0), silently discarding the PRM's entire partial-credit
+    signal. Bucket instead: > +0.5 is positive evidence, < -0.5 is a
+    contradiction, and the ambiguous middle stays NEUTRAL.
+    """
+    if label >= _POSITIVE_THRESHOLD:
+        return 2
+    if label <= -_POSITIVE_THRESHOLD:
+        return 0
+    return 1
+
+
+# A step needs a majority of its citations verified AND relevant to count as
+# positive evidence; below that the KG has not really rendered a verdict.
+_POSITIVE_THRESHOLD = 0.5
 
 
 def _build_samples_accepted_only(
@@ -96,8 +114,9 @@ def _build_samples_accepted_only(
             text = step.text or ""
             if not text.strip():
                 continue
-            label = int(step.label)
-            if binary_labels_only and label == 0:
+            label = float(step.label)
+            label_class = _label_to_class(label)
+            if binary_labels_only and label_class == 1:
                 continue
             parsed = parsed_step_from_silver_dict(step.to_dict(), fallback_index=s_idx)
             step_entities = clean_entities(parsed.mentioned_entities)
@@ -110,7 +129,7 @@ def _build_samples_accepted_only(
                     sample=_StepSample(
                         text=text,
                         label=label,
-                        label_class=_label_to_class(label),
+                        label_class=label_class,
                         kg_subgraph=list(traj.kg_subgraph),
                         coverage=float(link_conf),
                         binary_quality=quality,
@@ -135,14 +154,15 @@ def _step_samples_from_silver(reader: SilverDatasetReader, *, binary_labels_only
             text = step.text or ""
             if not text.strip():
                 continue
-            label = int(step.label)
-            if binary_labels_only and label == 0:
+            label = float(step.label)
+            label_class = _label_to_class(label)
+            if binary_labels_only and label_class == 1:
                 continue
             out.append(
                 _StepSample(
                     text=text,
                     label=label,
-                    label_class=_label_to_class(label),
+                    label_class=label_class,
                     kg_subgraph=list(traj.kg_subgraph),
                     coverage=coverage,
                     binary_quality=quality,

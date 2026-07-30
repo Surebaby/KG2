@@ -27,6 +27,10 @@ DEFAULT_PIPELINE = (
     "KGProWeightPipeline",
 )
 
+# Loaded when --config is omitted so the documented command actually runs the
+# paper's retrieval setting instead of the bare DEFAULT_TOPK=15 fallback.
+DEFAULT_EVAL_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "eval" / "kg_proweight.yaml"
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
@@ -58,10 +62,22 @@ def _resolve_paths(args) -> dict:
 
 
 def _load_yaml_overrides(config_path: Optional[str]) -> Tuple[Dict[str, Any], str, str, bool]:
-    """Return (retrieval_dict, pipeline_module, pipeline_class, record_alpha)."""
+    """Return (retrieval_dict, pipeline_module, pipeline_class, record_alpha).
+
+    With no ``--config`` this used to return ``{}``, so the run silently used
+    ``DEFAULT_TOPK=15`` — including the README's own command — while
+    ``configs/retrieval/hybrid_rrf_top50.yaml`` sat unused. We now load the
+    canonical eval config by default so train and eval share one retrieval
+    setting; pass ``--config`` explicitly to override (e.g. an ablation).
+    """
     if not config_path:
-        module, cls = DEFAULT_PIPELINE
-        return {}, module, cls, True
+        config_path = str(DEFAULT_EVAL_CONFIG)
+        if not Path(config_path).exists():
+            logger.warning("Default eval config %s missing — falling back to built-in defaults.",
+                           config_path)
+            module, cls = DEFAULT_PIPELINE
+            return {}, module, cls, True
+        logger.info("No --config given; using default eval config %s", config_path)
 
     doc = load_config(config_path)
     pipeline_cfg = doc.get("pipeline") or {}
@@ -112,12 +128,31 @@ def main():
             if args.no_kg:
                 pipeline_kwargs["inject_kg"] = False
             if args.rerank > 0:
+                # Report the ACTUAL configured pool, not a hardcoded "50": with
+                # no --config the retriever returned 15 docs while this line
+                # claimed RRF@50, so logs disagreed with what ran.
+                pool = int(cfg.get("retrieval_topk") or 0)
+                per_retriever = [
+                    r.get("retrieval_topk")
+                    for r in cfg.get("multi_retriever_setting", {}).get("retriever_list", [])
+                ]
+                if pool < args.rerank:
+                    logger.warning(
+                        "rerank_topk=%d >= candidate pool=%d — reranking is a no-op. "
+                        "Raise retrieval.retrieval_topk in the config.",
+                        args.rerank, pool,
+                    )
                 pipeline_kwargs["rerank_topk"] = args.rerank
-                pipeline_kwargs["retrieval_topk"] = 50  # RRF candidate pool
+                pipeline_kwargs["retrieval_topk"] = pool
+                pipeline_kwargs["rerank_method"] = retrieval_overrides.get(
+                    "rerank_method", "cross-encoder")
+                pipeline_kwargs["cross_encoder_model"] = retrieval_overrides.get(
+                    "cross_encoder_model", "models/bge-reranker-v2-m3")
                 logger.info(
-                    "Two-stage retrieval: dense@100 + sparse@100 → RRF@50 → rerank@%d → prompt≤%dtok",
-                    args.rerank,
-                    3860,
+                    "Two-stage retrieval: per-retriever@%s → RRF@%d → %s@%d → prompt<=%dtok",
+                    per_retriever, pool,
+                    retrieval_overrides.get("rerank_method", "cross-encoder"),
+                    args.rerank, 3860,
                 )
 
             def _after_run(pipe, save_dir=save_dir):  # noqa: ARG001

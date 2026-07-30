@@ -153,11 +153,14 @@ def answer_match_score(pred: str, gold: str) -> float:
 # ---------------------------------------------------------------------------
 
 _CAP_PHRASE_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b")
-_MENTION_BLACKLIST = {
-    "what", "which", "who", "whom", "whose", "when", "where", "why", "how",
-    "is", "are", "was", "were", "do", "does", "did", "can", "could",
-    "should", "would", "will", "the", "a", "an",
-}
+
+# Share the entity_linker blacklist + affix stripper so Phase 1 mentions and
+# inference-time mentions are extracted identically (they feed the same linker
+# and the same KG cache — divergence here means train/inference KG mismatch).
+from kgproweight.kg.entity_linker import (  # noqa: E402
+    _MENTION_BLACKLIST,
+    _strip_stopword_affixes,
+)
 
 # Lazily-loaded spaCy pipeline (None means "not attempted yet", False means
 # "tried and unavailable").
@@ -206,7 +209,7 @@ def extract_mentions_robust(
     seen: Dict[str, None] = {}
 
     def _add(m: str) -> None:
-        m = m.strip()
+        m = _strip_stopword_affixes(m.strip())
         if len(m) < 3:
             return
         if m.lower() in _MENTION_BLACKLIST:
@@ -334,25 +337,12 @@ class _RetrievalAdapter:
     """
 
     def __init__(self, retriever: Any, top_k: int = DEFAULT_TOPK,
-                 rerank_topk: int = 0, cross_encoder_model: str = "",
-                 questions: list = None) -> None:
+                 rerank_topk: int = 0,
+                 cross_encoder_model: str = "models/bge-reranker-v2-m3") -> None:
         self.retriever = retriever
         self.top_k = top_k
         self.rerank_topk = rerank_topk
         self.cross_encoder_model = cross_encoder_model
-        self._ce_model = None
-        self._questions = questions or []
-
-    def _get_ce(self):
-        if self._ce_model is None and self.cross_encoder_model:
-            from sentence_transformers import CrossEncoder
-            from pathlib import Path
-            model_path = self.cross_encoder_model
-            local = Path("/home/zjulab/kgpaper/models") / model_path.split("/")[-1]
-            if local.exists():
-                model_path = str(local)
-            self._ce_model = CrossEncoder(model_path)
-        return self._ce_model
 
     def __call__(self, query: str) -> List[Dict[str, Any]]:
         if hasattr(self.retriever, "search"):
@@ -362,17 +352,20 @@ class _RetrievalAdapter:
         else:
             return []
 
-        # R9 v6: cross-encoder reranking
+        # R9 v6: rerank through the shared dispatcher so Phase 1 (silver data)
+        # and inference use the SAME reranker. Previously Phase 1 loaded a
+        # cross-encoder here while the eval pipeline used a hand-rolled BM25
+        # scorer, so the passage distribution the student trained on differed
+        # from the one it saw at test time.
         if self.rerank_topk > 0 and len(results) >= self.rerank_topk:
-            ce = self._get_ce()
-            if ce is not None:
-                candidates = list(results)
-                pairs = [(query, (c.get("contents", "") or c.get("text", ""))[:1200])
-                         for c in candidates]
-                scores = ce.predict(pairs, show_progress_bar=False)
-                scored = list(zip(scores, candidates))
-                scored.sort(key=lambda x: x[0], reverse=True)
-                return [c for _, c in scored[:self.rerank_topk]]
+            from kgproweight.retrieval.reranker import rerank_passages
+
+            return rerank_passages(
+                [query], [list(results)],
+                topk=self.rerank_topk,
+                method="cross-encoder",
+                cross_encoder_model=self.cross_encoder_model,
+            )[0]
 
         return list(results)[: self.top_k]
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -31,7 +32,8 @@ import torch
 from kgproweight.data.parsers import parse_steps
 from kgproweight.data.prompts import build_rl_messages, build_sft_messages
 from kgproweight.data.silver_dataset import SilverDatasetReader
-from kgproweight.kg.wikidata_retriever import WikidataSubgraphRetriever
+from kgproweight.kg.kg_filter import filter_and_rank_triples
+from kgproweight.kg.wikidata_retriever import _QA_RELATION_FILTER, WikidataSubgraphRetriever
 from kgproweight.reward.alpha_gate import AlphaGate
 from kgproweight.reward.prm_annotator import PRMAnnotator
 from kgproweight.reward.text_reward_model import build_text_reward_model
@@ -303,6 +305,16 @@ def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfi
             if dyn:
                 dyn_kg_hits += 1
                 kg_triples = list(dyn)
+            elif kg_triples:
+                # Index miss: the silver record's raw kg_subgraph has NOT been
+                # through the three-layer policy, so applying it here keeps the
+                # PPO prompt's KG distribution identical to the indexed case
+                # instead of silently reverting to SPARQL-order noise.
+                kg_triples = filter_and_rank_triples(
+                    [tuple(t) for t in kg_triples if len(t) == 3],
+                    question=traj.question,
+                    max_keep=cfg.ppo_max_kg_triples,
+                )
 
         msgs = build_rl_messages(
             question=traj.question,
@@ -331,6 +343,13 @@ def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfi
         logger.warning(
             "Skipped %d accepted trajectories with no gold_answer (A4: no teacher fallback).",
             skipped_no_gold,
+        )
+    if rows and dyn_kg_hits < len(rows):
+        logger.warning(
+            "question_kg_index missed %d/%d PPO prompts — those fall back to the silver "
+            "kg_subgraph (now policy-filtered inline). Rebuild the index over this silver "
+            "set for full coverage.",
+            len(rows) - dyn_kg_hits, len(rows),
         )
     if dyn_kg_hits > 0:
         logger.info("R9 prompt KG: %d/%d samples got subgraphs from pre-built index", dyn_kg_hits, len(rows))
@@ -595,7 +614,18 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
         min_valid_steps=cfg.min_valid_steps,
         min_reasoning_chars=cfg.min_reasoning_chars,
         step_reward_scale=cfg.step_reward_scale,
-        subgraph_retriever=WikidataSubgraphRetriever(max_hops=2, max_neighbors=30, offline=True),
+        # R9 v6 fix: this retriever previously got NO cache_dir while offline=True,
+        # so every fetch() returned [] and the entire reward-side dynamic-KG path
+        # was dead code that still paid the entity-linking cost per rollout. With
+        # the shared on-disk cache + QA relation policy it now returns real
+        # triples, gated by the question-anchoring rules in reward_function.
+        subgraph_retriever=WikidataSubgraphRetriever(
+            max_hops=2,
+            max_neighbors=30,
+            cache_dir=str(Path(index_dir()) / "kg_cache"),
+            offline=True,
+            relation_filter=_QA_RELATION_FILTER,
+        ),
         pure_em=cfg.pure_em_reward,
     )
 
@@ -604,8 +634,10 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     if cfg.binary_labels_only:
         for traj in reader.trajectories:
             for step in traj.steps:
-                if step.label == 0:
-                    step.label = -1  # collapse neutral into negative for this ablation
+                # Continuous labels: everything that is not clearly positive
+                # evidence collapses to negative for this ablation.
+                if float(step.label) < 0.5:
+                    step.label = -1.0
 
     # R9: dynamic prompt KG disabled for speed (9839 prompts).
     # EntityLinker needed for reward-side dynamic KG (below).
@@ -720,7 +752,11 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     if cfg.log_with == "tensorboard":
         from torch.utils.tensorboard import SummaryWriter
 
-        tb_log_dir = Path("/root/tf-logs")
+        # Was hardcoded to /root/tf-logs (the rented AutoDL box), which does not
+        # exist elsewhere — so logs either failed or landed outside the run dir.
+        # Default to <output_dir>/tensorboard; KGPW_TB_DIR overrides (e.g. to the
+        # AutoDL panel's directory).
+        tb_log_dir = Path(os.environ.get("KGPW_TB_DIR") or (Path(cfg.output_dir) / "tensorboard"))
         tb_log_dir.mkdir(parents=True, exist_ok=True)
         tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
         logger.info("TensorBoard logging to %s", tb_log_dir)
@@ -800,13 +836,23 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
             token_reward_list.append(tr)
 
         # ── R9: extract reward components from all responses for diagnostics ──
-        reward_rc = {"alpha_mean": 0.0, "r_kg_mean": 0.0, "r_text_mean": 0.0, "r_total_mean": 0.0, "n_steps": 0}
+        reward_rc = {"alpha_mean": 0.0, "r_kg_mean": 0.0, "r_text_mean": 0.0,
+                     "r_total_mean": 0.0, "n_steps": 0, "kg_reward_share": 0.0}
         if all_per_step_records:
             reward_rc["alpha_mean"] = float(sum(r.alpha for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["r_kg_mean"] = float(sum(r.r_kg for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["r_text_mean"] = float(sum(r.r_text for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["r_total_mean"] = float(sum(r.r_total for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["n_steps"] = len(all_per_step_records)
+            # What fraction of the batch's total reward magnitude the KG channel
+            # actually contributes. With outcome_weight=10 and
+            # step_reward_scale=0.3 this lands near 3%, i.e. PPO is effectively
+            # optimising format+EM and the KG process reward is close to noise.
+            # Log it so "we trained with a KG reward" is a measured claim.
+            kg_mass = sum(abs(r.alpha * r.r_kg) for r in all_per_step_records) * cfg.step_reward_scale
+            total_mass = sum(abs(r.r_total) for r in all_per_step_records) + \
+                cfg.outcome_weight * max(1, sum(traj_rewards) > 0)
+            reward_rc["kg_reward_share"] = float(kg_mass / total_mass) if total_mass else 0.0
 
         # P0-1 / #6: hand the per-token step rewards to the trainer so GAE runs
         placeholder_scores = [torch.zeros((), dtype=torch.float32) for _ in token_reward_list]
@@ -904,6 +950,7 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 "r_text_mean": reward_rc["r_text_mean"],
                 "r_total_mean": reward_rc["r_total_mean"],
                 "n_steps_sample": reward_rc["n_steps"],
+                "kg_reward_share": reward_rc["kg_reward_share"],
             }
         )
         if n_seen % (cfg.batch_size * 4) == 0:
@@ -1006,6 +1053,7 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
             tb_writer.add_scalar("reward/r_text_mean", reward_rc["r_text_mean"], global_step)
             tb_writer.add_scalar("reward/r_total_mean", reward_rc["r_total_mean"], global_step)
             tb_writer.add_scalar("reward/n_steps", reward_rc["n_steps"], global_step)
+            tb_writer.add_scalar("reward/kg_reward_share", reward_rc["kg_reward_share"], global_step)
 
         # Intermediate checkpoint: save the (PEFT) adapter whenever n_seen crosses
         # a save_every_steps boundary, so a run that collapses can be rolled back

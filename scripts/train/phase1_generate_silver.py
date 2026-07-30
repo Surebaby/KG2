@@ -58,6 +58,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--rerank", type=int, default=0,
                    help="Enable cross-encoder rerank after RRF (e.g. --rerank 10)")
+    p.add_argument("--allow_eval_split", action="store_true",
+                   help="Acknowledge generating silver data from a dev/test split "
+                        "(pipeline smoke tests only — output must NOT be trained on).")
     return p.parse_args()
 
 
@@ -75,6 +78,31 @@ def _build_retriever(dataset_name: str, topk: int = DEFAULT_TOPK):
     )
     cfg = flashrag_config(flashrag_cfg)
     return get_retriever(cfg)
+
+
+EVAL_SPLITS = {"dev", "test", "validation", "val"}
+
+
+def _check_split_leakage(dataset_name: str, split: str, allow: bool) -> None:
+    """Refuse to distil training data out of an evaluation split.
+
+    The R9 v6 silver rerun was launched with ``--split dev``, so 48/50 and 50/50
+    of the regenerated trajectories were HotpotQA dev questions — the exact set
+    EM/F1 is reported on. Training on them makes any improvement unverifiable.
+    (Note the three datasets' dev.jsonl and test.jsonl are byte-identical here,
+    so "test" is not a safe alternative either.)
+    """
+    if split.lower() not in EVAL_SPLITS:
+        return
+    msg = (
+        f"--split {split!r} is an EVALUATION split for {dataset_name}. Generating silver "
+        f"training data from it leaks the eval set into training and invalidates the "
+        f"reported EM/F1. Use --split train. If this is a deliberate throwaway "
+        f"pipeline smoke test, pass --allow_eval_split and do NOT train on the output."
+    )
+    if not allow:
+        raise SystemExit(f"REFUSING: {msg}")
+    logger.warning("EVAL-SPLIT LEAKAGE ACKNOWLEDGED: %s", msg)
 
 
 def _load_items(dataset_name: str, split: str, max_queries: int, resume_path: Path | None = None) -> List[Dict[str, Any]]:
@@ -115,6 +143,7 @@ def _load_items(dataset_name: str, split: str, max_queries: int, resume_path: Pa
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    _check_split_leakage(args.dataset, args.split, args.allow_eval_split)
 
     if args.config:
         cfg = load_config(args.config, validate=ProjectConfig)

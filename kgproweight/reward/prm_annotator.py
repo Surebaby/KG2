@@ -164,7 +164,15 @@ class PRMAnnotator:
         step: ParsedStep,
         kg_subgraph: List[Tuple[str, str, str]],
         prev_conclusions: List[str],
-    ) -> int:
+    ) -> float:
+        """Return r_kg for one step.
+
+        NOTE the return type: since R9's precision-based scoring this is a
+        CONTINUOUS value in [-1, 1] — ``precision × relevance`` — not only
+        {-1, 0, +1}. Consumers must bucket it (see
+        ``phase2_prm._label_to_class``) rather than ``int()``-truncate, which
+        maps every partial credit to 0.
+        """
         text = step.raw_text
         subgraph_usable = len(kg_subgraph) >= self.min_subgraph_for_verify
 
@@ -333,9 +341,12 @@ class PRMAnnotator:
             return True  # cannot judge → default relevant
 
         for h, r, t in cited_triples:
-            # Taxonomic relations are never QA-relevant
+            # Taxonomic relations are never QA-relevant. ``continue``, not
+            # ``return False``: returning bailed out of the whole loop, so a
+            # taxonomic triple in first position hid every relevant triple
+            # behind it.
             if r.lower() in ("instance of", "subclass of"):
-                return False
+                continue
 
             score = 0.0
             # entity evidence (primary)

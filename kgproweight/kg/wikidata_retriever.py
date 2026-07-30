@@ -21,6 +21,12 @@ _RELATION_PRIORITY: dict[str, int] = {
     # Identity/type (useful but low priority — one per entity is enough)
     "P31": 1,   # instance of
     "P279": 1,  # subclass of
+    # Compositional relations: kept in the candidate pool (2Wiki location
+    # questions need P150) but scored down by kg_filter's taxonomic penalty
+    # rather than dropped outright at the retrieval layer.
+    "P150": 2,  # contains the administrative territorial entity
+    "P361": 1,  # part of
+    "P527": 1,  # has part(s)
     # Core biographical
     "P27": 10,  # country of citizenship
     "P19": 9,   # place of birth
@@ -73,12 +79,83 @@ _RELATION_PRIORITY: dict[str, int] = {
     # Language/genre
     "P136": 4,  # genre
     "P407": 3,  # language of work
+    # ── R9 v6 fix: QA-relevant relations that were absent from the whitelist,
+    # so `_QA_RELATION_FILTER` discarded them even after label→PID resolution.
+    "P509": 6,  # cause of death
+    "P1346": 6, # winner
+    "P123": 6,  # publisher
+    "P86": 7,   # composer
+    "P3373": 6, # sibling
+    "P551": 6,  # residence
+    "P495": 6,  # country of origin
+    "P264": 5,  # record label
+    "P30": 6,   # continent
+    "P101": 5,  # field of work
+    "P800": 6,  # notable work
+    "P413": 5,  # position played on team
+    "P241": 5,  # military branch
+    "P364": 5,  # original language of film/TV
+    "P1303": 4, # instrument
+    "P103": 5,  # native language
+    "P937": 5,  # work location
+    "P119": 5,  # place of burial
+    "P84": 6,   # architect
+    "P178": 6,  # developer
+    "P344": 5,  # director of photography
+    "P98": 5,   # editor
+    "P676": 5,  # lyricist
+    "P725": 5,  # voice actor
+    "P674": 5,  # characters
+    "P144": 5,  # based on
+    "P272": 6,  # production company
+    "P750": 4,  # distributed by
+    "P179": 4,  # part of the series
+    "P155": 4,  # follows
+    "P156": 4,  # followed by
+    "P190": 3,  # twinned administrative body
+    "P206": 5,  # located in/next to body of water
+    "P706": 4,  # located in/on physical feature
+    "P610": 4,  # highest point
+    "P793": 4,  # significant event
+    "P1344": 5, # participant in
+    "P607": 6,  # conflict
+    "P184": 5,  # doctoral advisor
+    "P185": 4,  # doctoral student
+    "P1066": 5, # student of
+    "P737": 4,  # influenced by
+    "P169": 6,  # chief executive officer
+    "P488": 5,  # chairperson
+    "P194": 5,  # legislative body
+    "P1313": 5, # office held by head of government
+    "P122": 4,  # basic form of government
+    "P172": 4,  # ethnic group
+    "P840": 5,  # narrative location
+    "P915": 4,  # filming location
+    "P921": 5,  # main subject
+    "P186": 4,  # made from material
+    "P1056": 4, # product or material produced
+    "P452": 4,  # industry
+    "P1830": 4, # owner of
+    "P137": 5,  # operator
+    "P140": 5,  # religion or worldview
+    "P171": 4,  # parent taxon
+    "P105": 4,  # taxon rank
+    "P735": 2,  # given name
+    "P734": 2,  # family name
+    "P6": 7,    # head of government
+    "P35": 7,   # head of state
+    "P138": 5,  # named after
+    "P37": 5,   # official language
+    "P38": 4,   # currency
+    "P1082": 5, # population
+    "P1411": 4, # nominated for
+    "P1412": 4, # languages spoken/written/signed
     # External IDs (lowest — noise for QA)
     "P213": -1, "P214": -1, "P244": -1, "P245": -1, "P268": -1, "P269": -1,
     "P345": -1, "P434": -1, "P435": -1, "P496": -1, "P646": -1, "P672": -1,
     "P785": -1, "P856": -1, "P910": -1, "P932": -1, "P973": -1, "P1006": -1,
-    "P1015": -1, "P1082": -1, "P1146": -1, "P1343": -1, "P1411": -1,
-    "P1412": -1, "P1551": -1, "P1552": -1, "P1566": -1, "P1630": -1,
+    "P1015": -1, "P1146": -1, "P1343": -1,
+    "P1551": -1, "P1552": -1, "P1566": -1, "P1630": -1,
     "P1667": -1, "P1670": -1, "P1741": -1, "P1810": -1, "P2002": -1,
     "P2003": -1, "P2013": -1, "P2163": -1, "P2276": -1, "P2397": -1,
     "P2427": -1, "P2581": -1, "P2685": -1, "P2699": -1, "P2847": -1,
@@ -218,50 +295,50 @@ SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
     # Public API
     # ------------------------------------------------------------------
 
+    def _raw_cache_keys(self, qid: str) -> List[str]:
+        """Cache keys to try for ``qid``, newest format first.
+
+        ``relation_filter`` is a *Python* post-filter (SPARQL returns everything),
+        so it must NOT be part of the key: keying on it stored already-filtered
+        triples under a filter-specific key, which (a) duplicated storage per
+        filter and (b) silently missed the 63k entries written under the older
+        ``{qid}_{hops}`` scheme, making the whole on-disk cache dead weight in
+        offline mode. We now cache RAW subgraphs and filter at read time.
+        """
+        return [
+            f"{qid}_{self.max_hops}_{self.max_neighbors}",   # current
+            f"{qid}_{self.max_hops}_{self.max_neighbors}_all",  # R9 v6 interim
+            f"{qid}_{self.max_hops}",                        # legacy (bulk of cache)
+        ]
+
+    def _cached_raw(self, qid: str) -> Optional[List[Tuple[str, str, str]]]:
+        for key in self._raw_cache_keys(qid):
+            hit = self.cache.get(key)
+            if hit is not None:
+                return hit
+        return None
+
     def fetch(self, entity_ids: List[str]) -> List[Tuple[str, str, str]]:
         """Aggregate the deduplicated 2-hop subgraph for a list of QIDs."""
         all_triples: List[Tuple[str, str, str]] = []
         seen: Set[Tuple[str, str, str]] = set()
 
         for qid in entity_ids:
-            filter_tag = "_".join(sorted(self.relation_filter)) if self.relation_filter else "all"
-            cache_key = f"{qid}_{self.max_hops}_{self.max_neighbors}_{filter_tag}"
-            cached = self.cache.get(cache_key)
-            if cached is not None:
-                triples = cached
-                if self.relation_filter:
-                    triples = _apply_relation_filter(triples, self.relation_filter)
-                for triple in triples:
-                    if triple not in seen:
-                        all_triples.append(triple)
-                        seen.add(triple)
-                continue
+            raw = self._cached_raw(qid)
+            if raw is None:
+                raw = self._fetch_single(qid)
+                # Cache the RAW subgraph so a later relation-policy change reuses
+                # it. Never cache empty (a failed/blocked fetch must be retried).
+                if raw:
+                    self.cache.set(self._raw_cache_keys(qid)[0], raw)
+                if not self.offline:
+                    time.sleep(self.request_delay)
 
-            triples = self._fetch_single(qid)
-            # Fallback to unfiltered cache (key="all") if filtered query misses
-            if self.relation_filter and not triples and self.offline:
-                unfiltered_key = f"{qid}_{self.max_hops}_{self.max_neighbors}_all"
-                unfiltered = self.cache.get(unfiltered_key)
-                if unfiltered:
-                    triples = _apply_relation_filter(unfiltered, self.relation_filter)
-            elif self.relation_filter and triples:
-                # Only filter SPARQL results (offline fallback already filtered above)
-                triples = _apply_relation_filter(triples, self.relation_filter)
-
-            # Cache only non-empty results. Filtering can legitimately produce [] from
-            # a valid SPARQL result — don't cache that, so future filter changes retry.
-            if triples and not (self.offline and not triples):
-                self.cache.set(cache_key, triples)
-            elif triples:
-                pass  # offline, already from cache — don't re-persist
-            # empty triples: never cache, so future runs retry
+            triples = _apply_relation_filter(raw, self.relation_filter) if self.relation_filter else raw
             for triple in triples:
                 if triple not in seen:
                     all_triples.append(triple)
                     seen.add(triple)
-
-            if not self.offline:
-                time.sleep(self.request_delay)
         return all_triples
 
     def _fetch_single(self, qid: str) -> List[Tuple[str, str, str]]:

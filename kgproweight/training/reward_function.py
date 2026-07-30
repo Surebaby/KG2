@@ -43,6 +43,45 @@ def _decode_len(tokenizer, ids: List[int]) -> int:
         return len(tokenizer.decode(ids))
 
 
+def _norm_text(s: str) -> str:
+    return re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())
+
+
+def _grounded_mentions(
+    mentions,
+    question: str,
+    retrieved_passages: Sequence[Dict[str, Any]],
+    question_kg: Sequence[Tuple[str, str, str]],
+) -> List[str]:
+    """Subset of ``mentions`` that the question's own evidence supports (§3.4).
+
+    A generated mention qualifies when it appears in the question, in a retrieved
+    passage, or as a node of the question-anchored KG. Mentions the model
+    invented out of nothing are excluded, so they cannot pull their real-but-
+    irrelevant Wikidata subgraph into the reward graph.
+    """
+    haystack = _norm_text(question)
+    for p in list(retrieved_passages)[:20]:
+        if isinstance(p, dict):
+            haystack += " " + _norm_text(str(p.get("contents") or p.get("text") or ""))
+        else:
+            haystack += " " + _norm_text(str(p))
+    kg_nodes = set()
+    for t in question_kg:
+        if len(t) == 3:
+            kg_nodes.add(_norm_text(str(t[0])).strip())
+            kg_nodes.add(_norm_text(str(t[2])).strip())
+
+    out: List[str] = []
+    for m in mentions:
+        key = _norm_text(m).strip()
+        if not key:
+            continue
+        if key in kg_nodes or re.search(rf"\b{re.escape(key)}\b", haystack):
+            out.append(m)
+    return out
+
+
 def _supports_skip(tokenizer) -> bool:
     try:
         tokenizer.decode([], skip_special_tokens=False)
@@ -345,29 +384,37 @@ class KGProWeightRewardFunction:
         dynamic_kg: List[Tuple[str, str, str]] = []
         if self.subgraph_retriever is not None:
             try:
-                from kgproweight.kg.entity_linker import extract_mentions
                 all_mentions = set()
                 for _s in steps:
                     for m in (_s.mentioned_entities or []):
                         if m:
                             all_mentions.add(m)
-                if all_mentions:
+                # Only mentions that are GROUNDED in the question's own evidence
+                # may expand the reward graph (§3.4). Without this, the model can
+                # hallucinate an entity, the system fetches that entity's REAL
+                # Wikidata subgraph, the model cites it, the PRM marks the
+                # citation verified — and wrong reasoning earns positive R_KG.
+                grounded = _grounded_mentions(
+                    all_mentions, spec.query, spec.retrieved_passages, spec.kg_subgraph
+                )
+                if grounded:
                     linker = self.composite.prm_annotator.entity_linker
-                    linked = {}
-                    for m in all_mentions:
-                        r = linker.link_single(m)
-                        if r.selected_qid:
-                            linked[m] = r.selected_qid
-                    qids = list(linked.values())
+                    qids = []
+                    for m in grounded:
+                        # Pass the question so the linker's context scoring runs;
+                        # link_single(mention) alone silently skips it and falls
+                        # back to "first Wikidata search hit".
+                        r = linker.link_single(m, question=spec.query)
+                        if r.selected_qid and not r.abstained:
+                            qids.append(r.selected_qid)
                     if qids:
                         dynamic_kg = self.subgraph_retriever.fetch(qids) or []
             except Exception as e:
                 logger.warning("Dynamic KG fetch failed: %s", e)
 
-        # Merge dynamic KG with question-anchored KG instead of replacing it.
-        # Dynamic KG alone enables reward hacking: model generates wrong entity,
-        # system fetches its real KG, model cites it → verified → positive reward.
-        kg_for_reward = list(set(tuple(t) for t in (spec.kg_subgraph + dynamic_kg)))
+        # Merge the grounded expansion with the question-anchored KG; never let
+        # generated entities REPLACE it.
+        kg_for_reward = list(set(tuple(t) for t in (list(spec.kg_subgraph) + dynamic_kg)))
 
         records = self.composite.compute_trajectory_rewards(
             steps=steps,

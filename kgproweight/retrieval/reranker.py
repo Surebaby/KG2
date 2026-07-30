@@ -15,7 +15,7 @@ Config fields (set in hybrid.py or YAML):
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 from kgproweight.utils.logging import get_logger
 
@@ -74,6 +74,87 @@ def rerank_with_bm25(
 def _passage_text(passage: Dict[str, Any]) -> str:
     """Extract text from a passage dict."""
     return passage.get("contents", "") or passage.get("text", "") or ""
+
+
+# Cross-encoder models are ~600 MB and take seconds to load; cache per path so a
+# per-question or per-batch rerank does not reload the weights every call.
+_CE_CACHE: Dict[str, Any] = {}
+
+
+def resolve_cross_encoder_path(model_name: str) -> str:
+    """Resolve a cross-encoder to a local dir when available, else an HF id."""
+    if Path(model_name).exists():
+        return str(Path(model_name))
+    from kgproweight.utils.paths import project_root
+
+    local = Path(project_root()) / "models" / model_name.split("/")[-1]
+    if local.exists():
+        return str(local)
+    return model_name  # let sentence-transformers download it
+
+
+def get_cross_encoder(model_name: str):
+    """Load (and memoise) a sentence-transformers CrossEncoder."""
+    path = resolve_cross_encoder_path(model_name)
+    if path not in _CE_CACHE:
+        from sentence_transformers import CrossEncoder
+
+        logger.info("Loading cross-encoder reranker from %s", path)
+        _CE_CACHE[path] = CrossEncoder(path)
+    return _CE_CACHE[path]
+
+
+def rerank_with_cross_encoder(
+    questions: List[str],
+    candidates: List[List[Dict[str, Any]]],
+    topk: int = 10,
+    model_name: str = "models/bge-reranker-v2-m3",
+    max_chars: int = 1200,
+) -> List[List[Dict[str, Any]]]:
+    """Cross-encoder rerank. Falls back to BM25 if the model cannot load."""
+    try:
+        model = get_cross_encoder(model_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Cross-encoder %s unavailable (%s) — falling back to the BM25 reranker. "
+            "Results will NOT match a cross-encoder run; note this in any comparison.",
+            model_name, exc,
+        )
+        return rerank_with_bm25(questions, candidates, topk=topk)
+
+    results: List[List[Dict[str, Any]]] = []
+    for q, cands in zip(questions, candidates):
+        if not cands:
+            results.append([])
+            continue
+        pairs = [(q, _passage_text(c)[:max_chars]) for c in cands]
+        scores = model.predict(pairs, show_progress_bar=False)
+        order = sorted(range(len(cands)), key=lambda i: float(scores[i]), reverse=True)
+        results.append([cands[i] for i in order[:topk]])
+    return results
+
+
+def rerank_passages(
+    questions: List[str],
+    candidates: List[List[Dict[str, Any]]],
+    topk: int = 10,
+    method: str = "cross-encoder",
+    cross_encoder_model: str = "models/bge-reranker-v2-m3",
+) -> List[List[Dict[str, Any]]]:
+    """Single entry point for reranking, so every call site agrees on the method.
+
+    Phase 1 used a cross-encoder while inference used the hand-rolled BM25
+    scorer, which silently made the silver-data and eval passage distributions
+    different.
+    """
+    if method == "bm25":
+        return rerank_with_bm25(questions, candidates, topk=topk)
+    if method in ("cross-encoder", "cross_encoder", "ce"):
+        return rerank_with_cross_encoder(
+            questions, candidates, topk=topk, model_name=cross_encoder_model,
+        )
+    logger.warning("Unknown rerank method %r — truncating to top-%d instead.", method, topk)
+    return [c[:topk] for c in candidates]
 
 
 class RetrievalConfig:
@@ -175,29 +256,11 @@ class RRFRerankRetriever:
         self, questions: List[str], candidates: List[List[Dict[str, Any]]],
     ) -> List[List[Dict[str, Any]]]:
         """Rerank candidates using a cross-encoder model."""
-        from sentence_transformers import CrossEncoder
-
-        model_path = str(Path(self.config.cross_encoder_model))
-        if not Path(model_path).exists():
-            # Try local models dir
-            local = Path("/home/zjulab/kgpaper/models") / self.config.cross_encoder_model.split("/")[-1]
-            if local.exists():
-                model_path = str(local)
-            else:
-                model_path = self.config.cross_encoder_model  # HF download
-
-        model = CrossEncoder(model_path)
-        results = []
-        for q, cands in zip(questions, candidates):
-            if not cands:
-                results.append([])
-                continue
-            pairs = [(q, _passage_text(c)) for c in cands]
-            scores = model.predict(pairs, show_progress_bar=False)
-            scored = list(zip(scores, cands))
-            scored.sort(key=lambda x: x[0], reverse=True)
-            results.append([c for _, c in scored[:self.config.rerank_topk]])
-        return results
+        return rerank_with_cross_encoder(
+            questions, candidates,
+            topk=self.config.rerank_topk,
+            model_name=self.config.cross_encoder_model,
+        )
 
 
 def pack_passages_by_token_budget(

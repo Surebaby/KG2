@@ -159,6 +159,37 @@ def main():
             all_ok &= check("v1→v2 rebuild recommended", True,
                           "run scripts/prepare/06_build_question_kg_index.py")
 
+        # ── Eval-split coverage (R9 v6) ──
+        # The single most consequential gap found in the v6 audit: the index was
+        # built from TRAIN questions only, so it covered 0/100 hotpotqa dev,
+        # 0/12576 2wiki dev and 0/2417 musique dev. Inference silently fell back
+        # to raw SPARQL-order triples, so the filtered KG never reached eval.
+        # Coverage is now a hard check, not an afterthought.
+        for ds in ["hotpotqa", "2wikimultihopqa", "musique"]:
+            ds_file = data_dir() / ds / "dev.jsonl"
+            if not ds_file.exists():
+                continue
+            dev_qs = []
+            with open(ds_file, encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        dev_qs.append(json.loads(line).get("question", ""))
+                    except json.JSONDecodeError:
+                        continue
+            if not dev_qs:
+                continue
+            covered = sum(1 for q in dev_qs if q in q_kg_index)
+            pct = covered / len(dev_qs) * 100
+            all_ok &= check(
+                f"{ds} dev coverage >= 90%", pct >= 90.0,
+                f"{covered}/{len(dev_qs)} = {pct:.1f}%"
+                + ("" if pct >= 90 else
+                   "  [rebuild: 06_build_question_kg_index.py --datasets "
+                   f"{ds} --split dev]"),
+            )
+
         # KG token budget
         p95_triples = sorted(len(_get_triples(e)) for e in raw)[int(len(raw) * 0.95)]
         p95_tokens = p95_triples * 40 // 4

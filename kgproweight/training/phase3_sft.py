@@ -52,7 +52,9 @@ def _render_assistant_trace(traj) -> str:
     lines = []
     n = 0
     for step in traj.steps:
-        if step.label == -1:
+        # Labels are continuous r_kg values, so `== -1` missed anything strictly
+        # between -1 and 0. Drop any step the KG net-contradicts.
+        if float(step.label) <= -0.5:
             continue  # drop hallucinated steps from SFT
         n += 1
         lines.append(f"[Step {n}]\n{step.text.strip()}")

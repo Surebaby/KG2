@@ -24,11 +24,12 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # ── Layer 1: Hard deletion ──
-
-# Relations to ALWAYS drop (Wikimedia meta, disambiguation, maintenance)
-_HARD_DELETE_RELATIONS: Set[str] = frozenset({
-    "instance of",                          # handled by quota, not hard delete
-})
+#
+# Removed: _HARD_DELETE_RELATIONS and _HARD_DELETE_PIDS. Both were unreferenced
+# and each contained only "instance of"/P31 with a comment saying that relation
+# is handled by quota rather than hard delete — i.e. they claimed a policy the
+# code does not implement. Reading them as live config was misleading; the
+# taxonomic policy lives in _QUOTA_PID_LIMITS + the score_triple penalty.
 
 # Head/tail entity labels to ALWAYS drop
 _HARD_DELETE_TAIL_LABELS: Set[str] = {
@@ -44,16 +45,65 @@ _HARD_DELETE_TAIL_LABELS: Set[str] = {
     "Wikipedia disambiguation page",
 }
 
-# Relations that are Wikimedia-internal (always noise for QA)
-_HARD_DELETE_PIDS: Set[str] = {
-    "P31",  # instance of — handled by quota, not hard delete
-}
-
 # Relations to hard-delete by LABEL (the English display name)
 _HARD_DELETE_RELATION_LABELS: Set[str] = {
     "topic's main category",
     "category's main topic",
     "on focus list of Wikimedia project",
+    # Wikimedia-internal bookkeeping. These survived scoring because their head
+    # and tail echo the question entity ("Ed Wood" → "Template:Ed Wood"), so the
+    # entity_anchor term outweighed the noise penalty and they reached the prompt.
+    "topic has template",
+    "template has topic",
+    "related category",
+    "category contains",
+    "is a list of",
+    "has list",
+    "list of monuments",
+    "maintained by WikiProject",
+    "model item",
+    "main Wikidata property",
+    "related Wikidata property",
+    "inappropriate property for this type",
+    "Wikimedia outline",
+    "topic's main Wikimedia portal",
+    "permanent duplicated item",
+    "category combines topics",
+    "category for eponymous categories",
+    "category of associated people",
+    "category for people who died here",
+    "category for people born here",
+    "category for people buried here",
+    "category for films shot at this location",
+    "category for alumni of educational institution",
+    "category for employees of the organization",
+    "category for members of a team",
+    "category for recipients of this award",
+    "category for the view of the item",
+    "category for the view from the item",
+    "category for maps or plans",
+    "member category",
+    "history of topic",
+    "economy of topic",
+    "geography of topic",
+    "demographics of topic",
+    "open data portal",
+    "documentation files at",
+    "archives at",
+    "artist files at",
+    "assessment",
+    "partially coincident with",
+    "said to be the same as",
+    "different from",
+    "opposite of",
+    "facet of",
+    "has characteristic",
+    "attested in",
+    "depicted by",
+    "copyright status",
+    "copyright status as a creator",
+    "copyright license",
+    "copyright representative",
     "described by source",
     "properties for this type",
     "said to be the same as",
@@ -225,7 +275,12 @@ _QUESTION_KEYWORD_TO_PID: Dict[str, List[str]] = {
     "highway": ["P182"], "railway": ["P81"],
     "port": ["P206"], "harbor": ["P206"],
     # ── Animals / Species ──
-    "species": ["P105"], "genus": ["P171"], "family": ["P171"],
+    # NOTE: "family" is deliberately NOT re-keyed here. It appears above mapped
+    # to the kinship PIDs; a second "family": ["P171"] entry silently overwrote
+    # that (later key wins), so questions about a person's family scored
+    # taxonomic rank instead of spouse/parent/child. Taxonomic "family" is
+    # covered by "genus"/"parent taxon".
+    "species": ["P105"], "genus": ["P171"],
     "moth": ["P105", "P171"], "animal": ["P105", "P171"],
     "bird": ["P105"], "fish": ["P105"],
     # ── Contains / Part of ──
@@ -306,6 +361,93 @@ _RELATION_LABEL_TO_PID: Dict[str, str] = {
     "said to be the same as": "P460",
     "different from": "P1889",
     "topic's main category": "P910",
+    # ── R9 v6 fix: labels that were MISSING, so `_apply_relation_filter`
+    # (which resolves label→PID before testing the QA whitelist) silently
+    # dropped triples whose PID *is* whitelisted. P20/P166/P175/P112/P54/
+    # P286/P118 were all unreachable — exactly the relations multi-hop QA
+    # needs. Measured effect: 48% of cached triples discarded, incl. 5767
+    # `place of death` and 3654 `award received`.
+    "place of death": "P20",
+    "award received": "P166",
+    "performer": "P175",
+    "founded by": "P112",
+    "founder": "P112",
+    "member of sports team": "P54",
+    "head coach": "P286",
+    "league": "P118",
+    "league or competition": "P118",
+    # ── Additional QA-relevant relations observed in the live cache ──
+    "publisher": "P123",
+    "composer": "P86",
+    "sibling": "P3373",
+    "winner": "P1346",
+    "cause of death": "P509",
+    "residence": "P551",
+    "country of origin": "P495",
+    "record label": "P264",
+    "continent": "P30",
+    "field of work": "P101",
+    "notable work": "P800",
+    "nominated for": "P1411",
+    "parent taxon": "P171",
+    "taxon rank": "P105",
+    "operator": "P137",
+    "religion or worldview": "P140",
+    "position played on team / speciality": "P413",
+    "military branch": "P241",
+    "original language of film or TV show": "P364",
+    "instrument": "P1303",
+    "languages spoken, written or signed": "P1412",
+    "native language": "P103",
+    "work location": "P937",
+    "place of burial": "P119",
+    "architect": "P84",
+    "developer": "P178",
+    "director of photography": "P344",
+    "editor": "P98",
+    "film editor": "P1040",
+    "lyricist": "P676",
+    "voice actor": "P725",
+    "characters": "P674",
+    "based on": "P144",
+    "production company": "P272",
+    "distributed by": "P750",
+    "part of the series": "P179",
+    "follows": "P155",
+    "followed by": "P156",
+    "replaces": "P1365",
+    "replaced by": "P1366",
+    "twinned administrative body": "P190",
+    "located in time zone": "P421",
+    "located in or next to body of water": "P206",
+    "located in/on physical feature": "P706",
+    "highest point": "P610",
+    "significant event": "P793",
+    "participant in": "P1344",
+    "participated in conflict": "P607",
+    "doctoral advisor": "P184",
+    "doctoral student": "P185",
+    "student of": "P1066",
+    "student": "P802",
+    "influenced by": "P737",
+    "chief executive officer": "P169",
+    "chairperson": "P488",
+    "legislative body": "P194",
+    "office held by head of government": "P1313",
+    "basic form of government": "P122",
+    "ethnic group": "P172",
+    "narrative location": "P840",
+    "filming location": "P915",
+    "main subject": "P921",
+    "depicts": "P180",
+    "made from material": "P186",
+    "product or material produced": "P1056",
+    "industry": "P452",
+    "legal form": "P1454",
+    "owner of": "P1830",
+    "parent organization or unit": "P749",
+    "given name": "P735",
+    "family name": "P734",
 }
 
 
@@ -480,11 +622,22 @@ def _path_connectivity_score(
     return 0.0
 
 
-def _relation_utility_baseline(pid: str, r: str) -> float:
-    """Score how inherently useful a relation is for QA (0.0–1.0).
+def _relation_priority(pid: str) -> int:
+    """Retrieval-layer QA priority for ``pid`` (0 when unknown).
 
-    Wikidata metadata relations get 0.0. Core factual relations get 1.0.
-    Unknown/unmapped relations get 0.1 (likely noise).
+    Imported lazily to avoid a circular import: wikidata_retriever imports the
+    label→PID map from this module.
+    """
+    from kgproweight.kg.wikidata_retriever import _RELATION_PRIORITY
+
+    return int(_RELATION_PRIORITY.get(pid, 0))
+
+
+def _relation_utility_baseline(pid: str, r: str) -> float:
+    """Score how inherently useful a relation is for QA (-0.3 – 1.0).
+
+    Wikidata metadata/external-ID relations are penalised; core factual
+    relations score highest; unknown relations are treated as probable noise.
     """
     if not pid:
         # Unknown relation — check for noise patterns
@@ -501,22 +654,18 @@ def _relation_utility_baseline(pid: str, r: str) -> float:
                 return -0.30  # heavy penalty for noise
         return 0.05  # unknown, assume mostly useless
 
-    # Core factual relations
-    core_pids = {
-        "P27", "P19", "P20", "P569", "P570",  # nationality, birth, death
-        "P106", "P39", "P108",                 # occupation, position, employer
-        "P26", "P22", "P25", "P40",            # family
-        "P57", "P58", "P161", "P162", "P50",   # film/creative
-        "P17", "P131", "P159", "P276", "P36",   # location
-        "P112", "P127", "P176", "P355",        # organization
-        "P69", "P54", "P118", "P463",          # education, sports, membership
-        "P136", "P407", "P138",                # genre, language, named after
-        "P571", "P576",                        # inception, dissolution
-    }
-    if pid in core_pids:
-        return 0.25  # baseline reward for being a useful relation type
-
-    return 0.05  # mapped but not core → low utility
+    # Core factual relations. Derived from the retrieval-layer priority table
+    # rather than a second hand-maintained list: the previous hardcoded set had
+    # drifted, so relations like P551 (residence) — often the literal answer —
+    # scored as "mapped but not core" and lost to noise on lexical overlap.
+    priority = _relation_priority(pid)
+    if priority >= 6:
+        return 1.0   # high-value QA relation
+    if priority >= 3:
+        return 0.5   # useful but secondary
+    if priority >= 1:
+        return 0.1   # low value (taxonomic, given/family name)
+    return -0.30     # external ID / metadata
 
 
 def score_triple(
@@ -578,12 +727,20 @@ def score_triple(
     elif pid == "P361":
         taxonomic_penalty = 0.15
 
+    # Relation-utility prior. This term was computed by a helper that nothing
+    # called, so unmapped relations ("topic has template", "related category",
+    # …) carried NO penalty and could outrank real facts on lexical overlap
+    # alone. Small weight: it breaks ties, it does not dominate the question
+    # signal.
+    utility = _relation_utility_baseline(pid, r)
+
     return (
         0.30 * entity_score
         + 0.25 * rel_score
         + 0.25 * triple_score
         + 0.10 * path_score
         + 0.10 * evidence_score
+        + 0.10 * utility
         - taxonomic_penalty
     )
 

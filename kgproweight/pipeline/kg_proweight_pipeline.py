@@ -24,7 +24,8 @@ from kgproweight.data.parsers import parse_steps
 from kgproweight.data.prompts import build_inference_messages
 from kgproweight.eval.pred_processing import extract_kg_proweight_answer
 from kgproweight.kg.entity_linker import EntityLinker, extract_mentions
-from kgproweight.kg.wikidata_retriever import WikidataSubgraphRetriever
+from kgproweight.kg.kg_filter import filter_and_rank_triples
+from kgproweight.kg.wikidata_retriever import _QA_RELATION_FILTER, WikidataSubgraphRetriever
 from kgproweight.retrieval.hybrid import DEFAULT_TOPK
 from kgproweight.reward.alpha_gate import AlphaGate, compute_features
 from kgproweight.utils.paths import index_dir
@@ -55,6 +56,8 @@ class KGProWeightPipeline(BasicPipeline):
         max_mentions: int = 5,
         retrieval_topk: Optional[int] = None,
         rerank_topk: int = 0,  # 0 = disabled
+        rerank_method: str = "cross-encoder",
+        cross_encoder_model: str = "models/bge-reranker-v2-m3",
         generator=None,
         retriever=None,
         **kwargs,
@@ -67,6 +70,8 @@ class KGProWeightPipeline(BasicPipeline):
         _cfg_topk = config["retrieval_topk"] if "retrieval_topk" in config else DEFAULT_TOPK
         self.retrieval_topk = retrieval_topk or int(_cfg_topk)
         self.rerank_topk = rerank_topk
+        self.rerank_method = rerank_method
+        self.cross_encoder_model = cross_encoder_model
         self._alpha_records: List[Dict] = []
 
         self.generator = generator if generator is not None else get_generator(config)
@@ -79,10 +84,17 @@ class KGProWeightPipeline(BasicPipeline):
         if _kg_offline:
             logger.info("KG offline mode ON (KGPW_KG_OFFLINE) — cache-only, no network.")
         self.entity_linker = EntityLinker(cache_path=entity_cache_path, offline=_kg_offline)
+        # Default to the project KG cache when the caller passes nothing — an
+        # unset cache_dir means every offline fetch returns [] (no KG at all).
+        _kg_cache_dir = kg_cache_dir or str(Path(index_dir()) / "kg_cache")
         self.kg_retriever = WikidataSubgraphRetriever(
-            max_hops=2, max_neighbors=30, cache_dir=kg_cache_dir, offline=_kg_offline
+            max_hops=2, max_neighbors=30, cache_dir=_kg_cache_dir,
+            offline=_kg_offline, relation_filter=_QA_RELATION_FILTER,
         )
         self.prm_annotator = PRMAnnotator(entity_linker=self.entity_linker, verbose=False)
+        # Where each sample's KG came from — logged after run() so a 0% index
+        # hit rate (the R9 v6 dev-split gap) is visible instead of silent.
+        self._kg_source_counts: Dict[str, int] = {"index": 0, "fallback": 0, "empty": 0}
 
         # R9 v6: load pre-built question→KG index (v2 filtered cache) to align
         # inference KG quality with training. Falls back to live Wikidata on miss.
@@ -138,6 +150,7 @@ class KGProWeightPipeline(BasicPipeline):
         # Falls back to live Wikidata lookup only on cache miss.
         cached = self._q_kg_index.get(item.question)
         if cached:
+            self._kg_source_counts["index"] += 1
             return list(cached[:self.max_kg_triples])
 
         mentions = extract_mentions(item.question, max_n=self.max_mentions)
@@ -148,7 +161,22 @@ class KGProWeightPipeline(BasicPipeline):
             )
             if not result.abstained and result.selected_qid:
                 qids.append(result.selected_qid)
-        return self.kg_retriever.fetch(qids) if qids else []
+        if not qids:
+            self._kg_source_counts["empty"] += 1
+            return []
+        raw = self.kg_retriever.fetch(qids)
+        if not raw:
+            self._kg_source_counts["empty"] += 1
+            return []
+        # R9 v6 fix: the fallback previously returned RAW SPARQL-order triples,
+        # bypassing the three-layer filter entirely. Since the v2 index only
+        # covers the questions it was built from, most eval questions took this
+        # path — so the measured "74.6% noise removed" never reached inference.
+        # Apply the same scoring/quota policy here.
+        self._kg_source_counts["fallback"] += 1
+        return filter_and_rank_triples(
+            raw, question=item.question, max_keep=self.max_kg_triples,
+        )
 
     # ------------------------------------------------------------------
     # Run
@@ -164,15 +192,26 @@ class KGProWeightPipeline(BasicPipeline):
         # R9 v6: two-stage retrieval with reranker
         if self.rerank_topk > 0 and retrieval_results and len(retrieval_results[0]) > self.rerank_topk:
             from kgproweight.retrieval.reranker import (
-                RetrievalConfig, rerank_with_bm25, pack_passages_by_token_budget,
+                RetrievalConfig, pack_passages_by_token_budget, rerank_passages,
             )
             rcfg = RetrievalConfig(
                 rrf_candidate_topk=len(retrieval_results[0]),
                 rerank_topk=self.rerank_topk,
                 prompt_passage_token_budget=3860,
+                rerank_method=self.rerank_method,
+                cross_encoder_model=self.cross_encoder_model,
             )
             logger.info("R9 v6 retrieval: %s", rcfg.log_string())
-            retrieval_results = rerank_with_bm25(questions, retrieval_results, topk=self.rerank_topk)
+            # Was hardcoded to the hand-rolled BM25 scorer even though
+            # bge-reranker-v2-m3 is present locally and Phase 1 already uses it —
+            # so train and eval reranked with DIFFERENT models. Now both go
+            # through one dispatcher, cross-encoder by default.
+            retrieval_results = rerank_passages(
+                questions, retrieval_results,
+                topk=self.rerank_topk,
+                method=rcfg.rerank_method,
+                cross_encoder_model=rcfg.cross_encoder_model,
+            )
             # Apply token budget to each question's passages
             retrieval_results = [
                 pack_passages_by_token_budget(passages, rcfg.prompt_passage_token_budget)
@@ -197,6 +236,24 @@ class KGProWeightPipeline(BasicPipeline):
                 max_kg_triples=self.max_kg_triples,
             )
             prompts.append(self.prompt_template.get_string(messages=msgs))
+
+        _src = self._kg_source_counts
+        _tot = max(1, sum(_src.values()))
+        logger.info(
+            "KG source: prebuilt index %d (%.0f%%), live fallback %d (%.0f%%), empty %d (%.0f%%) "
+            "| mean triples/question=%.1f",
+            _src["index"], 100 * _src["index"] / _tot,
+            _src["fallback"], 100 * _src["fallback"] / _tot,
+            _src["empty"], 100 * _src["empty"] / _tot,
+            sum(len(k) for k in kg_subgraphs) / max(1, len(kg_subgraphs)),
+        )
+        if self.inject_kg and _src["index"] == 0 and _src["fallback"] + _src["empty"] > 0:
+            logger.warning(
+                "question_kg_index covered 0/%d eval questions — the pre-built v2 KG is "
+                "NOT being used. Rebuild it for this split with "
+                "scripts/prepare/06_build_question_kg_index.py --datasets <ds> --split <split>.",
+                _tot,
+            )
 
         dataset.update_output("prompt", prompts)
         dataset.update_output("kg_subgraphs", kg_subgraphs)

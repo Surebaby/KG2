@@ -15,6 +15,9 @@ from __future__ import annotations
 from typing import List, Mapping, Optional, Sequence
 
 from kgproweight.retrieval.hybrid import DEFAULT_TOPK
+from kgproweight.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Step / answer markers — single source of truth

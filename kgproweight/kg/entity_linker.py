@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import requests
 from rapidfuzz import fuzz
@@ -292,78 +291,11 @@ class EntityLinker:
         candidates.sort(key=lambda x: x.score, reverse=True)
         return candidates
 
-    def link_with_context(
-        self,
-        mention: str,
-        question: str = "",
-        retrieved_titles: Optional[List[str]] = None,
-        expected_types: Optional[List[str]] = None,
-    ) -> LinkResult:
-        """Link a mention to a Wikidata QID with question-context scoring.
-
-        Returns a LinkResult with candidates, confidence, and abstain flag.
-        """
-        clean = _clean(mention)
-        candidates: List[LinkCandidate] = []
-
-        # Check known fixes first
-        fix = _KNOWN_FIXES.get(clean)
-        if fix:
-            q_key = "default"
-            if expected_types:
-                for et in expected_types:
-                    if et in fix:
-                        q_key = et
-                        break
-            if q_key in fix:
-                return LinkResult(
-                    mention=mention,
-                    selected_qid=fix[q_key],
-                    selected_label=mention,
-                    score=0.95,
-                    margin=0.50,
-                )
-
-        # 1. Wikidata Search candidates
-        candidates = self._search_candidates(mention)
-        if candidates:
-            candidates = self._score_candidates(mention, candidates, question, expected_types)
-
-        # 2. Score and select
-        if not candidates:
-            return LinkResult(mention=mention, abstained=True, abstain_reason="no candidates")
-
-        top = candidates[0]
-        second_score = candidates[1].score if len(candidates) > 1 else 0.0
-        margin = top.score - second_score
-
-        # Abstain rules
-        if top.score < 0.15:
-            return LinkResult(mention=mention, abstained=True,
-                           abstain_reason=f"low score ({top.score:.2f})",
-                           candidates=candidates)
-        if margin < 0.05 and len(candidates) > 1:
-            return LinkResult(mention=mention, abstained=True,
-                           abstain_reason=f"low margin ({margin:.2f})",
-                           candidates=candidates)
-        if top.score < 0:
-            return LinkResult(mention=mention, abstained=True,
-                           abstain_reason="negative score (disambiguation/category)",
-                           candidates=candidates)
-
-        # Update cache with context-aware decision
-        self.cache.set(clean, top.qid)
-
-        return LinkResult(
-            mention=mention,
-            selected_qid=top.qid,
-            selected_label=top.label,
-            description=top.description,
-            score=top.score,
-            second_score=second_score,
-            margin=margin,
-            candidates=candidates,
-        )
+    # NOTE: `link_with_context` was removed. It duplicated `link_single`
+    # (same candidate generation + scoring) but with DIFFERENT abstain
+    # thresholds and no legacy-cache fallback, and nothing called it — so
+    # reading it as the context-aware entry point was misleading.
+    # `link_single(mention, question=...)` is the one real path.
 
     # ------------------------------------------------------------------
     # Public API (legacy)
@@ -509,32 +441,35 @@ class EntityLinker:
 # ---------------------------------------------------------------------------
 
 _MENTION_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b")
+
+# Words that are never part of an entity name. Used BOTH as a whole-mention
+# filter and — critically — as a leading/trailing token stripper: a
+# sentence-initial function word is capitalised, so the regex above happily
+# glued it onto the real entity ("Were Scott Derrickson", "This Singer",
+# "Are Local"). The resulting mention never linked. Measured contamination of
+# the FIRST extracted mention: hotpotqa 17%, 2wiki 14.9%, musique 6.6%.
 _MENTION_BLACKLIST = {
-    "what",
-    "which",
-    "who",
-    "whom",
-    "whose",
-    "when",
-    "where",
-    "why",
-    "how",
-    "is",
-    "are",
-    "was",
-    "were",
-    "do",
-    "does",
-    "did",
-    "can",
-    "could",
-    "should",
-    "would",
-    "will",
-    "the",
-    "a",
-    "an",
+    "what", "which", "who", "whom", "whose", "when", "where", "why", "how",
+    "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "has", "have", "had",
+    "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+    "the", "a", "an", "this", "that", "these", "those",
+    "and", "or", "but", "if", "then", "than", "both", "either", "neither",
+    "in", "on", "at", "to", "for", "of", "from", "by", "with", "as",
+    "there", "here", "it", "its", "his", "her", "their", "he", "she", "they",
+    "also", "not", "no", "yes", "between", "during", "after", "before",
+    "name", "given", "according", "based", "about",
 }
+
+
+def _strip_stopword_affixes(mention: str) -> str:
+    """Drop leading/trailing blacklist tokens from a capitalised phrase."""
+    parts = mention.split()
+    while parts and parts[0].lower() in _MENTION_BLACKLIST:
+        parts.pop(0)
+    while parts and parts[-1].lower() in _MENTION_BLACKLIST:
+        parts.pop()
+    return " ".join(parts)
 
 
 def extract_mentions(text: str, max_n: int = 5) -> List[str]:
@@ -545,7 +480,8 @@ def extract_mentions(text: str, max_n: int = 5) -> List[str]:
     """
     seen: Dict[str, None] = {}
     for m in _MENTION_RE.findall(text):
-        if m.lower() in _MENTION_BLACKLIST:
+        m = _strip_stopword_affixes(m)
+        if not m or m.lower() in _MENTION_BLACKLIST:
             continue
         if len(m) >= 3:
             seen.setdefault(m, None)
