@@ -162,7 +162,7 @@ python scripts/eval/run_ihr_judge.py \
 
 See `docs/baselines_final.md` for full baseline comparison.
 
-## R9 v5 Results (July 2026)
+## R9 v5 Results
 
 | Baseline | EM avg | HotpotQA | 2Wiki | MuSiQue |
 |---|---|---|---|---|
