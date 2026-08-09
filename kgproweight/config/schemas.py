@@ -11,6 +11,12 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from kgproweight.data.silver_split import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_TEST_RATIO,
+    DEFAULT_VAL_RATIO,
+)
+
 
 class _Base(BaseModel):
     """Base model: allow extras for forward-compat with YAML overrides."""
@@ -167,6 +173,18 @@ class TrainingConfig(_Base):
     reference_model: Optional[str] = None  # path to SFT checkpoint
     text_reward_model: Optional[str] = None
     prm_checkpoint: Optional[str] = None
+
+    # ---- train/val/test split (shared by phase 2 and phase 3)
+    # Applies to every phase that reads silver data, so the same fold definition
+    # is reused rather than each phase inventing its own. ``split=None`` keeps
+    # the pre-split behaviour of training on the whole file.
+    split: Optional[Literal["train", "val", "test"]] = None
+    val_ratio: float = DEFAULT_VAL_RATIO
+    test_ratio: float = DEFAULT_TEST_RATIO
+    # Deliberately independent of ``seed``: a sweep over training randomness must
+    # not also redraw the held-out set, or the resulting variance mixes two
+    # different sources.
+    split_seed: int = DEFAULT_SPLIT_SEED
 
     # ---- runtime
     silver_data: SilverDataConfig = Field(default_factory=SilverDataConfig)

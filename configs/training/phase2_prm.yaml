@@ -10,4 +10,43 @@ training:
   prm_lr: 5.0e-5
   prm_batch_size: 4
   prm_grad_accum: 4
-  prm_max_length: 2048
+  # Phase 2 tokenises ONE reasoning step per sample, not a whole trajectory or
+  # prompt. The old 2048 was a prompt-sized value that let a single long step pad
+  # its whole batch to ~1400 tokens; at batch 8 with no gradient checkpointing
+  # that is ~80 GB of activations and OOM'd a 96 GB card at step 3900.
+  #
+  # Since the NEG fix, the input is the step PLUS up to 6 prior conclusions (the
+  # contradiction evidence the label depends on). Measured over 13,374 accepted
+  # steps with the prefix: mean=95, p50=87, p95=152, p99=242, p99.9=701, max=1386.
+  #
+  # 1024 rather than 512 because the tail is thin but real: at 512, 26 samples
+  # (0.194%) truncate and their MEDIAN length is 749 — i.e. the ones that get cut
+  # lose a third of their content, not a token or two. 1024 cuts that to 3
+  # samples (0.022%).
+  #
+  # This is nearly free. _collate pads to the batch max, so cost tracks the
+  # longest sample in each batch, and at batch_size=4 the long tail is too sparse
+  # to be drawn: over 1000 sampled batches the mean batch-max is 130 tokens at
+  # cap=512 and 133 at cap=1024 (p95: 221 vs 210). Only the handful of batches
+  # containing a genuine outlier get bigger. Still well clear of the OOM at
+  # max_length=2048, where a 1357-token sample padded its whole batch to ~1400.
+  prm_max_length: 1024
+
+  # ── train/val/test split ──
+  # Left at null so this file reproduces the checkpoints already trained with it.
+  # Set to "train" for the next run: that holds val/test back and makes a
+  # same-distribution held-out number possible. Until then the only
+  # generalisation evidence is the rejected-trajectory proxy in
+  # scripts/_phase2_prm_holdout.py, which is distribution-shifted, not held-out.
+  #
+  # 10% each rather than 5%: NEG is ~3.4% of held-out accepted steps, so a 5%
+  # fold holds ~57 NEG steps and a NEG-recall 95% CI of +/-0.12. At 10% it is
+  # ~114 steps and +/-0.086, while train still keeps ~20,078 trajectories.
+  # Use the SAME values in phase 3, or a later phase trains on what phase 2
+  # held out.
+  split: null
+  val_ratio: 0.10
+  test_ratio: 0.10
+  # Separate from `seed` on purpose: a seed sweep over training randomness must
+  # not also redraw the held-out set.
+  split_seed: 42

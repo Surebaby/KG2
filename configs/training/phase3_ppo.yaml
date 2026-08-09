@@ -16,33 +16,185 @@ training:
   lora_alpha: 64
   lora_dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj]
+  # ---------------------------------------------------------------------
+  # Silver train/val/test fold
+  # ---------------------------------------------------------------------
+  # MUST match phase2_prm.yaml and phase3_sft.yaml. PPO rolls out over these
+  # questions and the SFT anchor computes a cross-entropy loss on them, so both
+  # are training on whatever fold is set here. A fold that differs from Phase
+  # 2's means the PRM is scored on questions the policy trained on, and nothing
+  # raises — the number just looks held-out.
+  # Left null to reproduce the pre-split runs; set to `train` for the split runs.
+  split: null
+  val_ratio: 0.10
+  test_ratio: 0.10
+  # Separate from `seed`: a seed sweep over RL randomness must not redraw the
+  # held-out set.
+  split_seed: 42
   ppo:
     learning_rate: 1.0e-6
-    batch_size: 8
+    # R10 OOM FIX (2026-08-06): 8 -> 4. The 3000-trajectory run died at update
+    # ~110/375 with OutOfMemoryError in TRL's batched_forward_pass at
+    # ppo_trainer.py:1061, `torch.cat(all_logits)`: it asked for 2.59 GiB with
+    # 2.53 GiB free.
+    #
+    # That 2.59 GiB is ONE sequence's logits, not a batch's:
+    #   2.59 GiB / (128256 vocab x 4 B) = 5421 tokens.
+    # TRL keeps full logits in the TRAINING forward (:830 passes
+    # return_logits=True; train_minibatch needs them for entropy/approxkl), so
+    # the tensor scales with sequence length alone. At max_input_length 6144 +
+    # max_new_tokens 256 the worst case is 6400 tok = 3.06 GiB in one alloc.
+    # (The two rollout-side forward passes at :754/:762 pass
+    # return_logits=full_kl_penalty, and kl_penalty="kl" here, so they do NOT
+    # retain logits. Only the training pass does.)
+    #
+    # So this is a LENGTH LOTTERY, not a leak and not a too-large batch:
+    # mini_batch_size is already 1. Prompt length varies with the sampled
+    # passages + KG triples, and update ~110 drew a long one. Peak VRAM was
+    # 95681 MiB (500-traj run) and 95683 MiB (this run) out of 97887 -- ~2.2 GB
+    # spare, which cannot hold a 3.06 GiB allocation. The 500-trajectory trial
+    # was never safe; it just drew 6x fewer times and got lucky.
+    #
+    # batch_size 4 does not shrink the failing tensor. It halves everything else
+    # resident during the training stage (queries/responses/logprobs/values/
+    # advantages for the batch), freeing the several GB that the worst-case
+    # single-sequence alloc needs. Cost: 3000 traj = 750 updates instead of 375,
+    # and the ppo stage carries ~6.5s of fixed cost per update, so ~+40 min
+    # (~4.7 h total, still inside the 5 h budget).
+    #
+    # Rejected alternatives: ppo_max_kg_triples 30->20 lowers the probability of
+    # a long draw but sets no hard bound and weakens the KG context this paper
+    # measures; max_input_length 6144->5120 would bound it at 2.45 GiB but must
+    # equal phase3_sft.yaml's sft_max_length, so it would require re-running
+    # Phase 3a.
+    batch_size: 4
     # R4: increased from 1 to 2 for more stable gradient estimates.
+    # (The comment describes an intent that was never applied -- the value below
+    # is 1. Left as-is rather than "corrected" to 2, because 2 would change the
+    # gradient-accumulation shape and is not what any measured run used.)
     mini_batch_size: 1
-    ppo_epochs: 2
+    # R10 speed (2026-08-06): 2 -> 1. MEASURED split per optimiser update after
+    # batched rollout landed: rollout ~19s, reward ~6s, ppo ~23s of ~49s total.
+    # The ppo stage is the largest single cost, and it is
+    # batch_size/mini_batch_size * ppo_epochs = 16 sequential fwd+bwd passes at
+    # ppo_epochs=2.
+    #
+    # It does NOT halve. Two measured runs (23.5s at 2 epochs, 14.6s at 1)
+    # decompose to ~6.5s fixed + ~8.5s per epoch: TRL's batched_forward_pass
+    # recomputes logprobs and values once per update regardless of epoch count.
+    # So dropping an epoch is worth ~8.5s, not ~11.75s, and the same fixed cost
+    # caps what mini_batch_size can buy. Total went 49.4s -> 39.8s/update
+    # (20-update mean), i.e. 1.98x against the 80.8s serial-rollout baseline.
+    #
+    # Why this is defensible beyond speed: reusing a rollout batch twice buys
+    # little when target_kl=40 already bounds how far the policy may move within
+    # an update, and the smoke run measured clip=0.001 -- essentially no ratio
+    # clipping, i.e. the second epoch was not correcting much. Reversible: set
+    # back to 2 if the reward curve degrades.
+    ppo_epochs: 1
+    # R10 speed (2026-08-06): how many prompts to decode per generate() call.
+    # The smoke run measured 80.8 s/optimiser-update, i.e. 44.9 h for the full
+    # 16000-trajectory schedule. Rollout previously decoded ONE prompt per
+    # generate() call -- ~8x256 = 2048 single-sample decode steps per update,
+    # against only 16 fwd+bwd passes in the PPO stage. Batching the rollout is
+    # therefore the dominant lever, and unlike raising mini_batch_size it costs
+    # no VRAM headroom in the training stage (the card sat at 92.4/97.9 GB).
+    #
+    # Set to batch_size so the whole batch decodes in one call. Lower it if the
+    # per-token score tensor gets tight: chunk x 128256 vocab x 4 B per generated
+    # token, ~1 GB for chunk=8 over 256 tokens.
+    #
+    # NOTE: phase3_ppo.py logs a "TIMING upd=N rollout=..s reward=..s ppo=..s"
+    # line every update. Read it before tuning any of this -- the pre-R10 split
+    # across the three stages was never measured, only inferred.
+    # Tracks batch_size (8 -> 4 with the OOM fix above). A chunk larger than
+    # batch_size is harmless -- _generate slices [lo:lo+chunk] and just gets one
+    # short group -- but it would misdescribe what runs.
+    rollout_chunk_size: 4
     cliprange: 0.2
     cliprange_value: 0.2
     # R9: kl_coef 0.1→0.15 for tighter KL control. Combined with lr 1e-6
     # to reduce per-step policy drift and prevent 400-step collapse.
     kl_coef: 0.15
     # Adaptive KL controller target + horizon.
-    target_kl: 8.0
+    #
+    # R10 (2026-08-06): target 8.0 → 40.0. TRL's `objective/kl` is a
+    # PER-SEQUENCE SUM over response tokens, not a per-token mean:
+    #   ppo_trainer.py:1301  kl_list = ((kls) * mask).sum(axis=-1)
+    #   ppo_trainer.py:1302  mean_kl = kl_list.mean()
+    # At max_new_tokens=256 the measured range across r9_v4/v5 was 28–69, i.e.
+    # per-token 0.11–0.27 — ordinary drift. Against target=8.0 the controller
+    # therefore saw current/target ≈ 4–9× on every single update and sat
+    # permanently saturated. 40.0 puts the target in the same units as the
+    # quantity being measured, so the controller can actually push both ways.
+    #
+    # Note this was NOT the cause of any past collapse: AdaptiveKLController
+    # (trainer/utils.py:65-68) clips proportional_error to ±0.2 and scales by
+    # n_steps/horizon = 8/2000 = 0.004, so a saturated controller moves kl_coef
+    # by at most +0.08% per update — 1.0008^250 ≈ 1.22 over a whole run. The
+    # fix restores a working feedback loop; it does not change the KL penalty
+    # much either way.
+    target_kl: 40.0
     kl_horizon: 2000.0
     gamma: 0.95
     lam: 0.95
     max_grad_norm: 1.0
-    total_ppo_steps: 2000
+    # Restored 2026-08-06: this line was dropped from the file during an earlier
+    # R10 edit. No behaviour changed while it was missing -- phase3_ppo.py:91 and
+    # schemas.py:135 both default to 0.5 -- but the config should state what runs
+    # rather than rely on a default matching.
     vf_coef: 0.5
-    # R8: save every 500 steps — gives checkpoints at 500/1000/1500/2000 for
-    # periodic sampling and resumability. Each save includes adapter + history.
+    # R10 (2026-08-06): 2000 → 16000. This counts TRAJECTORIES SEEN, not
+    # optimiser steps — phase3_ppo.py:914 does `n_seen += cfg.batch_size` and
+    # :821 loops `while n_seen < cfg.total_steps`. At batch_size=8 the old 2000
+    # bought only 250 gradient updates, and the "all three runs peak near step
+    # 500 then collapse" folklore is really "peaks after 63 updates", which at
+    # lr=1e-6 with clipfrac≈0.001 is sampling noise in an 8-trajectory batch,
+    # not policy degradation. 16000 = 2000 real updates and ~80% of one pass
+    # over the 20,078-trajectory train fold (full pass = 20080).
+    #
+    # R10 (2026-08-06): 16000 -> 3000, chosen by WALL CLOCK, not by learning
+    # theory. At the measured 39.8s/update: 3000 traj = 375 updates = 4.1 h,
+    # 4000 = 5.5 h, 16000 = 22.1 h. 3000 is the largest schedule that fits a 5 h
+    # budget with margin. 375 updates is still 6x the ~63 updates at which the
+    # r9 runs were reported to "peak", so this is not a return to the old
+    # too-short regime. Raise it if the val curve is still climbing at the end.
+    total_ppo_steps: 3000
+    # Save every 500 trajectories seen = every 62 optimiser steps, giving 6
+    # checkpoints across the 3000-trajectory run. Named by n_seen (step_500,
+    # step_1000, ...), so divide by batch_size to recover the update count.
+    #
+    # Was 2000, written for the 16000 schedule; at 3000 that would have written
+    # exactly ONE checkpoint and left nothing to select over. Checkpoint
+    # selection happens on the VAL fold — see launch_split_ppo.sh's header.
     save_every_steps: 500
     # R7: outcome reward is CONDITIONAL on ValidTrajectory (parseable steps,
     # >=min_valid_steps, sequential indices, has Final Answer). The model can
-    # only earn the +10 EM bonus when it emits a well-structured reasoning
-    # trace. Plain "Final Answer: X" with correct EM gets ZERO outcome bonus.
-    outcome_weight: 10.0
+    # only earn the EM bonus when it emits a well-structured reasoning trace.
+    # Plain "Final Answer: X" with correct EM gets ZERO outcome bonus.
+    #
+    # R10 (2026-08-06): 10.0 → 4.0, paired with step_reward_scale 0.3 → 1.5.
+    # Substituting the MEASURED components from r9_v4/v5 (alpha≈0.75,
+    # r_kg≈0.15, r_text≈0.50, ~2.75 steps/trajectory) into the reward assembly
+    # in reward/composite_reward.py:100 gives, at the old weights:
+    #     per-step KG   = 0.75 × 0.15 × 0.3   = 0.034
+    #     per-trajectory step sum              = 0.124
+    #     outcome / invalid penalty            = ±10.0
+    #     => KG channel is 0.9% of total reward magnitude
+    # phase3_ppo.py:902 estimates this at "near 3%"; with the real alpha and
+    # r_kg it is three times worse. PPO was optimising format-validity and EM
+    # essentially alone, so "trained with a KG process reward" was not a claim
+    # the numbers supported. At 4.0/1.5 the KG share is ~10%: still
+    # outcome-dominated (correct — EM is the task) but no longer noise.
+    #
+    # Two reasons the outcome weight can afford to come down: the SFT anchor
+    # already passes PPO's own _is_valid_trajectory at 0.980, so a ±10 club to
+    # teach formatting is spending the reward budget on a solved problem; and
+    # the invalid penalty is hardwired to -outcome_weight
+    # (reward/composite_reward.py:194), so 10.0 made a single invalid
+    # trajectory in a batch of 8 swamp every process signal in the batch.
+    # Watch custom/kg_reward_share in tensorboard to confirm the ~10%.
+    outcome_weight: 4.0
     # R5: scale R_text from (-1,1) down to (-0.3,0.3). ReaRAG's text coherence
     # score is the dominant noise source — scaling it down lets EM and R_KG
     # dominate while keeping the alpha-gate structure intact.
@@ -66,6 +218,11 @@ training:
     #     writing just 1 step — then gradually raise the bar
     #   sft_anchor_interval=10: 5x denser anchors (every 80 trajectories)
     #   sft_anchor_weight=0.05: 2.5x stronger pullback force
+    #
+    # NOTE: the two values below have since moved past what R7-B described --
+    # min_valid_steps is 2 (not 1) and sft_anchor_weight is 0.10 (not 0.05, so 5x
+    # the R7-A weight of 0.02, not 2.5x). The R7-B notes above are kept as the
+    # historical rationale; read the values, not the prose, for what runs.
     min_valid_steps: 2
     sft_anchor_weight: 0.10
     sft_anchor_interval: 10
@@ -81,7 +238,19 @@ training:
     min_reasoning_chars: 20
     # R9: precision PRM already breaks the zero-signal deadlock.
     # Lower scale lets KL penalty do its job of preventing SFT forgetting.
-    step_reward_scale: 0.3
-  # 6144 fits 15 passages (~3.7k tok) + KG block (30 triples) + generation so the
-  # KG context is never truncated. Consistent with SFT/eval top_k=15.
+    #
+    # R10 (2026-08-06): 0.3 → 1.5, paired with outcome_weight 10.0 → 4.0. See
+    # the arithmetic in the outcome_weight comment above: at 0.3 against a ±10
+    # outcome the KG process channel carried 0.9% of reward magnitude. The R9
+    # rationale ("let the KL penalty prevent forgetting") is better served by
+    # kl_coef, which is an explicit knob, than by shrinking the one reward
+    # channel the method is named after.
+    step_reward_scale: 1.5
+  # 6144 fits 15 passages (~3.7k tok) + KG block + generation so the KG context
+  # is never truncated. Consistent with SFT/eval top_k=15.
+  #
+  # NOTE: ppo_max_kg_triples is NOT settable from this file — scripts/train/
+  # phase3_ppo.py never forwards it to Phase3PPOConfig, and schemas.py sets
+  # extra="allow", so a key added here would be silently accepted and ignored.
+  # It is fixed at the dataclass default in phase3_ppo.py (R10: 50 → 30).
   max_input_length: 6144

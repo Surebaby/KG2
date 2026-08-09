@@ -96,3 +96,85 @@ Accept rate	56%	48%	略降(正常)
 
 
 已知但暂缓：SFT replay 随机配对（复杂重构）、实体缓存跨问题污染（需上下文感知缓存）、Alpha Gate 训推偏移（推理缺 logprob）。这些不影响 P0 训练链路。
+
+V6 全量银标质量报告
+数据集	总数	Accepted	KG 引用率	KG 噪音	有效引用
+HotpotQA	7,405	1,878 (25%)	97%	11%	86%
+2Wiki	1,586	142 (9%)	100%	6%	92%
+Musique	1,586	206 (13%)	89%	13%	82%
+总计	10,577	2,226 (21%)	95%	10%	87%
+对比旧银标：
+
+指标	旧	新
+KG 噪音	46%	10% (-78%)
+KG 引用率	79%	95% (+16pp)
+有效引用	~54%	87% (+33pp)
+文件大小	1.4 GB	142 MB
+Accept rate 从 39%→21%——全量 hotpotqa 难题更多，质量门槛一致。核心指标全部大幅提升 ✅
+
+
+
+
+
+
+
+V1 银标可用性评估
+结论：能用，且比 V6 更适合训练。但有两个必须处理的问题。
+一、核心指标对比
+指标	V1 (train, wiki18)	V6 dev (989篇)	判定
+Answer Recall	73.6%	16.4%	✅ V1 压倒性优势
+Accepted 数量	9,839	3,549	✅ V1 是 2.8 倍
+可用步骤(去NEG)	32,272	12,702	✅ V1 是 2.5 倍
+avg answer_score	0.945	0.890	✅ V1 更高
+Split 来源	纯 train	dev(泄漏)	✅ V1 合规
+avg passages	50	20	✅ V1 更多
+Triple 幻觉率	14.15%	0.54%	❌ V1 差
+KG 引用率	75.0%	94.4%	❌ V1 低
+步骤 POS 率	54.6%	76.0%	⚠️ 见下
+二、关键洞察：V6 的"高指标"是假的
+V6 的 POS 76% 和 KG 引用率 94% 不是质量提升。Answer Recall 只有 16.4% 意味着 passage 里没答案，Teacher 被迫死抓 KG triple 硬凑引用 —— PRM 把这些"引用了但对答案无用"的步骤判成 POSITIVE。V1 的 54.6% 反而是真实的：passage 里有答案（73.6% recall），Teacher 从 passage 推理，只在 KG 真有帮助时才引用。
+
+**对 PPO 来说，Answer Recall 是不可替代的。**PPO 用冻结的 passages 做 rollout，如果 83.6% 的问题 passage 里没答案，模型学到的是"编答案"而不是"从证据推理"——这正是论文要解决的 reasoning hallucination。
+
+三、V1 的两个必须处理的问题
+问题 1：Triple 幻觉率 14.15%（3,055/21,588）
+
+V1 的 KG 未经 3 层过滤（avg 105 triples vs V6 的 49），Teacher 引用了大量不在子图里的 triple。影响：
+
+Phase 2 PRM 会学到错误的验证信号
+PPO 的 R_KG 计算会失真
+可修复：不需要重跑 Teacher，只需重新标注。项目里已有工具：
+
+
+python scripts/utils/reannotate_silver.py \
+    --input data/silver_data/silver_trajectories.jsonl \
+    --output data/silver_data/silver_v1_reannotated.jsonl
+这会用当前版本的 PRMAnnotator（连续 label + relevance 检查）+ filter_and_rank_triples（3 层 KG 过滤）重新处理，Teacher 输出不变。
+
+问题 2：只有 HotpotQA，缺 2Wiki + Musique
+
+V1 是 24,998 条纯 HotpotQA train。论文实验设计要求三个数据集。
+
+部分可补：2Wiki/Musique 的 train split 已在本地，但当前机器无 wiki18 索引，补出来的数据 Answer Recall 也会是 16%——不能补。
+
+四、我的建议
+
+方案：V1 重标注 → Phase 2/3 训练（仅 HotpotQA）
+      + 并行解决 wiki18 索引 → 补 2Wiki/Musique
+立即可做（不需要 wiki18）：
+
+重标注 V1 → 修掉 14% 幻觉，得到连续 label + 过滤后 KG
+用重标注的 V1（~9,839 accepted）跑 Phase 2 PRM + Phase 3a SFT
+验证训练链路能跑通、指标有提升
+必须解决 wiki18 才能做：
+
+补 2Wiki/Musique 银标
+最终论文级三数据集实验
+评测（eval 也需要检索，989 篇语料评测结果无意义）
+五、需要你确认
+/home/ai/flashrag/kgpaper/indexes/ 那台机器还能访问吗？ V1 是在那上面跑的，如果能拷回三个文件（corpus_flashrag.jsonl / e5_Flat.index / bm25/），所有问题一次性解决：
+
+可以补 2Wiki/Musique 银标
+可以做真实评测
+磁盘剩 135 GB，够放
+如果访问不了，我先启动 V1 重标注，你同时想办法搞 wiki18。要开始重标注吗？

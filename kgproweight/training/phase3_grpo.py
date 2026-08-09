@@ -19,6 +19,11 @@ import torch.nn.functional as F
 
 from kgproweight.data.prompts import build_rl_messages
 from kgproweight.data.silver_dataset import SilverDatasetReader
+from kgproweight.data.silver_split import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_TEST_RATIO,
+    DEFAULT_VAL_RATIO,
+)
 from kgproweight.reward.alpha_gate import AlphaGate
 from kgproweight.reward.prm_annotator import PRMAnnotator
 from kgproweight.reward.text_reward_model import build_text_reward_model
@@ -60,7 +65,22 @@ class Phase3GRPOConfig:
     alpha_override: Optional[float] = None
     binary_labels_only: bool = False
     kl_coef: float = 0.05
+    # Fold to roll out on; see Phase3PPOConfig.split. Must match the fold the
+    # earlier phases used. ``None`` reproduces the pre-split whole-file behaviour.
+    split: Optional[str] = None
+    val_ratio: float = DEFAULT_VAL_RATIO
+    test_ratio: float = DEFAULT_TEST_RATIO
+    split_seed: Optional[int] = DEFAULT_SPLIT_SEED
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def build_split_spec(self):
+        from kgproweight.data.silver_split import SplitSpec
+
+        return SplitSpec(
+            val_ratio=self.val_ratio,
+            test_ratio=self.test_ratio,
+            seed=self.seed if self.split_seed is None else self.split_seed,
+        )
 
 
 def _build_policy(cfg: Phase3GRPOConfig):
@@ -122,7 +142,23 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
         alpha_override=cfg.alpha_override,
     )
 
-    reader = SilverDatasetReader(cfg.silver_path)
+    reader = SilverDatasetReader(
+        cfg.silver_path,
+        split=cfg.split,
+        split_spec=cfg.build_split_spec() if cfg.split else None,
+    )
+    if cfg.split is None:
+        logger.warning(
+            "Phase 3 GRPO split: NONE — rolling out over the whole file (%d "
+            "trajectories, %d accepted). Nothing is held back.",
+            len(reader.trajectories), len(reader.accepted()),
+        )
+    else:
+        logger.info(
+            "Phase 3 GRPO split: fold=%s -> %d/%d trajectories, %d accepted.",
+            cfg.split, len(reader.trajectories), reader.n_total_in_file,
+            len(reader.accepted()),
+        )
     if cfg.binary_labels_only:
         for traj in reader.trajectories:
             for step in traj.steps:

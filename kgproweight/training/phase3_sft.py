@@ -19,6 +19,11 @@ from kgproweight.data.prompts import (
     build_sft_messages,
 )
 from kgproweight.data.silver_dataset import SilverDatasetReader
+from kgproweight.data.silver_split import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_TEST_RATIO,
+    DEFAULT_VAL_RATIO,
+)
 from kgproweight.utils.logging import dump_manifest, get_logger
 from kgproweight.utils.paths import model_path
 from kgproweight.utils.seed import set_seed
@@ -44,7 +49,23 @@ class Phase3SFTConfig:
     lora_dropout: float = 0.05
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03
+    # Fold to train on. Must match the fold Phase 2 used, or the SFT model has
+    # seen the trajectories the PRM head is later evaluated against. ``None``
+    # reproduces the pre-split behaviour of training on the whole file.
+    split: Optional[str] = None
+    val_ratio: float = DEFAULT_VAL_RATIO
+    test_ratio: float = DEFAULT_TEST_RATIO
+    split_seed: Optional[int] = DEFAULT_SPLIT_SEED
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def build_split_spec(self):
+        from kgproweight.data.silver_split import SplitSpec
+
+        return SplitSpec(
+            val_ratio=self.val_ratio,
+            test_ratio=self.test_ratio,
+            seed=self.seed if self.split_seed is None else self.split_seed,
+        )
 
 
 def _render_assistant_trace(traj) -> str:
@@ -201,7 +222,28 @@ def run_phase3_sft(cfg: Phase3SFTConfig) -> Dict[str, Any]:
         except Exception as exc:
             logger.warning("PEFT unavailable (%s); full-parameter SFT.", exc)
 
-    reader = SilverDatasetReader(cfg.silver_path)
+    # Filtering at the reader is safe here: unlike Phase 2, SFT does not write
+    # anything back into the trajectories, so a narrowed reader cannot truncate a
+    # downstream artefact.
+    reader = SilverDatasetReader(
+        cfg.silver_path,
+        split=cfg.split,
+        split_spec=cfg.build_split_spec() if cfg.split else None,
+    )
+    if cfg.split is None:
+        logger.warning(
+            "Phase 3a split: NONE — SFT trains on the whole file (%d trajectories, "
+            "%d accepted). Nothing is held back.",
+            len(reader.trajectories), len(reader.accepted()),
+        )
+    else:
+        logger.info(
+            "Phase 3a split: fold=%s -> %d/%d trajectories in file, %d accepted "
+            "(val=%.3f test=%.3f split_seed=%d)",
+            cfg.split, len(reader.trajectories), reader.n_total_in_file,
+            len(reader.accepted()), cfg.val_ratio, cfg.test_ratio,
+            cfg.build_split_spec().seed,
+        )
     ds_raw = _build_dataset(reader, tokenizer, cfg.max_length)
     ds_tok = _tokenise(ds_raw, tokenizer, cfg.max_length)
 
@@ -234,7 +276,21 @@ def run_phase3_sft(cfg: Phase3SFTConfig) -> Dict[str, Any]:
         tokenizer=tokenizer, padding="longest", label_pad_token_id=-100
     )
     trainer = Trainer(model=model, args=args, train_dataset=ds_tok, data_collator=collator)
+    torch.cuda.reset_peak_memory_stats() if torch.cuda.is_available() else None
     trainer.train()
+
+    # nvidia-smi reports the caching allocator's RESERVED bytes, which it does not
+    # return to the driver once freed — so a run whose active peak is ~46 GB can
+    # still show ~96 GB and look like it is about to OOM. Logging both numbers
+    # makes the difference visible, which is what tells you whether headroom for a
+    # larger batch/seq actually exists.
+    if torch.cuda.is_available():
+        logger.info(
+            "SFT peak GPU memory: allocated %.2f GB | reserved %.2f GB "
+            "(nvidia-smi shows the reserved figure)",
+            torch.cuda.max_memory_allocated() / 1024 ** 3,
+            torch.cuda.max_memory_reserved() / 1024 ** 3,
+        )
 
     # Record the loss curve to a clean sft_loss.jsonl (one row per logged step),
     # mirroring PPO's history.jsonl. trainer_state.json also has the raw
@@ -268,6 +324,25 @@ def run_phase3_sft(cfg: Phase3SFTConfig) -> Dict[str, Any]:
             "lr": cfg.lr,
             "seed": cfg.seed,
             "base_model": base_id,
+            "max_length": cfg.max_length,
+            "batch_size": cfg.batch_size,
+            "grad_accum": cfg.grad_accum,
+            "peak_gpu_gb": (
+                {"allocated": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2),
+                 "reserved": round(torch.cuda.max_memory_reserved() / 1024 ** 3, 2)}
+                if torch.cuda.is_available() else None
+            ),
+            # Same reason as Phase 2: without this there is no way to tell later
+            # whether this checkpoint saw the held-out trajectories.
+            "split_info": {
+                "split": cfg.split,
+                "val_ratio": cfg.val_ratio,
+                "test_ratio": cfg.test_ratio,
+                "split_seed": cfg.build_split_spec().seed,
+                "n_trajectories": len(reader.trajectories),
+                "n_trajectories_in_file": reader.n_total_in_file,
+                "n_accepted": len(reader.accepted()),
+            },
         },
     )
     logger.info("Phase 3a SFT done. Checkpoint at %s", final_dir)

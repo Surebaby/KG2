@@ -376,9 +376,42 @@ class DenseRetriever(BaseTextRetriever):
     def load_index(self):
         if self.index_path is None or not os.path.exists(self.index_path):
             raise Warning(f"Index file {self.index_path} does not exist!")
+
+        # NumPy memmap path — for fp16 vectors when the faiss index is too large
+        # for available RAM. Detected by .dat extension; bypasses faiss entirely
+        # and does chunked brute-force search via MemmapSearch.
+        if self.index_path.endswith(".dat"):
+            from kgproweight.retrieval.np_search import MemmapSearch
+            log_stage("Loading NumPy memmap index from %s ...", self.index_path)
+            t0 = time.time()
+            self.index = MemmapSearch.load(self.index_path)
+            log_stage("Memmap index ready in %.1fs.", time.time() - t0)
+            ntotal = self.index.ntotal
+            dim = self.index.d
+            log_stage(
+                "Memmap ready: ntotal=%s, dim=%s (chunked brute-force, no GPU).",
+                f"{ntotal:,}", dim,
+            )
+            self._faiss_search_batch_size = int(
+                self._config["faiss_search_batch_size"]
+                if "faiss_search_batch_size" in self._config
+                else 64
+            )
+            return
+
         log_stage("Loading FAISS index from %s (may take 1-3 min for ~45GB Flat) ...", self.index_path)
         t0 = time.time()
-        self.index = faiss.read_index(self.index_path)
+        # KGPW_FAISS_MMAP=1 memory-maps the index instead of loading it eagerly.
+        # Needed for the 64.6 GB wiki18 e5 Flat index on a 62 GB box: eager
+        # read_index OOMs, mmap keeps RSS flat (verified: +0.004 GB) and leaves
+        # paging to the OS. Off by default so the small smoke index keeps its
+        # current fully-resident behaviour.
+        mmap_flag = os.environ.get("KGPW_FAISS_MMAP", "").lower() in {"1", "true", "yes"}
+        if mmap_flag:
+            log_stage("KGPW_FAISS_MMAP set — memory-mapping index (RSS stays low, pages on demand).")
+            self.index = faiss.read_index(self.index_path, faiss.IO_FLAG_MMAP)
+        else:
+            self.index = faiss.read_index(self.index_path)
         log_stage("FAISS index loaded in %.1fs.", time.time() - t0)
         ntotal = int(getattr(self.index, "ntotal", 0))
         dim = int(getattr(self.index, "d", 0))

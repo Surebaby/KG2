@@ -11,6 +11,12 @@ from kgproweight.training.phase3_sft import Phase3SFTConfig, run_phase3_sft
 from kgproweight.utils.logging import configure_logging, get_logger
 from kgproweight.utils.paths import checkpoint_dir, data_dir
 
+try:  # installed / -m invocation
+    from scripts.train._split_args import add_split_args, log_split, split_kwargs
+except ModuleNotFoundError:  # `python scripts/train/phase3_sft.py` — sys.path[0]
+    # is this file's directory, and `scripts` is not an installed package.
+    from _split_args import add_split_args, log_split, split_kwargs
+
 configure_logging("INFO")
 logger = get_logger(__name__)
 
@@ -28,6 +34,7 @@ def parse_args():
     p.add_argument("--grad_accum", type=int, default=4)
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--no_lora", action="store_true")
+    add_split_args(p)
     return p.parse_args()
 
 
@@ -55,6 +62,7 @@ def main():
             lora_r=tcfg.lora_r,
             lora_alpha=tcfg.lora_alpha,
             lora_dropout=tcfg.lora_dropout,
+            **split_kwargs(args, tcfg),
         )
     else:
         silver = args.silver_data or str(
@@ -74,8 +82,10 @@ def main():
             grad_accum=args.grad_accum,
             lr=args.lr,
             use_lora=not args.no_lora,
+            **split_kwargs(args),
         )
 
+    log_split(logger, "Phase 3a", cfg)
     result = run_phase3_sft(cfg)
     logger.info("Phase 3a result: %s", result)
 

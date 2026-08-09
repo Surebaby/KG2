@@ -52,7 +52,7 @@ class KGProWeightPipeline(BasicPipeline):
         kg_cache_dir: Optional[str] = None,
         record_alpha: bool = True,
         inject_kg: bool = True,
-        max_kg_triples: int = 50,
+        max_kg_triples: int = 12,
         max_mentions: int = 5,
         retrieval_topk: Optional[int] = None,
         rerank_topk: int = 0,  # 0 = disabled
@@ -99,6 +99,9 @@ class KGProWeightPipeline(BasicPipeline):
         # R9 v6: load pre-built question→KG index (v2 filtered cache) to align
         # inference KG quality with training. Falls back to live Wikidata on miss.
         self._q_kg_index: Dict[str, List[Tuple[str, str, str]]] = {}
+        # R9 v6: use pre-built question→KG index. v2 is the original filtered
+        # cache (30 triples/q, 3-layer filter). Runtime improvements
+        # (max_kg_triples=12, bias correction, hard-delete) are applied.
         _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index_v2.json"
         if not _q_kg_path.exists():
             _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index.json"
@@ -119,6 +122,18 @@ class KGProWeightPipeline(BasicPipeline):
         if alpha_gate_path and Path(alpha_gate_path).exists():
             self.alpha_gate.load_state_dict(torch.load(alpha_gate_path, map_location="cpu"))
             logger.info("Loaded AlphaGate from %s", alpha_gate_path)
+            # R9 v6 inference fix: during Phase 2 training, f_entropy varied with
+            # real per-step logprobs (mean≈0.3–0.5). At inference, logprobs=None
+            # forces f_entropy=1.0, shifting the input distribution right by
+            # ~0.5–0.7. The trained b≈-1.78 was calibrated for the training
+            # regime; without correction, α saturates at [0.02, 0.17] and the
+            # gate cannot express "KG is useful". We apply a one-time bias
+            # correction of +0.78 (inference override → beff=-1.0) so α operates
+            # in [0.11, 0.69] — empty KG still gets low α, good KG gets high α.
+            _b_corrected = self.alpha_gate.b.data + 0.78
+            logger.info("AlphaGate inference bias correction: %.3f → %.3f",
+                        self.alpha_gate.b.item(), _b_corrected.item())
+            self.alpha_gate.b.data = _b_corrected
         elif inject_kg:
             logger.warning("No AlphaGate checkpoint provided — using initial weights.")
         self.alpha_gate.eval()
@@ -138,7 +153,7 @@ class KGProWeightPipeline(BasicPipeline):
                     return [tuple(t) for t in mod if len(t) == 3]
         return None
 
-    def _build_kg_context(self, item) -> List[Tuple[str, str, str]]:
+    def _build_kg_context(self, item, passages=None) -> List[Tuple[str, str, str]]:
         if not self.inject_kg:
             return []
 
@@ -153,11 +168,29 @@ class KGProWeightPipeline(BasicPipeline):
             self._kg_source_counts["index"] += 1
             return list(cached[:self.max_kg_triples])
 
+        # R9 v6 fix: extract passage titles for context-aware entity linking.
+        # The linker's _score_candidates() already supports retrieved_titles for
+        # disambiguation (0.10 weight), but inference never passed them — so
+        # "Made" linked to the Dutch town instead of the song, etc.
+        _passage_titles: Optional[List[str]] = None
+        if passages:
+            _passage_titles = []
+            for p in passages:
+                if isinstance(p, dict):
+                    title = p.get("id") or p.get("title") or ""
+                elif isinstance(p, str):
+                    title = p
+                else:
+                    continue
+                if title:
+                    _passage_titles.append(str(title))
+
         mentions = extract_mentions(item.question, max_n=self.max_mentions)
         qids = []
         for m in mentions:
             result = self.entity_linker.link_single(
                 m, question=item.question,
+                retrieved_titles=_passage_titles,
             )
             if not result.abstained and result.selected_qid:
                 qids.append(result.selected_qid)
@@ -174,9 +207,16 @@ class KGProWeightPipeline(BasicPipeline):
         # path — so the measured "74.6% noise removed" never reached inference.
         # Apply the same scoring/quota policy here.
         self._kg_source_counts["fallback"] += 1
-        return filter_and_rank_triples(
-            raw, question=item.question, max_keep=self.max_kg_triples,
+        filtered = filter_and_rank_triples(
+            raw, question=item.question, max_keep=self.max_kg_triples, min_keep=5,
         )
+        # R9 v6 Phase C: passage-verified filtering. Triples whose entities
+        # never appear in any retrieved passage have no textual grounding for
+        # the model — they're floating facts that the model can't verify.
+        if passages and filtered:
+            from kgproweight.kg.kg_filter import filter_by_passage_support
+            filtered = filter_by_passage_support(filtered, passages)
+        return filtered
 
     # ------------------------------------------------------------------
     # Run
@@ -225,7 +265,7 @@ class KGProWeightPipeline(BasicPipeline):
         used_dropout: List[bool] = []
 
         for item, passages in zip(dataset, retrieval_results):
-            kg_sub = self._build_kg_context(item)
+            kg_sub = self._build_kg_context(item, passages=passages)
             kg_subgraphs.append(kg_sub)
             used_dropout.append(self._get_dropout_kg(item) is not None)
             msgs = build_inference_messages(
@@ -259,17 +299,31 @@ class KGProWeightPipeline(BasicPipeline):
         dataset.update_output("kg_subgraphs", kg_subgraphs)
         dataset.update_output("used_dropout_kg", used_dropout)
 
-        raw_outputs = self.generator.generate(prompts)
+        # D1: request per-token scores so f_entropy uses real logprobs instead
+        # of the hardcoded 1.0 default. The generator already computes these;
+        # we just need return_scores=True to get them back.
+        try:
+            raw_outputs, token_scores = self.generator.generate(prompts, return_scores=True)
+        except (TypeError, ValueError):
+            raw_outputs = self.generator.generate(prompts)
+            token_scores = None
         dataset.update_output("raw_output", raw_outputs)
 
         preds: List[str] = []
         alpha_stats: List[Dict] = []
         ihr_stats: List[Dict] = []
 
-        for item, raw_output, kg_sub in zip(dataset, raw_outputs, kg_subgraphs):
+        for i, (item, raw_output, kg_sub) in enumerate(zip(dataset, raw_outputs, kg_subgraphs)):
             pred = extract_kg_proweight_answer(raw_output)
             preds.append(pred)
-            alpha_stats.append(self._compute_alpha_stats(raw_output, kg_sub, item.question))
+            # D1: compute per-question token logprobs from real generation scores
+            _logprobs = None
+            if token_scores is not None and i < len(token_scores):
+                import math
+                _scores = [max(s, 1e-9) for s in token_scores[i]]
+                _logprobs = [math.log(s) for s in _scores]
+            alpha_stats.append(self._compute_alpha_stats(raw_output, kg_sub, item.question,
+                                                          logprobs=_logprobs))
             ihr_stats.append(self._compute_ihr(raw_output, kg_sub))
 
         dataset.update_output("pred", preds)
@@ -285,14 +339,17 @@ class KGProWeightPipeline(BasicPipeline):
     # Telemetry helpers
     # ------------------------------------------------------------------
 
-    def _compute_alpha_stats(self, generated_text: str, kg_subgraph, query: str) -> Dict:
+    def _compute_alpha_stats(self, generated_text: str, kg_subgraph, query: str,
+                              logprobs=None) -> Dict:
         steps = parse_steps(generated_text) if generated_text else []
         alphas: List[float] = []
         for step in steps:
+            # D1: use real per-token logprobs from generation when available.
+            # Falls back to None (→ f_entropy=1.0) for backward compatibility.
             f_density, f_confidence, f_entropy = compute_features(
                 step_entities=step.mentioned_entities,
                 kg_subgraph=kg_subgraph,
-                logprobs=None,
+                logprobs=logprobs,  # D1: was hardcoded None
                 entity_linker=self.entity_linker,
             )
             alphas.append(self.alpha_gate.forward_single(f_density, f_confidence, f_entropy))

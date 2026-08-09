@@ -11,14 +11,17 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+if TYPE_CHECKING:  # avoids a circular import at runtime (silver_split imports us)
+    from kgproweight.data.silver_split import SplitSpec
 
 
 @dataclass
 class SilverStepRecord:
     index: int
     text: str
-    label: int  # +1 / 0 / -1
+    label: float  # continuous R_KG = precision × relevance in [-1, 1]
     cited_triples: List[Tuple[str, str, str]] = field(default_factory=list)
     token_logprobs: Optional[List[float]] = None  # filled by Phase 2 logprob pass
 
@@ -31,7 +34,7 @@ class SilverStepRecord:
         return cls(
             index=int(d.get("index", 0)),
             text=str(d.get("text", "")),
-            label=int(d.get("label", 0)),
+            label=float(d.get("label", 0)),
             cited_triples=triples,
             token_logprobs=d.get("token_logprobs"),
         )
@@ -121,9 +124,46 @@ class SilverDatasetReader:
     loader.
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        split: Optional[str] = None,
+        split_spec: Optional["SplitSpec"] = None,
+    ) -> None:
+        """Load the file, optionally keeping only one fold.
+
+        ``split`` filters at load time so every downstream call — ``accepted()``,
+        ``subset()``, ``__iter__`` — sees only that fold. This is deliberate:
+        12+ call sites across Phase 2/3a/3b treat ``accepted()`` as "the data",
+        and threading a fold argument through each one invites the failure where
+        one site is missed and quietly trains on test. Filtering at the source
+        makes the reader itself the single point of enforcement.
+
+        ``split=None`` keeps the historical whole-file behaviour, so existing
+        callers and the rejected-trajectory G5 proxy are unaffected until they
+        opt in.
+        """
         self.path = Path(path)
-        self.trajectories: List[SilverTrajectory] = list(iter_silver_trajectories(self.path))
+        self.split = split
+        self.split_spec = split_spec
+        all_trajectories = list(iter_silver_trajectories(self.path))
+        if split is None:
+            self.trajectories: List[SilverTrajectory] = all_trajectories
+        else:
+            from kgproweight.data.silver_split import (
+                SPLIT_NAMES,
+                SplitSpec,
+                assign_split,
+            )
+
+            if split not in SPLIT_NAMES:
+                raise ValueError(f"split must be one of {SPLIT_NAMES}, got {split!r}")
+            spec = split_spec or SplitSpec()
+            self.split_spec = spec
+            self.trajectories = [t for t in all_trajectories if assign_split(t, spec) == split]
+        # Kept so callers can report what fraction of the file a fold covers
+        # without re-reading 1.28 GB.
+        self.n_total_in_file = len(all_trajectories)
 
     def __len__(self) -> int:
         return len(self.trajectories)
@@ -138,13 +178,26 @@ class SilverDatasetReader:
         return [t for t in self.trajectories if t.accepted]
 
     def subset(self, n: int, seed: int = 42) -> List[SilverTrajectory]:
-        """Reproducible random subset; used by the data-efficiency rigour scan."""
+        """Reproducible random subset; used by the data-efficiency rigour scan.
+
+        Shuffles a copy: the previous version shuffled the list returned by
+        ``accepted()`` and returned a prefix of it, which is fine, but taking a
+        copy makes it explicit that repeated calls are independent.
+        """
         import random
 
         rng = random.Random(seed)
-        accepted = self.accepted()
+        accepted = list(self.accepted())
         rng.shuffle(accepted)
         return accepted[:n]
+
+    def splits(
+        self, spec: Optional["SplitSpec"] = None
+    ) -> Dict[str, List[SilverTrajectory]]:
+        """Partition the loaded trajectories into all three folds at once."""
+        from kgproweight.data.silver_split import SplitSpec, split_trajectories
+
+        return split_trajectories(self.trajectories, spec or SplitSpec())
 
     @staticmethod
     def write_jsonl(path: str | Path, trajectories: Iterable[SilverTrajectory]) -> None:

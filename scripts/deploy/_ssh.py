@@ -3,10 +3,12 @@
 import sys
 import paramiko
 
-HOST = "connect.bjb1.seetacloud.com"
-PORT = 27924
-USER = "root"
-PASS = "F5PcLR9FufOe"
+import os
+
+HOST = os.environ.get("KGPW_SSH_HOST", "connect.bjb1.seetacloud.com")
+PORT = int(os.environ.get("KGPW_SSH_PORT", "41354"))
+USER = os.environ.get("KGPW_SSH_USER", "root")
+PASS = os.environ.get("KGPW_SSH_PASS", "")
 
 
 def run(cmd: str, timeout: int = 600) -> int:

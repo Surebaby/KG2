@@ -10,6 +10,12 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
+from kgproweight.data.silver_split import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_TEST_RATIO,
+    DEFAULT_VAL_RATIO,
+    SplitSpec,
+)
 from kgproweight.eval.data_efficiency import f1_curve_from_summary, make_subset_file
 from kgproweight.eval.stats import mean_std_ci
 from kgproweight.utils.logging import configure_logging, get_logger
@@ -29,7 +35,17 @@ def parse_args():
         help="Path to silver_with_logprobs.jsonl (defaults to checkpoint_dir/prm_alpha_gate/...).",
     )
     p.add_argument("--dataset", default="hotpotqa", help="Dataset for evaluation.")
-    p.add_argument("--split", default="dev")
+    p.add_argument("--split", default="dev",
+                   help="QA benchmark split to evaluate on (dev/test) — NOT the silver fold.")
+    # Distinct from --split above: this one selects the silver train/val/test fold
+    # the subsets are drawn from. Every subset here is TRAINING data, so drawing
+    # from the whole file would seed val/test trajectories into training at every
+    # point on the curve, and the curve's own held-out numbers would be invalid.
+    p.add_argument("--silver_split", default=None, choices=[None, "train", "val", "test"],
+                   help="Silver fold to draw subsets from. Use 'train' to match the real runs.")
+    p.add_argument("--val_ratio", type=float, default=DEFAULT_VAL_RATIO)
+    p.add_argument("--test_ratio", type=float, default=DEFAULT_TEST_RATIO)
+    p.add_argument("--split_seed", type=int, default=DEFAULT_SPLIT_SEED)
     p.add_argument("--total_steps", type=int, default=1500)
     p.add_argument("--save_root", default=None)
     p.add_argument("--python", default=sys.executable)
@@ -52,6 +68,18 @@ def main():
     save_root = Path(args.save_root) if args.save_root else Path(output_dir()) / "rigor" / "data_eff"
     save_root.mkdir(parents=True, exist_ok=True)
 
+    split_spec = SplitSpec(val_ratio=args.val_ratio, test_ratio=args.test_ratio,
+                           seed=args.split_seed)
+    if args.silver_split:
+        logger.info("Silver fold for subsets: %s (val=%.2f test=%.2f seed=%d)",
+                    args.silver_split, args.val_ratio, args.test_ratio, args.split_seed)
+    else:
+        logger.warning(
+            "--silver_split not set: subsets are drawn from the WHOLE silver file, so "
+            "each point on the curve trains on val/test trajectories too. Pass "
+            "--silver_split train to make the curve's held-out evaluation valid."
+        )
+
     summary: Dict[int, Dict[str, float]] = {}
     for n in args.sizes:
         f1_values: List[float] = []
@@ -60,7 +88,8 @@ def main():
             run_dir.mkdir(parents=True, exist_ok=True)
 
             subset_path = run_dir / "silver_subset.jsonl"
-            make_subset_file(silver, n=n, seed=seed, output_path=subset_path)
+            make_subset_file(silver, n=n, seed=seed, output_path=subset_path,
+                             split=args.silver_split, split_spec=split_spec)
 
             ppo_out = run_dir / "ppo"
             ppo_cmd = [

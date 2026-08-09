@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -32,6 +33,11 @@ import torch
 from kgproweight.data.parsers import parse_steps
 from kgproweight.data.prompts import build_rl_messages, build_sft_messages
 from kgproweight.data.silver_dataset import SilverDatasetReader
+from kgproweight.data.silver_split import (
+    DEFAULT_SPLIT_SEED,
+    DEFAULT_TEST_RATIO,
+    DEFAULT_VAL_RATIO,
+)
 from kgproweight.kg.kg_filter import filter_and_rank_triples
 from kgproweight.kg.wikidata_retriever import _QA_RELATION_FILTER, WikidataSubgraphRetriever
 from kgproweight.reward.alpha_gate import AlphaGate
@@ -132,6 +138,21 @@ class Phase3PPOConfig:
     # top_k in the generate() call so rollout == scoring distribution.
     temperature: float = 1.0
     top_p: float = 1.0
+    # R10 speed: how many prompts to decode in ONE generate() call. 1 reproduces
+    # the old prompt-at-a-time loop exactly; higher batches the decode.
+    #
+    # Why this is the main speed lever: at batch_size=8 / max_new_tokens=256 the
+    # serial loop runs ~8x256 = 2048 single-sample decode steps per optimiser
+    # update, against 16 fwd+bwd passes in the PPO stage. Batching turns those
+    # 2048 into ~256 batched steps.
+    #
+    # Memory: output_scores keeps one (chunk, vocab) fp32 logit tensor per
+    # generated token. At vocab=128256 that is chunk x 128256 x 4 B = 0.5 MB per
+    # prompt per token, so a chunk of 8 over 256 tokens is ~1 GB held until we
+    # collapse it. That fits the 5.5 GB free, but the chunk knob exists so it can
+    # be lowered without touching batch_size if a longer max_new_tokens or a
+    # bigger batch ever makes it tight.
+    rollout_chunk_size: int = 8
     max_input_length: int = 4096
     # R9 v3: cap parsed [Step N] blocks per rollout (reduced to save VRAM).
     max_steps: int = 5
@@ -146,7 +167,15 @@ class Phase3PPOConfig:
     # for activations at batch_size=8 / mini_batch_size=1 + gradient checkpointing.
     # If OOM: drop batch_size 8→4, then ppo_max_kg_triples 30→20, then passages.
     ppo_max_passages: int = 15
-    ppo_max_kg_triples: int = 50
+    # R10 (2026-08-06): 50 → 30. The 6144 budget above, the YAML comment in
+    # configs/training/phase3_ppo.yaml, and the OOM ladder in
+    # launch_split_ppo.sh were all written against 30 triples, but this default
+    # said 50 and nothing overrides it — scripts/train/phase3_ppo.py does not
+    # forward this field, so the YAML cannot set it. The extra 20 triples eat
+    # into the margin that keeps the KG block clear of the right-truncation at
+    # line 491, which would silently drop the tail of the very context the
+    # method depends on.
+    ppo_max_kg_triples: int = 12
 
     # LoRA on policy
     use_lora: bool = True
@@ -160,7 +189,25 @@ class Phase3PPOConfig:
     # P1-1: use real per-step token logprobs for the α-gate's entropy feature.
     use_real_logprobs: bool = True
 
+    # Fold to roll out on. Must match the fold Phase 2 / 3a used: PPO generates
+    # from these questions, so a question in the val or test fold here has been
+    # optimised against and is no longer held out for anything downstream.
+    # ``None`` reproduces the pre-split behaviour of using the whole file.
+    split: Optional[str] = None
+    val_ratio: float = DEFAULT_VAL_RATIO
+    test_ratio: float = DEFAULT_TEST_RATIO
+    split_seed: Optional[int] = DEFAULT_SPLIT_SEED
+
     extra: Dict[str, Any] = field(default_factory=dict)
+
+    def build_split_spec(self):
+        from kgproweight.data.silver_split import SplitSpec
+
+        return SplitSpec(
+            val_ratio=self.val_ratio,
+            test_ratio=self.test_ratio,
+            seed=self.seed if self.split_seed is None else self.split_seed,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -263,13 +310,19 @@ def _step_logprobs_from_scores(
     response_ids: torch.Tensor,
     scores: Sequence[torch.Tensor],
     spans,
+    row: int = 0,
 ) -> List[Optional[List[float]]]:
     """Slice per-step token logprobs from generation ``scores`` by token span.
 
     ``scores`` is the tuple from ``generate(output_scores=True)``: one
-    ``(1, vocab)`` logit tensor per *generated* token. We convert each to the
+    ``(batch, vocab)`` logit tensor per *generated* token. We convert each to the
     logprob of the actually-sampled token, then bucket those into the step
     spans (P1-1 feeds these to the α-gate's entropy feature).
+
+    ``row`` selects which sequence of a batched generate() call to read. It must
+    match the row ``response_ids`` came from: scores are indexed [token][row],
+    and mixing the two up silently attributes one rollout's logprobs to another
+    (the α-gate entropy feature would then be reading the wrong trajectory).
     """
     if not scores:
         return [None] * len(spans)
@@ -277,7 +330,7 @@ def _step_logprobs_from_scores(
     tok_logprobs: List[float] = []
     n_gen = min(len(scores), response_ids.size(0))
     for t in range(n_gen):
-        logits = scores[t][0]
+        logits = scores[t][row]
         lp = torch.log_softmax(logits.float(), dim=-1)
         tok_id = int(response_ids[t].item())
         tok_logprobs.append(float(lp[tok_id].item()))
@@ -353,11 +406,17 @@ def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfi
         )
     if dyn_kg_hits > 0:
         logger.info("R9 prompt KG: %d/%d samples got subgraphs from pre-built index", dyn_kg_hits, len(rows))
-        # Print one example: show KG block from the first dynamic-KG prompt
+        # Print one example: show KG block from the first dynamic-KG prompt.
+        # R10: the RL prompt is RL_USER_TEMPLATE = SFT_USER_TEMPLATE, which
+        # delimits the block with "[Knowledge Graph Context]" (prompts.py:120).
+        # The old literal "Knowledge Graph:" appears nowhere in it, so this
+        # example never printed. "Knowledge Graph (2-hop):" is the phase1
+        # distillation template, not this path -- do not use it here either.
+        KG_HDR = "[Knowledge Graph Context]"
         for row in rows:
             prompt = row["prompt"]
-            if "(empty)" not in prompt and "Knowledge Graph:" in prompt:
-                kg_start = prompt.index("Knowledge Graph:")
+            if "(empty)" not in prompt and KG_HDR in prompt:
+                kg_start = prompt.index(KG_HDR)
                 kg_end = prompt.index("\n\n", kg_start) if "\n\n" in prompt[kg_start:] else len(prompt)
                 logger.info("R9 KG example:\n%s", prompt[kg_start:kg_end])
                 break
@@ -381,8 +440,17 @@ def _prepare_sft_anchor_data(
     We create a fresh reader (the PPO reader is already consumed by
     ``_prepare_prompts``) and accept ALL trajectories, including those without
     a gold answer — the anchor only cares about the format, not correctness.
+
+    The fresh reader must honour ``cfg.split`` as well. The anchor computes a
+    cross-entropy loss on these trajectories' tokens, so it is training on them
+    every bit as much as the PPO objective is; leaving it on the whole file would
+    quietly train the policy on the held-out questions.
     """
-    reader2 = SilverDatasetReader(silver_path)
+    reader2 = SilverDatasetReader(
+        silver_path,
+        split=cfg.split,
+        split_spec=cfg.build_split_spec() if cfg.split else None,
+    )
     sft_samples: List[Dict[str, Any]] = []
     for traj in reader2.accepted():
         answer_text = (traj.answer or "").strip()
@@ -435,12 +503,20 @@ def _prepare_sft_anchor_data(
 
 
 def _generate(policy, tokenizer, prompts: Sequence[str], cfg: Phase3PPOConfig, device: str):
-    """Generate one response per prompt.
+    """Generate one response per prompt, decoding ``cfg.rollout_chunk_size`` at a time.
 
-    SCALE: when ``use_real_logprobs`` is on we convert each prompt's generation
-    ``scores`` to small per-step logprob lists *immediately* inside the loop and
-    discard the raw logit tensors, so the whole batch's logits (≈GBs at
-    batch_size=64) are never held in memory at once.
+    R10 speed: this used to decode one prompt per generate() call, which made
+    rollout ~batch_size x max_new_tokens single-sample decode steps per optimiser
+    update -- the dominant cost in the 80.8 s/update measured on 2026-08-06.
+    Batching collapses that to ~max_new_tokens batched steps per chunk.
+
+    SCALE: when ``use_real_logprobs`` is on we collapse each chunk's generation
+    ``scores`` into small per-step logprob lists and free the raw logits before
+    the next chunk, so only one chunk's logits are resident
+    (chunk x vocab x 4 B per generated token) rather than the whole batch's.
+
+    Returns UNPADDED query and response tensors: padding exists only inside the
+    generate() call, never in what TRL receives.
     """
     query_tensors, response_tensors, response_texts, logprobs_per_step_list = [], [], [], []
     # Read the device LIVE from the model: PPOTrainer/accelerate move the policy
@@ -450,28 +526,56 @@ def _generate(policy, tokenizer, prompts: Sequence[str], cfg: Phase3PPOConfig, d
         device = next(p for p in policy.parameters()).device
     except StopIteration:
         pass
-    for prompt in prompts:
+
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    chunk = max(1, int(getattr(cfg, "rollout_chunk_size", 1) or 1))
+
+    for lo in range(0, len(prompts), chunk):
+        group = list(prompts[lo:lo + chunk])
+
         # B3: check length BEFORE truncation so a prompt that would lose its KG
         # block is a loud warning, not a silent grounding failure. With passages
         # capped in _prepare_prompts this should not trigger; if it does, lower
         # cfg.ppo_max_passages / ppo_max_kg_triples.
-        full_len = len(tokenizer(prompt, truncation=False)["input_ids"])
-        if full_len > cfg.max_input_length:
-            logger.warning(
-                "PPO prompt is %d tokens > max_input_length=%d; right-truncation will drop the "
-                "trailing KG block. Lower ppo_max_passages (now %d) / ppo_max_kg_triples (now %d).",
-                full_len, cfg.max_input_length, cfg.ppo_max_passages, cfg.ppo_max_kg_triples,
+        for prompt in group:
+            full_len = len(tokenizer(prompt, truncation=False)["input_ids"])
+            if full_len > cfg.max_input_length:
+                logger.warning(
+                    "PPO prompt is %d tokens > max_input_length=%d; right-truncation will drop the "
+                    "trailing KG block. Lower ppo_max_passages (now %d) / ppo_max_kg_triples (now %d).",
+                    full_len, cfg.max_input_length, cfg.ppo_max_passages, cfg.ppo_max_kg_triples,
+                )
+
+        # LEFT padding is required for batched decoding: generate() appends new
+        # tokens at the right edge, so right-padding would put pad tokens between
+        # the prompt and the continuation and the model would attend to them as
+        # context. With left padding every row's generation starts at the same
+        # index, which is what lets `gen[:, plen:]` below be a single slice.
+        #
+        # Padding does NOT change the sampled distribution -- attention_mask
+        # zeroes the pads -- so the "rollout == TRL scoring distribution"
+        # invariant that top_k=0 protects is unaffected by batching.
+        prev_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        try:
+            enc = tokenizer(
+                group,
+                return_tensors="pt",
+                truncation=True,
+                max_length=cfg.max_input_length,
+                padding=True,
             )
-        enc = tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=cfg.max_input_length,
-        )
-        query_ids = enc["input_ids"].to(device).squeeze(0)
+        finally:
+            tokenizer.padding_side = prev_side
+
+        input_ids = enc["input_ids"].to(device)
+        attn = enc["attention_mask"].to(device)
+        plen = input_ids.size(1)
+
         with torch.no_grad():
             out = policy.generate(
-                input_ids=query_ids.unsqueeze(0),
+                input_ids=input_ids,
+                attention_mask=attn,
                 max_new_tokens=cfg.max_new_tokens,
                 do_sample=True,
                 temperature=cfg.temperature,
@@ -480,7 +584,7 @@ def _generate(policy, tokenizer, prompts: Sequence[str], cfg: Phase3PPOConfig, d
                 # (top_p<1 or top_k>0) makes the rollout distribution differ from
                 # TRL's raw-logit logp recomputation and pushes KL negative.
                 top_k=0,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                pad_token_id=pad_id,
                 # Override the config.use_cache=False set for gradient
                 # checkpointing: rollout runs under no_grad, so KV-cache is free
                 # memory-wise and ~Nx faster than recomputing every step.
@@ -488,26 +592,49 @@ def _generate(policy, tokenizer, prompts: Sequence[str], cfg: Phase3PPOConfig, d
                 return_dict_in_generate=cfg.use_real_logprobs,
                 output_scores=cfg.use_real_logprobs,
             )
-        if cfg.use_real_logprobs:
-            gen = out.sequences[0]
-            response_ids = gen[query_ids.size(0):]
-            # SCALE: collapse this prompt's raw scores into the small per-step
-            # logprob lists RIGHT HERE, then drop the logits before the next
-            # prompt — never accumulate raw scores across the batch.
+
+        seqs = out.sequences if cfg.use_real_logprobs else out
+        scores = out.scores if cfg.use_real_logprobs else None
+
+        for row in range(len(group)):
+            # Strip the LEFT pad back off the query: TRL gets the real prompt
+            # tokens only. Feeding it padded queries would make logp_old be
+            # recomputed over pad positions the rollout never conditioned on.
+            q_row = input_ids[row]
+            keep = attn[row].bool()
+            query_ids = q_row[keep]
+
+            # Every row's generation starts at `plen` thanks to left padding.
+            response_ids = seqs[row][plen:]
+            # Trim trailing pad/EOS filler emitted after this row finished, so
+            # step spans and token-reward placement are not padded out. Keep one
+            # EOS if present -- TRL expects the terminating token.
+            nz = (response_ids != pad_id).nonzero()
+            if nz.numel() > 0:
+                response_ids = response_ids[: int(nz[-1].item()) + 1]
+            else:
+                response_ids = response_ids[:1]
+
             resp_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-            n_parsed = len(parse_steps(resp_text)[: cfg.max_steps])
-            spans = step_spans_over_ids(response_ids, tokenizer, n_parsed)
-            logprobs_per_step = _step_logprobs_from_scores(response_ids, out.scores, spans)
-            del out
-        else:
-            gen = out[0]
-            response_ids = gen[query_ids.size(0):]
-            resp_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-            logprobs_per_step = None
-        query_tensors.append(query_ids)
-        response_tensors.append(response_ids)
-        response_texts.append(resp_text)
-        logprobs_per_step_list.append(logprobs_per_step)
+            if cfg.use_real_logprobs:
+                n_parsed = len(parse_steps(resp_text)[: cfg.max_steps])
+                spans = step_spans_over_ids(response_ids, tokenizer, n_parsed)
+                # row= must match the sequence: scores are [token][row].
+                logprobs_per_step = _step_logprobs_from_scores(
+                    response_ids, scores, spans, row=row
+                )
+            else:
+                logprobs_per_step = None
+
+            query_tensors.append(query_ids)
+            response_tensors.append(response_ids)
+            response_texts.append(resp_text)
+            logprobs_per_step_list.append(logprobs_per_step)
+
+        # SCALE: drop this chunk's raw logits before decoding the next one, so
+        # only one chunk's scores are ever resident (chunk x vocab x 4 B x tokens).
+        del out, seqs, scores
+
     return query_tensors, response_tensors, response_texts, logprobs_per_step_list
 
 
@@ -630,7 +757,28 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     )
 
     # ---- Data ------------------------------------------------------------
-    reader = SilverDatasetReader(cfg.silver_path)
+    # Filtering at the reader is safe here: PPO reads trajectories to build
+    # prompts and never writes them back out, so a narrowed reader cannot
+    # truncate a downstream artefact the way it would in Phase 2.
+    reader = SilverDatasetReader(
+        cfg.silver_path,
+        split=cfg.split,
+        split_spec=cfg.build_split_spec() if cfg.split else None,
+    )
+    if cfg.split is None:
+        logger.warning(
+            "Phase 3b split: NONE — PPO rolls out over the whole file (%d "
+            "trajectories, %d accepted). Nothing is held back.",
+            len(reader.trajectories), len(reader.accepted()),
+        )
+    else:
+        logger.info(
+            "Phase 3b split: fold=%s -> %d/%d trajectories, %d accepted "
+            "(val=%.3f test=%.3f split_seed=%d)",
+            cfg.split, len(reader.trajectories), reader.n_total_in_file,
+            len(reader.accepted()), cfg.val_ratio, cfg.test_ratio,
+            cfg.build_split_spec().seed,
+        )
     if cfg.binary_labels_only:
         for traj in reader.trajectories:
             for step in traj.steps:
@@ -799,10 +947,27 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 prompts.append(sft_replay_prompts[ri])
                 specs.append(samples[si]["spec"])
 
+        # R10 timing: the smoke run measured 80.8 s/update (→44.9 h for 16000
+        # trajectories) but only timestamped whole updates, so the split across
+        # the three serial stages was unknown and every speed-up argument was a
+        # guess about which one dominates. Time them separately. The stages have
+        # very different per-forward counts at batch_size=8 / max_new_tokens=256:
+        #   rollout  ~8x250 = 2000 single-sample decode steps (KV-cached, cheap
+        #            each, but batch=1 -- _generate loops one prompt at a time)
+        #   reward   ~1 ReaRAG-9B forward per parsed step (~19/batch), serial
+        #            (text_reward_model.score_steps is a Python loop)
+        #   ppo      batch_size/mini_batch_size * ppo_epochs = 16 fwd+bwd, each
+        #            recomputing activations under gradient checkpointing
+        # Counting forwards alone does not rank them -- a cached decode step and
+        # a checkpointed backward differ by orders of magnitude -- which is
+        # exactly why this is measured rather than reasoned about.
+        _t0 = time.perf_counter()
         query_tensors, response_tensors, response_texts, logprobs_per_step_list = _generate(
             policy, tokenizer, prompts, cfg, device
         )
+        _t_rollout = time.perf_counter() - _t0
 
+        _t0 = time.perf_counter()
         token_reward_list: List[torch.Tensor] = []
         traj_rewards: List[float] = []
         all_per_step_records = []  # R9: collect from all responses
@@ -845,10 +1010,38 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
             reward_rc["r_total_mean"] = float(sum(r.r_total for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["n_steps"] = len(all_per_step_records)
             # What fraction of the batch's total reward magnitude the KG channel
-            # actually contributes. With outcome_weight=10 and
-            # step_reward_scale=0.3 this lands near 3%, i.e. PPO is effectively
-            # optimising format+EM and the KG process reward is close to noise.
-            # Log it so "we trained with a KG reward" is a measured claim.
+            # actually contributes. Log it so "we trained with a KG process
+            # reward" is a measured claim rather than an architectural one.
+            #
+            # R10 (2026-08-06): under the old outcome_weight=10 /
+            # step_reward_scale=0.3 this was 0.9%, not the "near 3%" the previous
+            # comment estimated. PPO was optimising format-validity and EM
+            # essentially alone. Now 4.0/1.5, and the smoke run MEASURED a mean
+            # share of 0.118 (two batches, 0.024 and 0.213) — on target.
+            #
+            # The mechanism is not what the earlier version of this comment
+            # assumed. It reasoned from r_kg≈0.15 as if citation quality were the
+            # binding factor; the diagnostics say otherwise:
+            #   - precision of cited triples against the real subgraph: 13/13,
+            #     stable from fuzzy_threshold 0.95 down to 0.50
+            #   - relevance factor: mean 0.556
+            # so r_kg per CITING step is high. What holds r_kg_mean near 0.10 is
+            # the denominator: r_kg_mean averages over ALL step records, and
+            # roughly half of them cite nothing at all and score a NEUTRAL 0.
+            # The lever on this share is therefore citation FREQUENCY, not
+            # citation accuracy — do not "improve" it by tightening the matcher.
+            #
+            # Single-batch readings are near-useless here: at batch_size=8 the
+            # share swung 0.024 → 0.213 between consecutive logged batches. Judge
+            # it on a mean over 3+ batches (check_ppo_smoke.sh does this).
+            #
+            # `max(1, ...)` below is deliberate but easy to misread: the second
+            # argument is a bool, so the expression is 1 whenever no trajectory
+            # scored and 1 when some did — i.e. always 1. The denominator
+            # therefore always includes one outcome_weight, which is the point:
+            # it keeps the share comparable across batches instead of spiking on
+            # all-zero-reward batches. Kept as-is so R10 numbers stay comparable
+            # with the r9 history; do not "fix" it without re-baselining.
             kg_mass = sum(abs(r.alpha * r.r_kg) for r in all_per_step_records) * cfg.step_reward_scale
             total_mass = sum(abs(r.r_total) for r in all_per_step_records) + \
                 cfg.outcome_weight * max(1, sum(traj_rewards) > 0)
@@ -857,7 +1050,18 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
         # P0-1 / #6: hand the per-token step rewards to the trainer so GAE runs
         placeholder_scores = [torch.zeros((), dtype=torch.float32) for _ in token_reward_list]
         trainer.set_pending_step_rewards(token_reward_list)
+        _t_reward = time.perf_counter() - _t0
+        _t0 = time.perf_counter()
         stats = trainer.step(query_tensors, response_tensors, placeholder_scores)
+        _t_ppo = time.perf_counter() - _t0
+        # One line per update, so the split is visible in the log without a
+        # separate profiling run and can be re-checked after any config change.
+        logger.info(
+            "TIMING upd=%d rollout=%.1fs reward=%.1fs ppo=%.1fs total=%.1fs",
+            n_seen // max(1, cfg.batch_size),
+            _t_rollout, _t_reward, _t_ppo,
+            _t_rollout + _t_reward + _t_ppo,
+        )
         n_seen += cfg.batch_size
 
         # ── R7 SFT Anchor step ──
@@ -954,9 +1158,20 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
             }
         )
         if n_seen % (cfg.batch_size * 4) == 0:
+            # R10: kg_share and upd are on this line deliberately.
+            #   kg_share — the fraction of reward magnitude the KG channel
+            #     carries. It was 0.009 under outcome_weight=10 /
+            #     step_reward_scale=0.3, i.e. the process reward the method is
+            #     named after was numerically noise, and nobody noticed because
+            #     the number only existed in tensorboard and history.jsonl.
+            #   upd — n_seen counts TRAJECTORIES; every past run's "step 500"
+            #     was really 63 optimiser updates. Print both so the horizontal
+            #     axis can never be misread again.
             logger.info(
-                "step=%d reward=%.2f kl=%.1f clip=%.3f valid=%d/%d α=%.3f r_kg=%.3f r_text=%.3f n_steps=%d",
+                "step=%d (upd=%d) reward=%.2f kl=%.1f clip=%.3f valid=%d/%d "
+                "α=%.3f r_kg=%.3f r_text=%.3f kg_share=%.3f n_steps=%d",
                 n_seen,
+                n_seen // max(1, cfg.batch_size),
                 history[-1]["mean_reward"],
                 history[-1]["ppo_mean_kl"],
                 history[-1]["policy_clipfrac"] if history[-1]["policy_clipfrac"] is not None else float("nan"),
@@ -965,6 +1180,7 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 reward_rc["alpha_mean"],
                 reward_rc["r_kg_mean"],
                 reward_rc["r_text_mean"],
+                reward_rc["kg_reward_share"],
                 reward_rc["n_steps"],
             )
             # R7: dump one sample response for qualitative monitoring.

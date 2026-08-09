@@ -47,6 +47,12 @@ _HARD_DELETE_TAIL_LABELS: Set[str] = {
 
 # Relations to hard-delete by LABEL (the English display name)
 _HARD_DELETE_RELATION_LABELS: Set[str] = {
+    # R9 v6 fix: trivially-true meta-relations that survive entity_anchor scoring
+    # (entity IS in the question → ≥0.30 base score) but are never QA-relevant.
+    # Together they account for ~21% of triples in the prompt.
+    "given name",           # P735 — entity names ARE their given names, always
+    "family name",          # P734 — entity names ARE their family names, always
+    "sex or gender",        # P21  — factual but irrelevant for multi-hop QA
     "topic's main category",
     "category's main topic",
     "on focus list of Wikimedia project",
@@ -170,6 +176,11 @@ _MAX_SAME_RELATION_RATIO = 0.15  # same PID ≤ 15% of final top-K
 
 # Global taxonomic cap: instance_of + subclass_of ≤ 20% of final prompt
 _MAX_TAXONOMIC_RATIO = 0.20
+
+# Minimum score for a triple to be included in the final top-K prompt.
+# Triples scoring below this have at most entity_anchor firing weakly, with
+# zero signal on relation/question/path/evidence dimensions.
+_MIN_SCORE_THRESHOLD = 0.25
 
 # ── Layer 3: Question-aware scoring ──
 
@@ -750,11 +761,15 @@ def filter_and_rank_triples(
     question: str,
     pid_map: Optional[Dict[Tuple[str, str, str], str]] = None,
     max_keep: int = 30,
+    min_keep: int = 0,
     rich: bool = False,
     question_entities: Optional[List[str]] = None,
 ) -> List:
     """Full pipeline: hard delete → quota → score → rank → top-K.
 
+    When ``min_keep > 0``, the score threshold is relaxed if fewer than
+    ``min_keep`` triples survive, ensuring every question has at least
+    ``min_keep`` triples (hard-delete + quota are never relaxed).
     When ``rich=True``, returns list of dicts with pid, score, hop metadata.
     Otherwise returns plain (h, r, t) tuples.
     """
@@ -782,6 +797,20 @@ def filter_and_rank_triples(
         for t in after_quota
     ]
     scored.sort(key=lambda x: x[0], reverse=True)
+
+    # R9 v6 fix: minimum relevance threshold. Triples scoring below this have
+    # negligible question relevance — typically only entity_anchor fires (0.30
+    # × 1.0 = 0.30) with zero on every other dimension. Removing them cuts
+    # ~20% of low-signal triples before they reach the prompt.
+    if min_keep <= 0:
+        scored = [(s, t) for s, t in scored if s >= _MIN_SCORE_THRESHOLD]
+    else:
+        above_threshold = [(s, t) for s, t in scored if s >= _MIN_SCORE_THRESHOLD]
+        if len(above_threshold) >= min_keep:
+            scored = above_threshold
+        else:
+            # Relax threshold: keep top-scoring triples up to max_keep
+            scored = scored[:max_keep]
 
     # Post-process: enforce global taxonomic cap
     selected = scored[:max_keep * 2]
@@ -815,3 +844,72 @@ def filter_and_rank_triples(
             for s, t in result_scores
         ]
     return [t for _, t in result_scores]
+
+
+# ---------------------------------------------------------------------------
+# R9 v6 Phase C: passage-verified KG filtering
+# ---------------------------------------------------------------------------
+
+def _entity_in_text(entity_label: str, text_lower: str) -> bool:
+    """Check whether an entity label appears in the passage text.
+
+    Uses substring-overlap with a minimum token-length guard: single-word
+    labels must be >= 4 chars and appear as whole-word matches; multi-word
+    labels need at least one word >= 3 chars present.
+    """
+    label_lower = entity_label.strip().lower()
+    if not label_lower:
+        return False
+    parts = label_lower.split()
+    if len(parts) == 1:
+        # Single word: require whole-word match and >= 4 chars
+        if len(label_lower) < 4:
+            return False
+        return label_lower in text_lower.split()
+    else:
+        # Multi-word: require at least one content word present
+        for p in parts:
+            if len(p) >= 3 and p in text_lower:
+                return True
+        # Or the full label as substring
+        return label_lower in text_lower
+
+
+def filter_by_passage_support(
+    triples: List[Tuple[str, str, str]],
+    passages: List,
+    min_entities: int = 1,
+) -> List[Tuple[str, str, str]]:
+    """Keep only triples where at least ``min_entities`` entities appear in
+    the retrieved passages.
+
+    A KG fact whose entities never appear in any retrieved passage is
+    floating without textual grounding — the model has no context to
+    interpret it. This filter is the inference-time complement to the
+    scoring-based filter: scoring tries to predict relevance from the
+    question alone; passage support verifies it from the actual evidence.
+    """
+    if not triples or not passages:
+        return list(triples)
+
+    # Build a single searchable text block from passages
+    text_blocks: List[str] = []
+    for p in passages[:10]:  # top-10 passages (same as prompt)
+        if isinstance(p, dict):
+            content = p.get("contents") or p.get("text") or ""
+            title = p.get("id") or p.get("title") or ""
+            text_blocks.append(f"{title} {content}")
+        elif isinstance(p, str):
+            text_blocks.append(p)
+    passage_text = " ".join(text_blocks).lower()
+
+    kept: List[Tuple[str, str, str]] = []
+    for triple in triples:
+        if len(triple) != 3:
+            continue
+        h, _, t = triple
+        h_match = _entity_in_text(str(h), passage_text)
+        t_match = _entity_in_text(str(t), passage_text)
+        if int(h_match) + int(t_match) >= min_entities:
+            kept.append(triple)
+    return kept

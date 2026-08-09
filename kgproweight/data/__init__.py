@@ -31,6 +31,15 @@ from kgproweight.data.silver_dataset import (
     SilverTrajectory,
     iter_silver_trajectories,
 )
+from kgproweight.data.silver_split import (
+    SPLIT_NAMES,
+    SplitCounts,
+    SplitSpec,
+    assign_split,
+    group_key,
+    split_trajectories,
+    summarize_split,
+)
 from kgproweight.data.d_dropout_loader import (
     DropoutItem,
     DropoutDataset,
@@ -64,6 +73,13 @@ __all__ = [
     "SilverStepRecord",
     "SilverTrajectory",
     "iter_silver_trajectories",
+    "SPLIT_NAMES",
+    "SplitCounts",
+    "SplitSpec",
+    "assign_split",
+    "group_key",
+    "split_trajectories",
+    "summarize_split",
     "DropoutItem",
     "DropoutDataset",
     "load_dropout_dataset",

@@ -10,8 +10,27 @@ training:
   sft_lr: 2.0e-5
   sft_batch_size: 4
   sft_grad_accum: 8
-  sft_max_length: 4096
+  # 6144, NOT 4096, and it must equal phase3_ppo.yaml's max_input_length.
+  # Measured on the train fold (llama3-8b tokenizer, topk=15): median 4072,
+  # p90 4594, max 5901 tokens. At 4096 that put 48% of rows over the cap, and
+  # _build_dataset responds by DROPPING the lowest-ranked passages until the row
+  # fits — so SFT would learn to reason from ~10-14 passages while PPO rolls out
+  # with 15. Nothing errors; the two phases just see different input
+  # distributions. At 6144 nothing overflows (0% over cap).
+  sft_max_length: 6144
   lora_r: 32
   lora_alpha: 64
   lora_dropout: 0.05
   target_modules: [q_proj, k_proj, v_proj, o_proj]
+  # ---------------------------------------------------------------------
+  # Silver train/val/test fold
+  # ---------------------------------------------------------------------
+  # MUST match phase2_prm.yaml and phase3_ppo.yaml. SFT fits directly on these
+  # trajectories, so any fold set here is trained on. If SFT uses the whole file
+  # while Phase 2 holds back a test fold, the PRM's held-out fold has already
+  # been memorised by the policy it is meant to score.
+  # Left null to reproduce the pre-split runs; set to `train` for the split runs.
+  split: null
+  val_ratio: 0.10
+  test_ratio: 0.10
+  split_seed: 42
