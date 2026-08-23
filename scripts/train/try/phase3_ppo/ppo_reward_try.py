@@ -232,7 +232,17 @@ class ImprovedRewardFunction:
         )
 
         per_step_rewards = [r.r_total for r in records]
-        returns = self.composite.discounted_returns(per_step_rewards)
+        # 2026-08-22 (retraining_plan §13-3): CompositeRewardModel.discounted_returns
+        # was removed as dead code -- nothing consumed its output; the real
+        # discounting is TRL's GAE (PPOConfig gamma/lam). This frozen try/ script
+        # is kept for provenance and is NO LONGER RUNNABLE against current
+        # kgproweight. Inlined so the file at least still parses/reads correctly.
+        returns = []
+        _cum = 0.0
+        for _r in reversed(per_step_rewards):
+            _cum = _r + self.composite.discount * _cum
+            returns.append(_cum)
+        returns.reverse()
 
         # Map each step's reward to the last token of its [Step N] span.
         # #6: prefer response_ids coordinates so placement aligns with the

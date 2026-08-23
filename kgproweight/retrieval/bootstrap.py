@@ -55,6 +55,18 @@ def resolve_entity_cache_path(explicit: Optional[str] = None) -> str:
     return str(index_dir() / "entity_cache.jsonl")
 
 
+def resolve_entity_desc_index_path(explicit: Optional[str] = None) -> str:
+    """Offline label→candidate descriptions index (see
+    ``scripts/prepare/build_entity_desc_index.py``). Enables context scoring of
+    candidates without hitting the Wikidata Search API."""
+    if explicit:
+        return str(Path(explicit).expanduser())
+    env = os.environ.get("KGPW_ENTITY_DESC_INDEX_PATH")
+    if env:
+        return str(Path(env).expanduser())
+    return str(index_dir() / "entity_desc_index.json")
+
+
 def project_relative(path: str) -> str:
     """Make ``path`` relative to the project root if possible."""
     p = Path(path).resolve()

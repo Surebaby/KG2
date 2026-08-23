@@ -23,11 +23,17 @@ import torch
 from kgproweight.data.parsers import parse_steps
 from kgproweight.data.prompts import build_inference_messages
 from kgproweight.eval.pred_processing import extract_kg_proweight_answer
-from kgproweight.kg.entity_linker import EntityLinker, extract_mentions
+from kgproweight.kg.entity_linker import (
+    EntityLinker,
+    build_passage_text,
+    build_passage_titles,
+    extract_mentions,
+)
 from kgproweight.kg.kg_filter import filter_and_rank_triples
 from kgproweight.kg.wikidata_retriever import _QA_RELATION_FILTER, WikidataSubgraphRetriever
 from kgproweight.retrieval.hybrid import DEFAULT_TOPK
 from kgproweight.reward.alpha_gate import AlphaGate, compute_features
+from kgproweight.reward.citation_features import citation_features
 from kgproweight.utils.paths import index_dir
 from kgproweight.reward.prm_annotator import PRMAnnotator
 from kgproweight.utils.flashrag_bootstrap import setup_flashrag
@@ -58,6 +64,7 @@ class KGProWeightPipeline(BasicPipeline):
         rerank_topk: int = 0,  # 0 = disabled
         rerank_method: str = "cross-encoder",
         cross_encoder_model: str = "models/bge-reranker-v2-m3",
+        alpha_bias_correction: Optional[float] = None,
         generator=None,
         retriever=None,
         **kwargs,
@@ -65,6 +72,19 @@ class KGProWeightPipeline(BasicPipeline):
         super().__init__(config, prompt_template=kwargs.pop("prompt_template", None))
         self.record_alpha = record_alpha
         self.inject_kg = inject_kg
+        # 2026-08-23: the default is now 0.0 (NO correction). None → 0.0; a float
+        # → that exact additive bias. Pass 0.78 explicitly to reproduce any run
+        # from before this date.
+        #
+        # +0.78 was never a derived quantity: b_trained = -1.7818 and
+        # -1.7818 + 0.78 = -1.0018, i.e. it was reverse-engineered to land
+        # b_effective on a round -1.0 (the comment below said so outright). Sized
+        # against the mechanism it claims -- compensating a f_entropy regime shift
+        # Δe through W2 = -0.5833, so needed bias = 0.5833·Δe -- +0.78 requires
+        # Δe = 1.337, which is impossible: f_entropy's own ceiling here is ~0.62.
+        # The defensible ceiling is +0.363 (taking e_tr = 0); the real post-D1
+        # need is +0.129. See retraining_plan.md "P6 后续".
+        self.alpha_bias_correction = alpha_bias_correction
         self.max_kg_triples = max_kg_triples
         self.max_mentions = max_mentions
         _cfg_topk = config["retrieval_topk"] if "retrieval_topk" in config else DEFAULT_TOPK
@@ -122,18 +142,40 @@ class KGProWeightPipeline(BasicPipeline):
         if alpha_gate_path and Path(alpha_gate_path).exists():
             self.alpha_gate.load_state_dict(torch.load(alpha_gate_path, map_location="cpu"))
             logger.info("Loaded AlphaGate from %s", alpha_gate_path)
-            # R9 v6 inference fix: during Phase 2 training, f_entropy varied with
-            # real per-step logprobs (mean≈0.3–0.5). At inference, logprobs=None
-            # forces f_entropy=1.0, shifting the input distribution right by
-            # ~0.5–0.7. The trained b≈-1.78 was calibrated for the training
-            # regime; without correction, α saturates at [0.02, 0.17] and the
-            # gate cannot express "KG is useful". We apply a one-time bias
-            # correction of +0.78 (inference override → beff=-1.0) so α operates
-            # in [0.11, 0.69] — empty KG still gets low α, good KG gets high α.
-            _b_corrected = self.alpha_gate.b.data + 0.78
-            logger.info("AlphaGate inference bias correction: %.3f → %.3f",
-                        self.alpha_gate.b.item(), _b_corrected.item())
-            self.alpha_gate.b.data = _b_corrected
+            # HISTORY (R9 v6): a +0.78 bias correction was applied here to
+            # compensate f_entropy being hardcoded to 1.0 at inference (logprobs
+            # were unavailable), which shifted the α input distribution right of
+            # the regime the trained b≈-1.78 was calibrated for.
+            #
+            # 2026-08-23: DEFAULT CHANGED TO 0.0 (no correction). Three reasons,
+            # in decreasing order of how hard they are to argue with:
+            #
+            # 1. The premise is gone. D1 (commit e6b2198) made inference use REAL
+            #    per-token logprobs (return_scores=True below), and the measured
+            #    f_entropy is ~0.62, not 1.0. alpha_diagnose.py further shows
+            #    f_entropy=1.0 has NO solution in the feasible domain -- it would
+            #    require f_confidence = +1.135 > 1. Correcting the bias on top of
+            #    D1's feature-level fix double-counts the same shift.
+            # 2. Training never applied it. phase3_ppo.py:787-791 loads the gate
+            #    raw and calls eval(). So +0.78 made train and inference use two
+            #    DIFFERENT α functions -- a train/eval mismatch, not a fix for one.
+            # 3. Measured harm: with the correction, α's sd is 0.0217/0.0224/0.0301
+            #    (hotpotqa/2wiki/musique); without it, 0.0523/0.0529/0.0676. It
+            #    pushes α into sigmoid saturation and suppresses the gate's already
+            #    weak discriminative range -- the opposite of what it was for.
+            #
+            # This does NOT move EM/F1: α is eval-time telemetry and does not enter
+            # the answer path. It matters for PPO's r_kg weighting and for not
+            # claiming in §3.4 that +0.78 had a derivation.
+            _correction = 0.0 if self.alpha_bias_correction is None else self.alpha_bias_correction
+            if _correction:
+                _b_corrected = self.alpha_gate.b.data + _correction
+                logger.info("AlphaGate inference bias correction: %.3f → %.3f",
+                            self.alpha_gate.b.item(), _b_corrected.item())
+                self.alpha_gate.b.data = _b_corrected
+            else:
+                logger.info("AlphaGate inference bias correction disabled (b=%.3f)",
+                            self.alpha_gate.b.item())
         elif inject_kg:
             logger.warning("No AlphaGate checkpoint provided — using initial weights.")
         self.alpha_gate.eval()
@@ -163,27 +205,23 @@ class KGProWeightPipeline(BasicPipeline):
 
         # R9 v6: prefer pre-built filtered KG cache (aligned with training).
         # Falls back to live Wikidata lookup only on cache miss.
-        cached = self._q_kg_index.get(item.question)
+        # The index builder stores keys STRIPPED (q.strip()); the eval question
+        # string is raw, so ~10% of questions carry a trailing/leading space and
+        # silently miss the curated index, falling back to lower-quality (or
+        # empty) live KG. Strip here to match the builder's key normalization.
+        cached = self._q_kg_index.get(item.question) or self._q_kg_index.get(item.question.strip())
         if cached:
             self._kg_source_counts["index"] += 1
             return list(cached[:self.max_kg_triples])
 
         # R9 v6 fix: extract passage titles for context-aware entity linking.
-        # The linker's _score_candidates() already supports retrieved_titles for
-        # disambiguation (0.10 weight), but inference never passed them — so
-        # "Made" linked to the Dutch town instead of the song, etc.
-        _passage_titles: Optional[List[str]] = None
-        if passages:
-            _passage_titles = []
-            for p in passages:
-                if isinstance(p, dict):
-                    title = p.get("id") or p.get("title") or ""
-                elif isinstance(p, str):
-                    title = p
-                else:
-                    continue
-                if title:
-                    _passage_titles.append(str(title))
+        # R9 v7: also pass the passage *bodies* (build_passage_text) so the
+        # linker's passage-support term can disambiguate surface forms that
+        # share a label — "Evolution" film vs GNOME software, etc. The title
+        # alone is uninformative for such cases; the disambiguating signal
+        # ("film", "directed", "software") lives in the body.
+        _passage_titles: Optional[List[str]] = build_passage_titles(passages) if passages else None
+        _passage_text: Optional[str] = build_passage_text(passages) if passages else None
 
         mentions = extract_mentions(item.question, max_n=self.max_mentions)
         qids = []
@@ -191,6 +229,7 @@ class KGProWeightPipeline(BasicPipeline):
             result = self.entity_linker.link_single(
                 m, question=item.question,
                 retrieved_titles=_passage_titles,
+                passage_text=_passage_text,
             )
             if not result.abstained and result.selected_qid:
                 qids.append(result.selected_qid)
@@ -352,7 +391,14 @@ class KGProWeightPipeline(BasicPipeline):
                 logprobs=logprobs,  # D1: was hardcoded None
                 entity_linker=self.entity_linker,
             )
-            alphas.append(self.alpha_gate.forward_single(f_density, f_confidence, f_entropy))
+            # §14: the two per-step citation features, through the same shared
+            # helper Phase 2 and the PPO reward use. Omitting them here would make
+            # eval-time α a DIFFERENT function from training-time α -- the exact
+            # class of train/inference mismatch the +0.78 bias hack turned out to be.
+            f_cite_any, f_cite_match = citation_features(step.cited_triples, kg_subgraph)
+            alphas.append(self.alpha_gate.forward_single(
+                f_density, f_confidence, f_entropy, f_cite_any, f_cite_match
+            ))
 
         mean_alpha = sum(alphas) / len(alphas) if alphas else 0.0
         var = (sum((a - mean_alpha) ** 2 for a in alphas) / len(alphas)) if len(alphas) > 1 else 0.0

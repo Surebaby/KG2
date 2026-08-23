@@ -1,5 +1,9 @@
 # KG-ProWeight: Adaptive Process Supervision for Agentic RAG
 
+> ⚠️ **已过时 (2026-08-18)**: 本文件是 v1.0 设计稿,已被 [paper_design_new.md](paper_design_new.md) 取代。
+> 其中 Teacher 身份、PPO 超参、数据规模、α-gate 门控等口径与当前实现不符,统一见
+> [docs/paper/10_口径统一清单.md](paper/10_口径统一清单.md)。请以 `paper_design_new.md` + 当前代码为准。
+
 > 基于知识图谱约束蒸馏与动态可信度权重的 Agentic RAG 自适应过程监督方法。
 
 This document is the canonical methodology specification for KG-ProWeight. It

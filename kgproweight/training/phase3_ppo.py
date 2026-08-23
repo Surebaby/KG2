@@ -98,19 +98,41 @@ class Phase3PPOConfig:
     # trajectory is valid, the final step gets +outcome_weight.
     # R7: outcome is now CONDITIONAL on trajectory validity — no more
     # unconditional answer reward (see problem_and_solutions.md).
-    outcome_weight: float = 10.0  # R7: strong conditional EM signal
+    outcome_weight: float = 8.0  # R9 v6: EM-dominant reward (aligned with YAML)
     text_reward_scale: float = 0.3  # R6: scale down ReaRAG text reward
     pure_em_reward: bool = False
     # R7: minimum number of parsed [Step N] blocks for trajectory validity.
     # Trajectories with fewer steps cannot receive the outcome reward.
     min_valid_steps: int = 3
+    # retraining_plan §9.4-3 / R-1b: step-shortfall penalty, anchored to
+    # outcome_weight. 0.0 reproduces every pre-2026-08-22 run.
+    shortfall_coef: float = 0.0
+    # Measured against silver's min_steps (3), not min_valid_steps.
+    target_steps: int = 3
+    # ------------------------------------------------------------------
+    # retraining_plan §9.4-1 (量纲/D2): R_Text DC removal.
+    # ------------------------------------------------------------------
+    # MEASURED r_text mean 0.6284 sd 0.1353 against r_kg mean 0.0896 sd 0.1166 --
+    # a 7x gap in means on a nominally shared [-1,1] scale. The offset is
+    # invisible to the policy gradient (advantage whitening removes it) but NOT
+    # to the alpha channel, where it makes d r_total / d alpha = -0.148, i.e. the
+    # reward pays the policy to LOWER alpha, hence to make the KG subgraph look
+    # sparser. Centering removes the offset and neutralises that gradient.
+    # False = every pre-2026-08-23 run, bit-for-bit. See CompositeRewardModel.
+    center_text_reward: bool = False
+    # EMA momentum for the baseline. 0.99 => effective window ~100 step
+    # observations, se ~0.014 against the signal's own sd 0.135 (10%). A literal
+    # within-batch mean (~12 samples at batch_size=4) would inject se 0.039, i.e.
+    # 29% of the signal, and would make the reward batch-dependent in a way the
+    # critic cannot represent.
+    text_baseline_momentum: float = 0.99
     # R8: minimum characters of actual reasoning content per step. Empty
     # "Reasoning:\n" blocks are treated as invalid (content-aware gate).
     min_reasoning_chars: int = 20
     # R9: scale up per-step composite reward to cover KL token cost.
     # With KG online, max R_step ≈ 0.8; KL cost ≈ 5 per 100 tokens.
     # Scale ×5 brings max R_step to ~4.0 so multi-step reasoning is net positive.
-    step_reward_scale: float = 5.0
+    step_reward_scale: float = 0.5  # R9 v6: down-weighted (aligned with YAML)
     # R8: SFT Replay ratio — fraction of PPO prompts (0.0–1.0) sourced from
     # the SFT anchor data instead of the silver retrieval pool. Each SFT-replay
     # prompt includes the gold trajectory as the assistant response, so the
@@ -192,8 +214,26 @@ class Phase3PPOConfig:
     # Fold to roll out on. Must match the fold Phase 2 / 3a used: PPO generates
     # from these questions, so a question in the val or test fold here has been
     # optimised against and is no longer held out for anything downstream.
-    # ``None`` reproduces the pre-split behaviour of using the whole file.
+    # ``None`` reproduces the pre-split behaviour of using the whole file, which
+    # trains on the val/test folds. Since 2026-08-22 (retraining_plan §13-1) that
+    # is a hard error unless ``split_allow_none`` is set explicitly -- a data leak
+    # must not be reachable by omitting a flag. See :func:`_resolve_split`.
     split: Optional[str] = None
+    # Opt-in escape hatch for deliberately reproducing a pre-split run.
+    split_allow_none: bool = False
+
+    # Pre-built question -> KG-triples index used for PROMPT-side KG injection.
+    # 2026-08-22 (retraining_plan §10.3, R-2): made configurable. It used to be
+    # hardcoded to question_kg_index_v2.json with a fallback to
+    # question_kg_index.json; both were built over the DEV split, while PPO rolls
+    # out over the silver TRAIN fold, so every question missed and all 9839
+    # prompts silently took the fallback path. The miss also degraded r_kg,
+    # because the same subgraph is the verification reference in RewardSpec.
+    # None => keep the legacy two-name probe (for reproducing old runs).
+    question_kg_index_path: Optional[str] = None
+    # Refuse to train when the index misses more than this fraction of prompts.
+    # 1.0 disables the check (legacy behaviour: warn only).
+    max_kg_index_miss_rate: float = 1.0
     val_ratio: float = DEFAULT_VAL_RATIO
     test_ratio: float = DEFAULT_TEST_RATIO
     split_seed: Optional[int] = DEFAULT_SPLIT_SEED
@@ -350,11 +390,31 @@ def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfi
     rows = []
     skipped_no_gold = 0
     dyn_kg_hits = 0
+    # 2026-08-22: counted separately from dyn_kg_hits because they mean different
+    # things and only one of them indicates a broken artefact.
+    #   COVERED-BUT-EMPTY: the question IS in the index, and its subgraph is
+    #     legitimately empty -- entity linking abstained, or the cache has no
+    #     triples for the linked QIDs. MEASURED on a full rebuild of
+    #     silver_v1_reannotated (--min_keep 5 --max_keep 12, offline, 174 s):
+    #     23.3% over all 24,997 questions, but 9.7% over the 9,839 ACCEPTED ones
+    #     PPO actually rolls out on, and 6.3% after the silver kg_subgraph
+    #     fallback rescues 333 of them. It does NOT drop by rebuilding: it is a
+    #     property of the KG and the linker, not of the index. Counting these as
+    #     misses is what made a *correctly built* index trip the 5% guard below.
+    #   ABSENT: the question is not in the index at all -- the index was built
+    #     over a different question set. This is the 100% failure that PPO(1)/(2)
+    #     ran with, and the only case the guard should fire on.
+    dyn_kg_absent = 0
+    dyn_kg_empty = 0
     for traj in reader.accepted():
         kg_triples = list(traj.kg_subgraph)
         # R9: instant Q→KG lookup from pre-built index (0.2s, 100% coverage)
         if question_kg_index is not None:
             dyn = question_kg_index.get(traj.question)
+            if traj.question not in question_kg_index:
+                dyn_kg_absent += 1
+            elif not dyn:
+                dyn_kg_empty += 1
             if dyn:
                 dyn_kg_hits += 1
                 kg_triples = list(dyn)
@@ -398,12 +458,51 @@ def _prepare_prompts(reader: SilverDatasetReader, tokenizer, cfg: Phase3PPOConfi
             skipped_no_gold,
         )
     if rows and dyn_kg_hits < len(rows):
+        _miss = len(rows) - dyn_kg_hits
+        _miss_rate = _miss / len(rows)
+        _absent_rate = dyn_kg_absent / len(rows)
         logger.warning(
-            "question_kg_index missed %d/%d PPO prompts — those fall back to the silver "
-            "kg_subgraph (now policy-filtered inline). Rebuild the index over this silver "
-            "set for full coverage.",
-            len(rows) - dyn_kg_hits, len(rows),
+            "question_kg_index gave no triples for %d/%d PPO prompts (%.1f%%): "
+            "%d ABSENT from the index (%.1f%% — wrong artefact) + %d present but "
+            "with an EMPTY subgraph (%.1f%% — the KG genuinely has nothing). Both "
+            "fall back to the silver kg_subgraph (policy-filtered inline).",
+            _miss, len(rows), 100.0 * _miss_rate,
+            dyn_kg_absent, 100.0 * _absent_rate,
+            dyn_kg_empty, 100.0 * dyn_kg_empty / len(rows),
         )
+        # 2026-08-22 (retraining_plan R-2 / §8 病灶 1): the warning above was the
+        # only signal that the dev-split index missed 100% of the train-fold
+        # prompts, and it scrolled past unread for the whole of PPO(1)/PPO(2).
+        # A miss degrades BOTH the prompt KG and r_kg (the same subgraph is the
+        # verification reference in RewardSpec), so it is a silent quality drop,
+        # not a cosmetic one. Fail fast when a threshold is configured.
+        #
+        # The threshold is checked against ABSENT ONLY, not against absent+empty.
+        # A correct rebuild of silver_v1_reannotated measures 0.00% absent
+        # (24,997/24,997 covered) but 9.7% covered-but-empty among accepted
+        # prompts. That 9.7% is a property of the KG and the linker and does not
+        # fall with any rebuild, so checking the combined rate against a 5% cap
+        # would abort on a CORRECTLY built index -- a guard that fires on the
+        # fixed state is worse than no guard, because the only way past it is to
+        # disable it.
+        _cap = getattr(cfg, "max_kg_index_miss_rate", 1.0)
+        if _absent_rate > _cap:
+            raise ValueError(
+                f"question_kg_index is ABSENT for {dyn_kg_absent}/{len(rows)} "
+                f"prompts ({_absent_rate:.1%}), above the configured "
+                f"max_kg_index_miss_rate={_cap:.1%}. The index was almost "
+                "certainly built over a different question set than this silver "
+                "file — the shipped question_kg_index_v2.json is built from the "
+                "DEV splits (qids dev_*) and misses 100% of the train_* prompts "
+                "PPO rolls out on. Rebuild with:\n"
+                "  python scripts/prepare/06_build_question_kg_index.py \\\n"
+                f"    --silver {cfg.silver_path} --min_keep 5 --max_keep "
+                f"{cfg.ppo_max_kg_triples} \\\n"
+                "    --output indexes/kg_cache/question_kg_index_v2_train.json\n"
+                "then point training.question_kg_index_path at it "
+                "(retraining_plan §10.3). Set max_kg_index_miss_rate=1.0 to "
+                "train anyway."
+            )
     if dyn_kg_hits > 0:
         logger.info("R9 prompt KG: %d/%d samples got subgraphs from pre-built index", dyn_kg_hits, len(rows))
         # Print one example: show KG block from the first dynamic-KG prompt.
@@ -741,6 +840,10 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
         min_valid_steps=cfg.min_valid_steps,
         min_reasoning_chars=cfg.min_reasoning_chars,
         step_reward_scale=cfg.step_reward_scale,
+        shortfall_coef=cfg.shortfall_coef,
+        target_steps=cfg.target_steps,
+        center_text_reward=cfg.center_text_reward,
+        text_baseline_momentum=cfg.text_baseline_momentum,
         # R9 v6 fix: this retriever previously got NO cache_dir while offline=True,
         # so every fetch() returned [] and the entire reward-side dynamic-KG path
         # was dead code that still paid the entity-linking cost per rollout. With
@@ -766,9 +869,21 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
         split_spec=cfg.build_split_spec() if cfg.split else None,
     )
     if cfg.split is None:
+        # §13-1: this used to be a bare warning, and kg_proweight_ppo_v2 was
+        # trained over its own eval folds because of it. Refuse by default.
+        if not cfg.split_allow_none:
+            raise ValueError(
+                "training.split is None: PPO would roll out over the WHOLE silver "
+                f"file ({len(reader.trajectories)} trajectories, "
+                f"{len(reader.accepted())} accepted), including the val and test "
+                "folds, making every downstream eval number leak-contaminated. "
+                "Set training.split: train (the default since 2026-08-22), or pass "
+                "--split_allow_none to deliberately reproduce a pre-split run."
+            )
         logger.warning(
-            "Phase 3b split: NONE — PPO rolls out over the whole file (%d "
-            "trajectories, %d accepted). Nothing is held back.",
+            "Phase 3b split: NONE (explicitly allowed via split_allow_none) — PPO "
+            "rolls out over the whole file (%d trajectories, %d accepted). "
+            "Nothing is held back; results MUST NOT be reported as held-out.",
             len(reader.trajectories), len(reader.accepted()),
         )
     else:
@@ -794,9 +909,35 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
     # injection needs pre-built entity index for speed; TODO separately.
     # R9 v6: pre-built Q→KG index with filtered & ranked triples.
     _q_kg_index = {}
-    _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index_v2.json"
-    if not _q_kg_path.exists():
-        _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index.json"
+    if cfg.question_kg_index_path:
+        _q_kg_path = Path(cfg.question_kg_index_path)
+        # A relative path resolves against the CWD, and the launchers cd to
+        # $REMOTE_ROOT before running, so "indexes/kg_cache/..." lands under the
+        # project root there. Fall back to index_dir() (KGPW_INDEX_DIR) when the
+        # CWD-relative path misses, so the same YAML works from either place
+        # instead of failing on a box where only the env var is set.
+        if not _q_kg_path.exists() and not _q_kg_path.is_absolute():
+            _alt = Path(index_dir()) / _q_kg_path.name
+            if _alt.exists():
+                logger.info(
+                    "question_kg_index_path %s not found relative to CWD; using "
+                    "%s from KGPW_INDEX_DIR.", _q_kg_path, _alt,
+                )
+                _q_kg_path = _alt
+        if not _q_kg_path.exists():
+            raise FileNotFoundError(
+                f"question_kg_index_path does not exist: {_q_kg_path} "
+                f"(cwd={Path.cwd()}, index_dir={index_dir()}). It was "
+                "requested explicitly, so falling back to a default index would "
+                "silently train on a different KG than intended (§10.3). Build it "
+                "with 06_build_question_kg_index.py --silver "
+                f"{cfg.silver_path} --min_keep 5 --max_keep "
+                f"{cfg.ppo_max_kg_triples}."
+            )
+    else:
+        _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index_v2.json"
+        if not _q_kg_path.exists():
+            _q_kg_path = Path(index_dir()) / "kg_cache" / "question_kg_index.json"
     if _q_kg_path.exists():
         import json as _json
         _q_kg_raw = _json.loads(_q_kg_path.read_text(encoding="utf-8"))
@@ -1002,13 +1143,49 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
 
         # ── R9: extract reward components from all responses for diagnostics ──
         reward_rc = {"alpha_mean": 0.0, "r_kg_mean": 0.0, "r_text_mean": 0.0,
-                     "r_total_mean": 0.0, "n_steps": 0, "kg_reward_share": 0.0}
+                     "r_total_mean": 0.0, "n_steps": 0, "kg_reward_share": 0.0,
+                     # §9.4-1 (量纲): the centered channel and its baseline.
+                     "r_text_used_mean": 0.0, "text_baseline": 0.0,
+                     # d r_total / d alpha, the quantity the fix exists to move.
+                     "dr_dalpha": 0.0,
+                     # §9.6: direct evidence for the "r_kg is sparse" claim, which
+                     # until now rested only on the batch-aggregated mean.
+                     "r_kg_zero_frac": 0.0}
         if all_per_step_records:
             reward_rc["alpha_mean"] = float(sum(r.alpha for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["r_kg_mean"] = float(sum(r.r_kg for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["r_text_mean"] = float(sum(r.r_text for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["r_total_mean"] = float(sum(r.r_total for r in all_per_step_records) / len(all_per_step_records))
             reward_rc["n_steps"] = len(all_per_step_records)
+            _n = len(all_per_step_records)
+            # ── §9.4-1 (量纲) diagnostics ──────────────────────────────────
+            # r_text_used is what actually entered r_total; r_text is the raw
+            # scorer output. With centering ON the first must sit near 0 and the
+            # second near +0.63 -- if r_text_used_mean is also near +0.63 the
+            # centering is not running (config not forwarded), and if r_text_mean
+            # is near 0 the SCORER has changed, not the centering. Logging both
+            # is what makes those two cases distinguishable.
+            reward_rc["r_text_used_mean"] = float(
+                sum(r.r_text_used for r in all_per_step_records) / _n)
+            reward_rc["text_baseline"] = float(reward_fn.composite.text_baseline)
+            # The sensitivity of reward to the gate:
+            #   d r_total / d alpha = (r_kg - c_text * r_text_used) * c_step
+            # MEASURED at -0.148 before the fix (r_kg 0.0896, r_text 0.6284,
+            # c_text 0.3, c_step 1.5) -- the reward was paying the policy to lower
+            # alpha, i.e. to cite a sparser subgraph. After centering this should
+            # hover around 0 with the sign varying batch to batch. A persistent
+            # negative value means the KG channel is still being outbid.
+            reward_rc["dr_dalpha"] = float(
+                sum(r.r_kg - cfg.text_reward_scale * r.r_text_used
+                    for r in all_per_step_records) / _n) * cfg.step_reward_scale
+            # §9.6: what fraction of step records score EXACTLY 0 on r_kg (the
+            # PRM's NEUTRAL branch -- "the subgraph cannot judge this step").
+            # The claim that r_kg_mean 0.0896 is driven by frequency rather than
+            # by accuracy was inferred from the batch mean plus the 13/13
+            # precision reading; this measures it directly. Note 0 is a legitimate
+            # label here (prm_annotator.py:192 C2), not a missing value.
+            reward_rc["r_kg_zero_frac"] = float(
+                sum(1 for r in all_per_step_records if r.r_kg == 0.0) / _n)
             # What fraction of the batch's total reward magnitude the KG channel
             # actually contributes. Log it so "we trained with a KG process
             # reward" is a measured claim rather than an architectural one.
@@ -1155,6 +1332,11 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 "r_total_mean": reward_rc["r_total_mean"],
                 "n_steps_sample": reward_rc["n_steps"],
                 "kg_reward_share": reward_rc["kg_reward_share"],
+                # §9.4-1 (量纲): centered text reward diagnostics.
+                "r_text_used_mean": reward_rc["r_text_used_mean"],
+                "text_baseline": reward_rc["text_baseline"],
+                "dr_dalpha": reward_rc["dr_dalpha"],
+                "r_kg_zero_frac": reward_rc["r_kg_zero_frac"],
             }
         )
         if n_seen % (cfg.batch_size * 4) == 0:
@@ -1169,7 +1351,8 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
             #     axis can never be misread again.
             logger.info(
                 "step=%d (upd=%d) reward=%.2f kl=%.1f clip=%.3f valid=%d/%d "
-                "α=%.3f r_kg=%.3f r_text=%.3f kg_share=%.3f n_steps=%d",
+                "α=%.3f r_kg=%.3f r_text=%.3f (used %.3f base %.3f) "
+                "kg_share=%.3f dR/dα=%.3f r_kg_0=%d%% n_steps=%d",
                 n_seen,
                 n_seen // max(1, cfg.batch_size),
                 history[-1]["mean_reward"],
@@ -1180,7 +1363,11 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
                 reward_rc["alpha_mean"],
                 reward_rc["r_kg_mean"],
                 reward_rc["r_text_mean"],
+                reward_rc["r_text_used_mean"],
+                reward_rc["text_baseline"],
                 reward_rc["kg_reward_share"],
+                reward_rc["dr_dalpha"],
+                int(100 * reward_rc["r_kg_zero_frac"]),
                 reward_rc["n_steps"],
             )
             # R7: dump one sample response for qualitative monitoring.
@@ -1270,6 +1457,11 @@ def run_phase3_ppo(cfg: Phase3PPOConfig) -> Dict[str, Any]:
             tb_writer.add_scalar("reward/r_total_mean", reward_rc["r_total_mean"], global_step)
             tb_writer.add_scalar("reward/n_steps", reward_rc["n_steps"], global_step)
             tb_writer.add_scalar("reward/kg_reward_share", reward_rc["kg_reward_share"], global_step)
+            # §9.4-1 (量纲): the three new diagnostics.
+            tb_writer.add_scalar("reward/r_text_used_mean", reward_rc["r_text_used_mean"], global_step)
+            tb_writer.add_scalar("reward/text_baseline", reward_rc["text_baseline"], global_step)
+            tb_writer.add_scalar("reward/dr_dalpha", reward_rc["dr_dalpha"], global_step)
+            tb_writer.add_scalar("reward/r_kg_zero_frac", reward_rc["r_kg_zero_frac"], global_step)
 
         # Intermediate checkpoint: save the (PEFT) adapter whenever n_seen crosses
         # a save_every_steps boundary, so a run that collapses can be rolled back

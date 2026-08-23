@@ -19,11 +19,14 @@ def selfask_pred_parse(dataset):
 
 
 def ircot_pred_parse(dataset):
-    FINAL_ANSWER_PREFIX = "So the answer is:"
+    FINAL_ANSWER_PREFIX = "So the answer is"
     for item in dataset:
         pred = item.pred
         if FINAL_ANSWER_PREFIX in pred:
             answer = pred.split(FINAL_ANSWER_PREFIX)[1].strip()
+            # The model emits "So the answer is: X" *or* "So the answer is X"
+            # (no colon); drop an optional leading colon before returning.
+            answer = answer.lstrip(":").strip()
         else:
             answer = pred
         item.update_output('raw_pred', pred)

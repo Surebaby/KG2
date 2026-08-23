@@ -23,6 +23,7 @@ import torch
 from kgproweight.data.entity_filter import clean_entities
 from kgproweight.data.parsers import extract_final_answer, extract_step_token_spans, parse_steps
 from kgproweight.data.prompts import build_sft_messages
+from kgproweight.kg.entity_linker import build_passage_text, build_passage_titles
 from kgproweight.reward.alpha_gate import AlphaGate
 from kgproweight.reward.composite_reward import CompositeRewardModel
 from kgproweight.reward.prm_annotator import PRMAnnotator
@@ -188,6 +189,14 @@ class KGProWeightRewardFunction:
         min_reasoning_chars: int = 20,
         step_reward_scale: float = 1.0,
         subgraph_retriever = None,
+        # retraining_plan §9.4-3 / R-1b: step-shortfall penalty. 0.0 = disabled
+        # (reproduces every pre-2026-08-22 run).
+        shortfall_coef: float = 0.0,
+        target_steps: int = 3,
+        # retraining_plan §9.4-1 (量纲): remove R_Text's DC offset before mixing.
+        # False = pre-2026-08-23 behaviour, bit-for-bit.
+        center_text_reward: bool = False,
+        text_baseline_momentum: float = 0.99,
     ) -> None:
         self.composite = CompositeRewardModel(
             alpha_gate=alpha_gate,
@@ -197,6 +206,10 @@ class KGProWeightRewardFunction:
             discount=discount,
             text_reward_scale=text_reward_scale,
             step_reward_scale=step_reward_scale,
+            shortfall_coef=shortfall_coef,
+            target_steps=target_steps,
+            center_text_reward=center_text_reward,
+            text_baseline_momentum=text_baseline_momentum,
         )
         self.tokenizer = tokenizer
         self.alpha_override = alpha_override
@@ -324,7 +337,11 @@ class KGProWeightRewardFunction:
                 outcome = float(self.composite._em(predicted_answer, spec.gold_answer))
             if per_step_rewards and outcome:
                 per_step_rewards[-1] += self.composite.outcome_weight * outcome
-            returns = self.composite.discounted_returns(per_step_rewards)
+            # NOTE (retraining_plan §9.4-3): the step-shortfall penalty is
+            # deliberately NOT applied here. pure_em is the "reward is exactly the
+            # eval metric" upper-bound ablation; adding a process-shaping term
+            # would stop it measuring that. Expect this arm to collapse to short
+            # trajectories -- that is the finding, not a bug.
 
             # token mapping (shared with the main path)
             if response_ids is not None:
@@ -345,7 +362,6 @@ class KGProWeightRewardFunction:
             return {
                 "per_step_rewards": per_step_rewards,
                 "per_step_records": [],
-                "returns": returns,
                 "token_rewards": token_rewards,
                 "step_spans": spans,
                 "predicted_answer": predicted_answer,
@@ -399,12 +415,18 @@ class KGProWeightRewardFunction:
                 )
                 if grounded:
                     linker = self.composite.prm_annotator.entity_linker
+                    _titles = build_passage_titles(spec.retrieved_passages)
+                    _ptext = build_passage_text(spec.retrieved_passages)
                     qids = []
                     for m in grounded:
-                        # Pass the question so the linker's context scoring runs;
-                        # link_single(mention) alone silently skips it and falls
-                        # back to "first Wikidata search hit".
-                        r = linker.link_single(m, question=spec.query)
+                        # Pass the question + retrieved passage context so the
+                        # linker's full context scoring runs (R9 v7). Matches the
+                        # inference path so train and eval disambiguate identically.
+                        r = linker.link_single(
+                            m, question=spec.query,
+                            retrieved_titles=_titles,
+                            passage_text=_ptext,
+                        )
                         if r.selected_qid and not r.abstained:
                             qids.append(r.selected_qid)
                     if qids:
@@ -431,8 +453,10 @@ class KGProWeightRewardFunction:
         # R7: no per-step format bonus. Format is a CONSTRAINT (enforced via
         # trajectory_valid gating the outcome reward), not a reward target.
         # See problem_and_solutions.md for the rationale.
-        returns = self.composite.discounted_returns(per_step_rewards)
-
+        # NOTE: per_step_rewards already embeds r_kg (KG citation quality) via
+        # composite.compute_step_reward(). Adding PRM annotate_trajectory() on
+        # top would double-count the same signal — annotate_trajectory() calls
+        # the same label() method that produces r_kg.
         # Map each step's reward to the last token of its [Step N] span.
         # #6: prefer response_ids coordinates so placement aligns with the
         # trainer's scatter; fall back to re-tokenising the decoded response.
@@ -472,7 +496,6 @@ class KGProWeightRewardFunction:
         return {
             "per_step_rewards": per_step_rewards,
             "per_step_records": records,
-            "returns": returns,
             "token_rewards": token_rewards,
             "step_spans": spans,
             "predicted_answer": predicted_answer,

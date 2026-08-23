@@ -26,7 +26,12 @@ from kgproweight.data.parsers import (
 from kgproweight.data.prompts import build_teacher_messages
 from kgproweight.data.silver_dataset import SilverDatasetReader, SilverStepRecord, SilverTrajectory
 from kgproweight.kg.coverage import coverage_score
-from kgproweight.kg.entity_linker import EntityLinker, extract_mentions
+from kgproweight.kg.entity_linker import (
+    EntityLinker,
+    build_passage_text,
+    build_passage_titles,
+    extract_mentions,
+)
 from kgproweight.kg.wikidata_retriever import WikidataSubgraphRetriever
 from kgproweight.reward.prm_annotator import PRMAnnotator
 from kgproweight.retrieval.hybrid import DEFAULT_TOPK
@@ -579,13 +584,21 @@ def _process_one(
         passages = []
 
     # ---- robust mentions: NER/regex + passage titles ---------------------
-    # R9 v6: pass question context to entity linker for disambiguation
+    # R9 v6: pass question context to entity linker for disambiguation.
+    # R9 v7: also pass passage titles + bodies so silver-data linking matches
+    # the inference/reward paths (train/eval alignment).
     mentions = extract_mentions_robust(question, passages=passages, max_n=8)
     qids = []
     linked = {}  # mention → QID (for coverage + metadata)
     if mentions:
+        _titles = build_passage_titles(passages)
+        _ptext = build_passage_text(passages)
         for m in mentions:
-            result = cfg.entity_linker.link_single(m, question=question)
+            result = cfg.entity_linker.link_single(
+                m, question=question,
+                retrieved_titles=_titles,
+                passage_text=_ptext,
+            )
             if result.selected_qid and not result.abstained:
                 qids.append(result.selected_qid)
                 linked[m] = result.selected_qid

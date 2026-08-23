@@ -77,6 +77,58 @@ def _build_pipeline(
     return PipelineCls(cfg, **kwargs)
 
 
+def _wrap_retriever_rerank(
+    pipeline,
+    rerank_topk: int,
+    rerank_method: str = "cross-encoder",
+    cross_encoder_model: str = "models/bge-reranker-v2-m3",
+):
+    """Wrap ``pipeline.retriever.batch_search`` so retrieval is followed by the
+    same two-stage reranker the KG-ProWeight pipeline uses (:func:`rerank_passages`).
+
+    Baselines previously retrieved ``DEFAULT_TOPK=15`` with no reranker while the
+    main method retrieved 50 and reranked to 10 — an unfair comparison. This wrapper
+    makes every baseline's ``batch_search`` return cross-encoder-reranked top-K,
+    reusing the exact same dispatcher so both sides agree on the reranker.
+    """
+    retriever = getattr(pipeline, "retriever", None)
+    if retriever is None or rerank_topk <= 0:
+        return pipeline
+    from kgproweight.retrieval.reranker import rerank_passages
+
+    orig_batch_search = retriever.batch_search
+
+    def batch_search(query, *args, **kwargs):
+        return_score = kwargs.get("return_score", False)
+        out = orig_batch_search(query, *args, **kwargs)
+        if not return_score:
+            results = out
+        else:
+            results, scores = out
+        if not results:
+            return out
+        questions = [query] if isinstance(query, str) else list(query)
+        try:
+            reranked = rerank_passages(
+                questions,
+                results,
+                topk=rerank_topk,
+                method=rerank_method,
+                cross_encoder_model=cross_encoder_model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Rerank failed (%s) — returning un-reranked results.", exc)
+            return out
+        if return_score:
+            # Reranked order makes the original RRF scores stale; return zeros.
+            new_scores = [[0.0] * len(r) for r in reranked]
+            return reranked, new_scores
+        return reranked
+
+    retriever.batch_search = batch_search
+    return pipeline
+
+
 def run_evaluation(
     flashrag_cfg: Dict[str, Any],
     pipeline_module: str,
@@ -89,6 +141,9 @@ def run_evaluation(
     user_prompt: Optional[str] = None,
     pred_process_fun: Optional[Callable] = None,
     after_run: Optional[Callable[[Any], None]] = None,
+    rerank_topk: int = 0,
+    rerank_method: str = "cross-encoder",
+    cross_encoder_model: str = "models/bge-reranker-v2-m3",
 ) -> Dict[str, Any]:
     """Run one evaluation pass.
 
@@ -132,38 +187,62 @@ def run_evaluation(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
     )
+    _wrap_retriever_rerank(
+        pipeline,
+        rerank_topk=rerank_topk,
+        rerank_method=rerank_method,
+        cross_encoder_model=cross_encoder_model,
+    )
 
-    if run_mode == "naive":
-        result = pipeline.naive_run(ds, do_eval=True, pred_process_fun=pred_process_fun)
-    else:
-        result = pipeline.run(ds, do_eval=True, pred_process_fun=pred_process_fun)
+    try:
+        if run_mode == "naive":
+            result = pipeline.naive_run(ds, do_eval=True, pred_process_fun=pred_process_fun)
+        else:
+            result = pipeline.run(ds, do_eval=True, pred_process_fun=pred_process_fun)
 
-    if after_run is not None:
-        try:
-            after_run(pipeline)
-        except Exception as exc:
-            logger.warning("after_run callback failed: %s", exc)
+        if after_run is not None:
+            try:
+                after_run(pipeline)
+            except Exception as exc:
+                logger.warning("after_run callback failed: %s", exc)
 
-    final_dir: Optional[Path] = None
-    save_dir = cfg["save_dir"] if "save_dir" in cfg else None
-    if save_dir:
-        final_dir = Path(save_dir)
-        export_metric_json(final_dir)
+        final_dir: Optional[Path] = None
+        save_dir = cfg["save_dir"] if "save_dir" in cfg else None
+        if save_dir:
+            final_dir = Path(save_dir)
+            export_metric_json(final_dir)
 
-    if final_dir is not None and final_dir.exists():
-        dump_manifest(
-            final_dir,
-            extra={
-                "phase": "eval",
-                "pipeline_class": pipeline_class,
-                "dataset": flashrag_cfg.get("dataset_name"),
-                "split": flashrag_cfg.get("split"),
-                "seed": seed,
-                "run_mode": run_mode,
-            },
-        )
+        if final_dir is not None and final_dir.exists():
+            dump_manifest(
+                final_dir,
+                extra={
+                    "phase": "eval",
+                    "pipeline_class": pipeline_class,
+                    "dataset": flashrag_cfg.get("dataset_name"),
+                    "split": flashrag_cfg.get("split"),
+                    "seed": seed,
+                    "run_mode": run_mode,
+                },
+            )
 
-    return {
-        "result": result,
-        "save_dir": str(final_dir) if final_dir else None,
-    }
+        return {
+            "result": result,
+            "save_dir": str(final_dir) if final_dir else None,
+        }
+    finally:
+        # Release the generator/retriever models so a subsequent ``run_evaluation``
+        # in a loop loads into full VRAM — even when ``run()`` raised (a failed
+        # method must not cascade into CPU-offload for the next method). ``device_map
+        # ="auto"`` infers its budget from ``torch.cuda.mem_get_info()`` (FREE memory),
+        # and the CUDA caching allocator does not return freed blocks to the driver
+        # until ``empty_cache()``. Without this, run N+1 sees depleted free VRAM and
+        # spuriously CPU-offloads its model ("Some parameters are on the meta device
+        # ... offloaded to the cpu" → ~1 tok/s instead of ~70 tok/s).
+        import gc
+
+        import torch
+
+        del pipeline
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

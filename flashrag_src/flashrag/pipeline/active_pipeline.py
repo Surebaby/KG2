@@ -976,7 +976,12 @@ class IRCOTPipeline(BasicPipeline):
                 self.prompt_template.get_string(
                     question=items[item_id].question,
                     retrieval_result=batch_retrieval_results[item_id],
-                    previous_gen=' '.join(batch_thoughts[item_id])
+                    # The generator strips the terminating '.' (stop=['.', '\n']),
+                    # so re-add a period to each prior thought. Without it, the
+                    # continuation prompt ends mid-sentence ("...producer") and the
+                    # model's first generated token is the missing '.', which
+                    # immediately re-triggers the stop and yields an empty thought.
+                    previous_gen=' '.join(t + '.' for t in batch_thoughts[item_id] if t.strip())
                 )
                 for item_id in active_item_ids
             ]

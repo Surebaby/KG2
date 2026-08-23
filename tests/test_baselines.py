@@ -22,7 +22,10 @@ def test_baseline_flashrag_module_paths():
     assert modules["naive_rag"] == "flashrag.pipeline.pipeline"
     assert modules["self_rag"] == "flashrag.pipeline.active_pipeline"
     assert modules["rearag"] == "flashrag.pipeline.reasoning_pipeline"
-    assert modules["r1_searcher"] == "flashrag.pipeline.reasoning_pipeline"
+    # R1-Searcher was deliberately moved off ReasoningPipeline: it needs a
+    # <think> prompt + max_tokens=1024 through SequentialPipeline to produce
+    # anything (see docs/r9_diagnosis.md §6). This test asserted the old wiring.
+    assert modules["r1_searcher"] == "flashrag.pipeline.pipeline"
 
 
 def test_zero_shot_uses_naive_run():
@@ -37,7 +40,9 @@ def test_reasoning_baselines_flag():
     r1 = next(b for b in BASELINES if b.name == "r1_searcher")
     naive = next(b for b in BASELINES if b.name == "naive_rag")
     assert rearag.is_reasoning is True
-    assert r1.is_reasoning is True
+    # R1-Searcher runs through SequentialPipeline with an explicit <think>
+    # prompt, so is_reasoning is False by design (see the module-path test).
+    assert r1.is_reasoning is False
     assert naive.is_reasoning is False
 
 

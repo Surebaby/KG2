@@ -15,12 +15,27 @@ Two input modes:
     Legacy: re-filter an existing v1 ``question_kg_index.json`` in place. Kept
     so the old artifact can still be converted, but it cannot add coverage.
 
+``--silver``
+    Read questions from a silver ``.jsonl``. This is the only mode that covers
+    the PPO PROMPT set: the questions PPO rolls out on are the silver file's,
+    and they are disjoint from the dev-split questions ``--datasets --split dev``
+    produces (silver qids are ``train_*``, the dev index's are ``dev_*``), which
+    is why the shipped ``question_kg_index_v2.json`` misses 100% of PPO prompts.
+    Use the SAME file passed to ``--silver_data``, and ``--max_keep`` equal to
+    ``ppo_max_kg_triples`` (12), or teacher and student see different KG budgets.
+
 Usage::
 
     # Cover the eval splits (this is what inference reads)
     python scripts/prepare/06_build_question_kg_index.py \
       --datasets hotpotqa 2wikimultihopqa musique --split dev \
       --output indexes/kg_cache/question_kg_index_v2.json
+
+    # Cover the PPO prompt set (this is what phase3_ppo.py reads)
+    python scripts/prepare/06_build_question_kg_index.py \
+      --silver data/silver_data/silver_v1_reannotated.jsonl \
+      --min_keep 5 --max_keep 12 \
+      --output indexes/kg_cache/question_kg_index_v2_train.json
 
     # Convert the legacy artifact
     python scripts/prepare/06_build_question_kg_index.py \
@@ -68,6 +83,9 @@ def parse_args():
     p.add_argument("--output", required=True, help="Path for v2 output .json")
     p.add_argument("--report", default="docs/kg_build_report.md", help="Report output")
     p.add_argument("--max_keep", type=int, default=30, help="Max triples per question")
+    p.add_argument("--min_keep", type=int, default=5,
+                   help="Min triples per question; relaxes the score threshold to match "
+                        "the inference fallback (which uses min_keep=5). 0 = strict.")
     p.add_argument("--max_mentions", type=int, default=5)
     p.add_argument("--offline", action="store_true", default=True,
                    help="Cache-only: never call Wikidata (default)")
@@ -246,8 +264,8 @@ def main():
         ] or None
 
         filtered_rich = filter_and_rank_triples(
-            triples, q, pid_map=pid_map, max_keep=args.max_keep, rich=True,
-            question_entities=q_entities,
+            triples, q, pid_map=pid_map, max_keep=args.max_keep,
+            min_keep=args.min_keep, rich=True, question_entities=q_entities,
         )
         n_after = len(filtered_rich)
         total_quota_dropped += (n_before - hard_del - n_after)

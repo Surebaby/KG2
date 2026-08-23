@@ -1,5 +1,8 @@
 # Architecture Overview
 
+> ⚠️ **口径快照 (2026-08-18)**: 本文件的模块结构仍有效，但其中引用的 Teacher / IHR Judge / PPO 超参等数值口径已过时，
+> 以 [paper_design_new.md](paper_design_new.md) + [10_口径统一清单.md](paper/10_口径统一清单.md) + 当前代码为准。
+
 This document describes the module layout and primary dataflow of
 `kgproweight`. For the methodology, see [`paper_design.md`](paper_design.md).
 

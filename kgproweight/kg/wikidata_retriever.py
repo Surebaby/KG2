@@ -176,13 +176,27 @@ _QA_RELATION_FILTER: set[str] = {
 
 from kgproweight.utils.logging import get_logger
 
+import os as _os
+
 logger = get_logger(__name__)
 
-SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
+# R9 v6: support reverse proxy for firewalled environments (same env vars as entity_linker).
+_WIKIDATA_PROXY_BASE = _os.getenv("KGPW_WIKIDATA_PROXY_BASE", "").rstrip("/")
+_WIKIDATA_PROXY_TOKEN = _os.getenv("KGPW_WIKIDATA_PROXY_TOKEN", "")
+
+if _WIKIDATA_PROXY_BASE:
+    _WIKIDATA_API_BASE = f"{_WIKIDATA_PROXY_BASE}/https://query.wikidata.org"
+else:
+    _WIKIDATA_API_BASE = "https://query.wikidata.org"
+
+SPARQL_ENDPOINT = f"{_WIKIDATA_API_BASE}/sparql"
 SPARQL_HEADERS = {
     "User-Agent": "KGProWeight/1.0 (research; contact: anonymous@example.com)",
     "Accept": "application/sparql-results+json",
 }
+if _WIKIDATA_PROXY_TOKEN:
+    SPARQL_HEADERS["X-Proxy-Token"] = _WIKIDATA_PROXY_TOKEN
+
 REQUEST_DELAY = 0.5
 
 

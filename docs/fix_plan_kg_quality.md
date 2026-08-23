@@ -329,3 +329,6 @@ D3: reward 重平衡
 | 清洁 KG 后 PPO 仍不优于 SFT | 中 | PPO 可能存在固有的回归均值现象；可尝试 GRPO 替代 |
 | Entity Linker 改进需要 GENRE 模型 | 低 | 当前上下文打分（无需 GENRE）已足够；GENRE 是可选的增强 |
 | 重建 KG 缓存需要 Wikidata 在线查询 | 中 | 离线模式下用已有缓存兜底；分批查询避免限流 |
+
+
+

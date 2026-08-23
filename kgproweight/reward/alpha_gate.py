@@ -21,6 +21,9 @@ import torch
 import torch.nn as nn
 
 from kgproweight.kg.coverage import graph_density
+from kgproweight.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -28,11 +31,61 @@ from kgproweight.kg.coverage import graph_density
 # ---------------------------------------------------------------------------
 
 class AlphaGate(nn.Module):
-    """Learnable gate ``α ∈ (0, 1)`` over the 3-feature vector ``x_t``."""
+    """Learnable gate ``α ∈ (0, 1)`` over the feature vector ``x_t``.
+
+    FEATURE ORDER (positional, do not reorder -- checkpoints depend on it):
+
+        0  graph_density     |E| / (|V| + eps) of the step's filtered subgraph
+        1  link_confidence   mean fuzzy-link confidence of the step's entities
+        2  semantic_entropy  -mean(log p_token) over the step's tokens
+        3  cite_any          1.0 if the step cited ANY triple           (new)
+        4  cite_match        fraction of cited triples found in the KG  (new)
+
+    2026-08-23 -- why features 3 and 4 exist. The 3-feature gate could not fit
+    its own calibration target. Fitting this exact functional form directly to
+    ``kg_has_verdict`` (base rate 0.2983 over 33,011 accepted silver steps) gave
+    a CEILING of R^2 = +0.038 over a constant predictor, and the shipped
+    checkpoint scored WORSE than a constant (R^2 -0.674 at the measured
+    f_entropy=0.603, -1.105 at 0.0). The cause is that neither live feature
+    carries signal about the target: corr(f_density, target) = +0.172 and
+    corr(f_confidence, target) = +0.130. Measured ceilings:
+
+        constant (base rate)     BCE 0.6094  Brier 0.2093  R^2  0.000
+        3 features (ceiling)     BCE 0.5854  Brier 0.2013  R^2 +0.038
+        + cite_any               BCE 0.4317  Brier 0.1432  R^2 +0.316
+        + cite_match             BCE 0.4344  Brier 0.1342  R^2 +0.359
+        + both                   BCE 0.3762  Brier 0.1174  R^2 +0.439
+        cite_any ALONE           BCE 0.4380  Brier 0.1466  R^2 +0.300
+
+    One citation feature alone carries 8x the information of all three original
+    features combined. Both together give 12x.
+
+    CIRCULARITY, stated openly: ``PRMAnnotator.label`` returns NEUTRAL partly
+    BECAUSE a step cited nothing (prm_annotator.py:184), so cite_any is not
+    independent of the target. Measured conditional structure over the same
+    33,011 steps:
+
+        cite_any=0 (n=16,150)  ->  P(verdict) = 0.042    near-deterministic
+        cite_any=1 (n=16,861)  ->  P(verdict) = 0.543    genuinely uncertain
+
+    The definitional direction is the negative one; on the 51% of steps that DO
+    cite, the feature narrows the target from 0.298 to 0.543 without determining
+    it. That asymmetry is why this is a usable feature and not a label leak, but
+    the gate must never be reported as "predicting" verdicts -- it is a WEIGHT on
+    the KG channel, and cite_any is a legitimate input to that weight (a step
+    citing nothing should not be graded on its KG grounding).
+
+    Both new features are computable IDENTICALLY at training and inference:
+    ``ParsedStep.cited_triples`` is filled from the silver ``cited_triples`` field
+    during Phase 2 and by ``TRIPLE_RE`` over generated text at inference.
+    """
+
+    #: Number of features the current architecture expects.
+    N_FEATURES = 5
 
     def __init__(
         self,
-        init_weights: Sequence[float] = (1.0, 1.5, -0.8),
+        init_weights: Sequence[float] = (1.0, 1.5, -0.8, 0.9, 1.0),
         init_bias: float = -2.0,
         init_tau: float = 0.5,
         min_tau: float = 0.1,
@@ -52,10 +105,24 @@ class AlphaGate(nn.Module):
         graph_density_t: torch.Tensor,
         link_confidence_t: torch.Tensor,
         semantic_entropy_t: torch.Tensor,
+        cite_any_t: Optional[torch.Tensor] = None,
+        cite_match_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = torch.stack(
-            [graph_density_t, link_confidence_t, semantic_entropy_t], dim=-1
-        )
+        """Compute α. The citation features default to zeros when not supplied.
+
+        Defaulting rather than requiring them keeps every existing 3-argument
+        call site working. A zero default is also the RIGHT neutral value: it is
+        what a step that cites nothing actually scores, so an old call site that
+        never passes them behaves like "no citations observed" instead of
+        silently reading uninitialised state.
+        """
+        feats = [graph_density_t, link_confidence_t, semantic_entropy_t]
+        if self.W.numel() > 3:
+            zero = torch.zeros_like(graph_density_t)
+            feats.append(cite_any_t if cite_any_t is not None else zero)
+            if self.W.numel() > 4:
+                feats.append(cite_match_t if cite_match_t is not None else zero)
+        x = torch.stack(feats, dim=-1)
         logit = (x @ self.W + self.b) / self.tau
         return torch.sigmoid(logit)
 
@@ -64,12 +131,51 @@ class AlphaGate(nn.Module):
         graph_density_v: float,
         link_confidence_v: float,
         semantic_entropy_v: float,
+        cite_any_v: float = 0.0,
+        cite_match_v: float = 0.0,
     ) -> float:
         with torch.no_grad():
-            gd = torch.tensor([graph_density_v], dtype=torch.float32)
-            lc = torch.tensor([link_confidence_v], dtype=torch.float32)
-            se = torch.tensor([semantic_entropy_v], dtype=torch.float32)
-            return float(self.forward(gd, lc, se).item())
+            t = lambda v: torch.tensor([v], dtype=torch.float32)  # noqa: E731
+            return float(
+                self.forward(
+                    t(graph_density_v),
+                    t(link_confidence_v),
+                    t(semantic_entropy_v),
+                    t(cite_any_v),
+                    t(cite_match_v),
+                ).item()
+            )
+
+    def load_state_dict(self, state_dict, strict: bool = True):  # type: ignore[override]
+        """Load a checkpoint, ZERO-PADDING ``W`` if it predates the new features.
+
+        A 3-feature checkpoint would otherwise fail with a size mismatch at every
+        load site (``phase3_ppo.py``, ``kg_proweight_pipeline.py``,
+        ``phase3_grpo.py``). Padding with zeros reproduces the old gate EXACTLY --
+        the new features get weight 0 -- so an old checkpoint keeps behaving as it
+        did, and only a Phase 2 re-run gives the new features nonzero weight.
+
+        This is deliberately permissive in ONE direction only. A checkpoint WIDER
+        than the current architecture is an error, not something to truncate:
+        silently dropping a trained weight would change α with no warning.
+        """
+        sd = dict(state_dict)
+        w = sd.get("W")
+        if w is not None and w.ndim == 1 and w.numel() < self.W.numel():
+            pad = torch.zeros(self.W.numel() - w.numel(), dtype=w.dtype, device=w.device)
+            sd["W"] = torch.cat([w, pad])
+            logger.warning(
+                "AlphaGate checkpoint has %d features, this build expects %d. "
+                "Zero-padding the new weights, which reproduces the OLD gate "
+                "exactly. Re-run Phase 2 to actually fit the citation features.",
+                w.numel(), self.W.numel(),
+            )
+        elif w is not None and w.numel() > self.W.numel():
+            raise ValueError(
+                "AlphaGate checkpoint has %d features but this build expects %d. "
+                "Refusing to truncate a trained weight." % (w.numel(), self.W.numel())
+            )
+        return super().load_state_dict(sd, strict=strict)
 
     def extra_repr(self) -> str:
         return (

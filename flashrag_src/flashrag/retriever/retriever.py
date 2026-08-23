@@ -319,8 +319,19 @@ class BM25Retriever(BaseTextRetriever):
         elif self.backend == "bm25s":
             import bm25s
 
-            # query_tokens = self.tokenizer.tokenize([query], return_as="tuple", update_vocab=False)
+            # bm25s cannot retrieve an empty query: an empty/whitespace string
+            # tokenizes to an empty token list, which breaks ``retrieve``
+            # (its list-of-list type check inspects only ``query_tokens[0]``).
+            # Substitute a harmless OOV placeholder so empty queries return
+            # zero-score results instead of raising.
+            if not query or not query.strip():
+                query = "placeholder"
             query_tokens = bm25s.tokenize([query])
+            # A non-empty query can still tokenize to zero tokens when it is only
+            # stopwords or punctuation (e.g. "the" or "."); re-tokenize with the
+            # OOV placeholder so ``retrieve`` doesn't reject it.
+            if len(query_tokens.ids[0]) == 0:
+                query_tokens = bm25s.tokenize(["placeholder"])
             results, scores = self.searcher.retrieve(query_tokens, k=num)
             results = list(results[0])
             scores = list(scores[0])
@@ -344,8 +355,20 @@ class BM25Retriever(BaseTextRetriever):
         elif self.backend == "bm25s":
             import bm25s
 
-            # query_tokens = self.tokenizer.tokenize(query, return_as="tuple", update_vocab=False)
+            # bm25s cannot retrieve empty queries: an empty token list breaks
+            # ``is_list_of_list_of_type`` (which inspects only ``query[0]``),
+            # raising for the whole batch. IRCOT round-2 retrieval can produce
+            # empty thoughts, so substitute a harmless OOV placeholder.
+            query = [q if (q and q.strip()) else "placeholder" for q in query]
             query_tokens = bm25s.tokenize(query)
+            # A *non-empty* query can still tokenize to zero tokens when it is only
+            # stopwords or punctuation (e.g. an IRCOT thought of "the" or "."),
+            # which also makes ``retrieve`` reject the whole batch. Re-tokenize
+            # those with the same OOV placeholder; it matches no corpus token, so
+            # those queries return zero-score results instead of raising.
+            if any(len(t) == 0 for t in query_tokens.ids):
+                query = [q if len(t) else "placeholder" for q, t in zip(query, query_tokens.ids)]
+                query_tokens = bm25s.tokenize(query)
             results, scores = self.searcher.retrieve(query_tokens, k=num)
         else:
             assert False, "Invalid bm25 backend!"

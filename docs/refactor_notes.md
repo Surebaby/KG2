@@ -1,5 +1,8 @@
 # Refactor Notes: kg2 → kgpaper
 
+> ⚠️ **历史快照**: 本文件是 kg2 → kgpaper 重构时的映射记录，属工程历史；其中涉及的任何模型 / 超参口径
+> 以 [paper_design_new.md](paper_design_new.md) + [10_口径统一清单.md](paper/10_口径统一清单.md) 为准。
+
 A traceable mapping from the legacy `kg2` layout to the refactored
 `kgpaper` package, plus the list of semantic bugs that were fixed.
 

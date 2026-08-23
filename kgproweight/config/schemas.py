@@ -124,6 +124,12 @@ class PPOConfig(_Base):
     outcome_weight: float = 8.0  # R5: stronger EM signal for hard examples
     text_reward_scale: float = 0.3  # R5: scale down R_text so EM+R_KG dominate
     step_reward_scale: float = 1.0  # R9 v5: scale per-step composite reward (tuned to 0.3)
+    # retraining_plan §9.4-1 (量纲/D2): subtract R_Text's running DC offset before
+    # mixing. Measured r_text mean 0.6284 vs r_kg 0.0896 -- a 7x gap on the same
+    # nominal [-1,1] scale, which made d r_total/d alpha = -0.148 (the reward paid
+    # the policy to LOWER alpha). False reproduces every pre-2026-08-23 run.
+    center_text_reward: bool = False
+    text_baseline_momentum: float = 0.99  # EMA momentum; ~100-sample window
     # R7: format bonus REMOVED. Format is a constraint (ValidTrajectory gate),
     # not a reward target. See docs/problem_and_solutions.md and docs/R7_experiment_log.md.
     min_valid_steps: int = 3  # min parsed [Step N] blocks for outcome eligibility

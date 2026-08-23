@@ -45,6 +45,16 @@ def parse_args():
                    help="Also in trajectories. Overrides the YAML value; use a "
                         "small number for smoke tests so a checkpoint is "
                         "actually written before the run ends.")
+    p.add_argument("--question_kg_index_path", default=None,
+                   help="Pre-built question->KG index for PROMPT-side injection. "
+                        "MUST be built over the same silver file+fold this run "
+                        "rolls out on (06_build_question_kg_index.py --silver ...); "
+                        "a mismatched index misses every question and silently "
+                        "degrades both the prompt KG and r_kg. Overrides "
+                        "training.question_kg_index_path.")
+    p.add_argument("--max_kg_index_miss_rate", type=float, default=None,
+                   help="Abort if the index misses more than this fraction of "
+                        "prompts (default from YAML; 1.0 = warn only).")
     p.add_argument("--alpha_override", type=float, default=None)
     p.add_argument("--binary_labels_only", action="store_true")
     add_split_args(p)
@@ -99,7 +109,16 @@ def main():
             pure_em_reward=ppo_cfg.pure_em_reward,
             # R7: format-as-constraint (replaces step_format_bonus)
             min_valid_steps=getattr(ppo_cfg, "min_valid_steps", 3),
+            # §9.4-3 / R-1b: explicit forwarding is mandatory -- schemas.py sets
+            # extra="allow", so a YAML key that is not named here is accepted and
+            # silently ignored (the ppo_max_kg_triples trap).
+            shortfall_coef=getattr(ppo_cfg, "shortfall_coef", 0.0),
+            target_steps=getattr(ppo_cfg, "target_steps", 3),
             min_reasoning_chars=getattr(ppo_cfg, "min_reasoning_chars", 20),
+            # §9.4-1 (量纲): R_Text DC removal. Must be forwarded explicitly or
+            # the YAML setting is silently dropped (schemas.py extra="allow").
+            center_text_reward=getattr(ppo_cfg, "center_text_reward", False),
+            text_baseline_momentum=getattr(ppo_cfg, "text_baseline_momentum", 0.99),
             sft_anchor_weight=getattr(ppo_cfg, "sft_anchor_weight", 0.02),
             sft_anchor_interval=getattr(ppo_cfg, "sft_anchor_interval", 50),
             sft_replay_ratio=getattr(ppo_cfg, "sft_replay_ratio", 0.15),
@@ -116,6 +135,26 @@ def main():
             # then never reaches the dataclass -- the same trap that left
             # ppo_max_kg_triples pinned at its default while the YAML "set" it.
             rollout_chunk_size=getattr(ppo_cfg, "rollout_chunk_size", 8),
+            # §10.3 / R-2: must be forwarded EXPLICITLY -- schemas.py sets
+            # extra="allow", so these YAML keys would otherwise be accepted and
+            # silently dropped, exactly like ppo_max_kg_triples was.
+            question_kg_index_path=(
+                args.question_kg_index_path
+                if args.question_kg_index_path is not None
+                else getattr(tcfg, "question_kg_index_path", None)
+            ),
+            max_kg_index_miss_rate=(
+                args.max_kg_index_miss_rate
+                if args.max_kg_index_miss_rate is not None
+                else getattr(tcfg, "max_kg_index_miss_rate", 1.0)
+            ),
+            # §13-1: passed explicitly rather than via split_kwargs(), because
+            # phase3_sft.py shares that helper and its config has no such field.
+            split_allow_none=(
+                getattr(args, "split_allow_none", None)
+                if hasattr(args, "split_allow_none")
+                else getattr(tcfg, "split_allow_none", False)
+            ),
             **split_kwargs(args, tcfg),
         )
     else:
@@ -134,6 +173,11 @@ def main():
                else {"save_every_steps": args.save_every_steps}),
             alpha_override=args.alpha_override,
             binary_labels_only=args.binary_labels_only,
+            split_allow_none=getattr(args, "split_allow_none", False),
+            **({} if args.question_kg_index_path is None
+               else {"question_kg_index_path": args.question_kg_index_path}),
+            **({} if args.max_kg_index_miss_rate is None
+               else {"max_kg_index_miss_rate": args.max_kg_index_miss_rate}),
             **split_kwargs(args),
         )
 

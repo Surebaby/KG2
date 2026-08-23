@@ -30,6 +30,11 @@ def parse_args():
     p.add_argument("--seeds", type=int, nargs="+", default=[13, 42, 2024])
     p.add_argument("--gpu_id", default="0")
     p.add_argument("--save_root", default=None)
+    p.add_argument("--retrieval_topk", type=int, default=50,
+                   help="Candidate pool size after RRF (Stage 1). Default 50 matches "
+                        "the main method's two-stage retrieval. Set 15 to reproduce the legacy top-15.")
+    p.add_argument("--rerank", type=int, default=10,
+                   help="Rerank to top-K via bge-reranker-v2-m3 (Stage 2). 0 disables rerank.")
     return p.parse_args()
 
 
@@ -57,6 +62,7 @@ def main():
                     test_sample_num=args.test_sample_num,
                     seed=seed,
                     gpu_id=args.gpu_id,
+                    topk=args.retrieval_topk,
                 )
                 logger.info("Running %s / %s / seed=%d → %s", method, ds, seed, save_dir)
                 try:
@@ -69,9 +75,11 @@ def main():
                         system_prompt=spec.system_prompt,
                         user_prompt=spec.user_prompt,
                         pred_process_fun=spec.extras.get("pred_process_fun"),
+                        pipeline_kwargs=spec.pipeline_kwargs,
+                        rerank_topk=args.rerank,
                     )
                 except Exception as exc:
-                    logger.error("Eval failed for %s/%s seed=%d: %s", method, ds, seed, exc)
+                    logger.exception("Eval failed for %s/%s seed=%d: %s", method, ds, seed, exc)
                     summary.setdefault(method, {}).setdefault(ds, {})[f"seed_{seed}"] = {"error": str(exc)}
                     continue
                 summary.setdefault(method, {}).setdefault(ds, {})[f"seed_{seed}"] = {

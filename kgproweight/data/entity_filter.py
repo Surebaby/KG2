@@ -32,8 +32,26 @@ _SCAFFOLD: frozenset[str] = frozenset(
 def clean_entities(entities: List[str]) -> List[str]:
     """Drop scaffold mentions; keep order and de-dup. Pure, no side effects.
 
-    A mention is dropped only if its ENTIRE lower-cased form is a scaffold token,
-    so "Reasoning" -> dropped but "Albert Einstein" / "Reasoning Museum" are kept.
+    A mention is dropped when EVERY one of its tokens is a scaffold word, so
+    "Reasoning" and "Knowledge Used" -> dropped, while "Albert Einstein" and
+    "Reasoning Museum" (one non-scaffold token) are kept.
+
+    The whole-token test the earlier version used compared the joined mention
+    against the single-token set, so every MULTI-WORD scaffold phrase bypassed
+    it. The header of this module lists "Knowledge Used" and "Final Answer" as
+    exactly what must be stripped, and both were being kept: measured over the
+    33,011 accepted silver steps, "Knowledge Used" survived on 32,986 of them
+    (99.9%) and pure-scaffold mentions were 17.2% of all kept mentions
+    (32,989/191,400). Each contributed a spurious link_confidence of 0.667 (its
+    fuzzy match against the entity cache), which is precisely the inflation this
+    module was written to prevent.
+
+    Both live call sites -- Phase 2 (``phase2_prm._build_samples_accepted_only``)
+    and the PPO reward (``reward_function``) -- go through this one function, so
+    the fix lands on training and inference together and the feature
+    distributions stay aligned. It does, however, change the feature the shipped
+    α-gate was FITTED with, so the gate must be re-fitted (Phase 2 re-run) rather
+    than reused across this change.
     """
     out: List[str] = []
     seen = set()
@@ -41,7 +59,8 @@ def clean_entities(entities: List[str]) -> List[str]:
         key = e.strip()
         if not key:
             continue
-        if key.lower() in _SCAFFOLD:
+        toks = key.lower().split()
+        if toks and all(t in _SCAFFOLD for t in toks):
             continue
         if key in seen:
             continue

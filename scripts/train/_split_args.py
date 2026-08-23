@@ -28,9 +28,11 @@ def add_split_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("train/val/test split")
     g.add_argument(
         "--split", choices=["train", "val", "test"], default=argparse.SUPPRESS,
-        help="Fold to use. Omit for the whole file (pre-split behaviour). Use the "
-             "SAME fold in every phase, or a later phase trains on what an "
-             "earlier phase held out.",
+        help="Fold to use. Use the SAME fold in every phase, or a later phase "
+             "trains on what an earlier phase held out. Omitting it falls back to "
+             "the YAML value (phase3_ppo.yaml defaults to `train` since "
+             "2026-08-22); a resolved value of None makes Phase 3b refuse to run "
+             "unless --split_allow_none is also passed.",
     )
     g.add_argument(
         "--val_ratio", type=float, default=argparse.SUPPRESS,
@@ -44,6 +46,14 @@ def add_split_args(p: argparse.ArgumentParser) -> None:
         "--split_seed", type=int, default=argparse.SUPPRESS,
         help="Seed for fold assignment. Separate from --seed so a seed sweep over "
              "training randomness does not redraw the held-out set (default 42).",
+    )
+    g.add_argument(
+        "--split_allow_none", action="store_true", default=argparse.SUPPRESS,
+        help="Deliberately roll out over the WHOLE silver file, val/test folds "
+             "included. Phase 3b refuses split=None without this flag "
+             "(retraining_plan §13-1: kg_proweight_ppo_v2 was trained on its own "
+             "eval folds because omitting --split was only a warning). Results "
+             "from such a run must never be reported as held-out.",
     )
 
 

@@ -27,6 +27,9 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--alpha_override", type=float, default=None)
     p.add_argument("--binary_labels_only", action="store_true")
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--max_input_length", type=int, default=2048)
+    p.add_argument("--max_new_tokens", type=int, default=256)
     return p.parse_args()
 
 
@@ -48,6 +51,9 @@ def main():
         seed=args.seed,
         alpha_override=args.alpha_override,
         binary_labels_only=args.binary_labels_only,
+        batch_size=args.batch_size,
+        max_input_length=args.max_input_length,
+        max_new_tokens=args.max_new_tokens,
     )
     result = run_phase3_grpo(cfg)
     logger.info("Phase 3b GRPO result: %s", result)

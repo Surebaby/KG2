@@ -12,24 +12,29 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import os
 import torch
 import torch.nn.functional as F
 
+from collections import defaultdict
+
 from kgproweight.data.prompts import build_rl_messages
 from kgproweight.data.silver_dataset import SilverDatasetReader
+from kgproweight.kg.kg_filter import filter_and_rank_triples
 from kgproweight.data.silver_split import (
     DEFAULT_SPLIT_SEED,
     DEFAULT_TEST_RATIO,
     DEFAULT_VAL_RATIO,
 )
+from kgproweight.kg.wikidata_retriever import WikidataSubgraphRetriever
 from kgproweight.reward.alpha_gate import AlphaGate
 from kgproweight.reward.prm_annotator import PRMAnnotator
 from kgproweight.reward.text_reward_model import build_text_reward_model
 from kgproweight.training.reward_function import KGProWeightRewardFunction, RewardSpec
 from kgproweight.utils.logging import dump_manifest, get_logger
-from kgproweight.utils.paths import model_path
+from kgproweight.utils.paths import index_dir, model_path
 from kgproweight.utils.seed import set_seed
 
 logger = get_logger(__name__)
@@ -65,6 +70,27 @@ class Phase3GRPOConfig:
     alpha_override: Optional[float] = None
     binary_labels_only: bool = False
     kl_coef: float = 0.05
+    # R9 v6: reward calibration (Plan B).
+    # High outcome weight + low step scale = "final answer is what matters".
+    # The noisy per-step r_kg signal is down-weighted; GRPO's group-comparison
+    # advantage amplifies the consistent EM signal across rollouts.
+    outcome_weight: float = 8.0
+    step_reward_scale: float = 0.5
+    text_reward_scale: float = 0.3
+    # retraining_plan §9.4-1 (量纲): R_Text DC removal. GRPO is NOT the retraining
+    # path (PPO is), so this defaults OFF and no GRPO run changes. It is plumbed
+    # anyway because GRPO shares KGProWeightRewardFunction and therefore shares
+    # the bug: the +0.63 offset makes d r_total/d alpha negative here too. Note
+    # GRPO's group-relative advantage already cancels the offset in the OUTCOME
+    # channel -- but not in the alpha interaction, which is the part that matters.
+    center_text_reward: bool = False
+    text_baseline_momentum: float = 0.99
+    discount: float = 0.95
+    min_valid_steps: int = 2  # aligned with PPO
+    min_reasoning_chars: int = 20
+    max_steps: int = 7
+    kg_offline: bool = True  # offline by default for training (use cached KG)
+    max_kg_triples: int = 12  # R9 v6: filter noisy silver KG during training
     # Fold to roll out on; see Phase3PPOConfig.split. Must match the fold the
     # earlier phases used. ``None`` reproduces the pre-split whole-file behaviour.
     split: Optional[str] = None
@@ -92,7 +118,15 @@ def _build_policy(cfg: Phase3GRPOConfig):
     tokenizer = AutoTokenizer.from_pretrained(base_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(base_id, torch_dtype=torch_dtype, device_map="auto")
+    # R9 v6: limit policy model to 50 GiB max so ReaRAG + activations fit.
+    # Without this, accelerate's device_map="auto" reserves ~90% of GPU (85 GiB
+    # on a 96 GiB card), leaving no room for training activations or reward models.
+    max_mem = os.getenv("KGPW_POLICY_MAX_MEMORY", "50GiB")
+    model = AutoModelForCausalLM.from_pretrained(
+        base_id, torch_dtype=torch_dtype,
+        device_map="auto",
+        max_memory={0: max_mem},
+    )
 
     if cfg.use_lora:
         try:
@@ -132,14 +166,31 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
         device=str(device),
         dtype=cfg.dtype,
     )
+    # R9 v6: build subgraph retriever for dynamic KG reward (same as PPO).
+    # Without this, the reward function uses only static silver KG → graph_density
+    # is always zero → α gate can't compute meaningful r_kg.
+    _kg_cache_dir = str(Path(index_dir()) / "kg_cache")
+    subgraph_retriever = WikidataSubgraphRetriever(
+        max_hops=2, max_neighbors=30, cache_dir=_kg_cache_dir,
+        offline=cfg.kg_offline,
+    )
+
     reward_fn = KGProWeightRewardFunction(
         alpha_gate=alpha_gate,
         prm_annotator=annotator,
         text_reward_model=text_reward,
         tokenizer=tokenizer,
-        outcome_weight=1.0,
-        discount=0.95,
+        outcome_weight=cfg.outcome_weight,
+        step_reward_scale=cfg.step_reward_scale,
+        text_reward_scale=cfg.text_reward_scale,
+        discount=cfg.discount,
         alpha_override=cfg.alpha_override,
+        min_valid_steps=cfg.min_valid_steps,
+        min_reasoning_chars=cfg.min_reasoning_chars,
+        max_steps=cfg.max_steps,
+        subgraph_retriever=subgraph_retriever,
+        center_text_reward=cfg.center_text_reward,
+        text_baseline_momentum=cfg.text_baseline_momentum,
     )
 
     reader = SilverDatasetReader(
@@ -169,10 +220,20 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
 
     prompts_pool: List[Dict[str, Any]] = []
     for traj in reader.accepted():
+        # R9 v6: filter silver KG to match inference quality (max_keep=12,
+        # hard-delete noise, score threshold). Without this, training sees
+        # 105 triples/q of unfiltered noise while inference sees 10.3 — the
+        # distribution mismatch that collapsed PPO.
+        filtered_kg = filter_and_rank_triples(
+            list(traj.kg_subgraph),
+            question=traj.question,
+            max_keep=cfg.max_kg_triples,
+            min_keep=5,
+        )
         msgs = build_rl_messages(
             question=traj.question,
             retrieved_passages=traj.retrieved_passages,
-            kg_triples=traj.kg_subgraph,
+            kg_triples=filtered_kg,
         )
         if hasattr(tokenizer, "apply_chat_template"):
             text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
@@ -184,7 +245,7 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
                 "spec": RewardSpec(
                     query=traj.question,
                     gold_answer=traj.answer or "",
-                    kg_subgraph=list(traj.kg_subgraph),
+                    kg_subgraph=filtered_kg,  # R9 v6: use filtered KG for reward
                     retrieved_passages=list(traj.retrieved_passages),
                     metadata={"qid": traj.qid},
                 ),
@@ -199,6 +260,7 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
     rng = torch.Generator().manual_seed(cfg.seed)
     n_seen = 0
     history = []
+    _batch_metrics: List[Dict[str, float]] = []
     while n_seen < cfg.total_steps:
         idx = torch.randint(0, len(prompts_pool), (cfg.batch_size,), generator=rng).tolist()
         batch = [prompts_pool[i] for i in idx]
@@ -210,7 +272,8 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
             enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=cfg.max_input_length).to(device)
             query_ids = enc["input_ids"][0]
 
-            # Rollout K times
+            # Rollout K times — must be in eval mode (dropout OFF).
+            model.eval()
             responses_ids = []
             responses_text = []
             for _ in range(cfg.group_size):
@@ -228,11 +291,38 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
                 responses_ids.append(response_ids)
                 responses_text.append(tokenizer.decode(response_ids, skip_special_tokens=True))
 
-            rewards = [reward_fn(prompt, t, spec)["trajectory_reward"] for t in responses_text]
+            # Compute rewards and collect per-step metrics.
+            reward_results = [reward_fn(prompt, t, spec) for t in responses_text]
+            rewards = [r["trajectory_reward"] for r in reward_results]
             rewards_t = torch.tensor(rewards, dtype=torch.float32, device=device)
             advantages = (rewards_t - rewards_t.mean()) / (rewards_t.std() + 1e-6)
 
+            # Collect per-sample metrics for logging.
+            _step_records = []
+            for r in reward_results:
+                recs = r.get("per_step_records", [])
+                if recs:
+                    _step_records.extend(recs)
+            _alphas = [float(sr.alpha) for sr in _step_records if hasattr(sr, 'alpha')]
+            _rkgs = [float(sr.r_kg) for sr in _step_records if hasattr(sr, 'r_kg')]
+            _rtexts = [float(sr.r_text) for sr in _step_records if hasattr(sr, 'r_text')]
+            _outcomes = [1.0 if r.get("predicted_answer") and r.get("trajectory_reward", 0) > 0 else 0.0
+                         for r in reward_results]
+            _resp_lens = [len(ids) for ids in responses_ids]
+
+            _batch_metrics.append({
+                "reward": float(rewards_t.mean()),
+                "reward_std": float(rewards_t.std()),
+                "advantage_std": float(advantages.std()),
+                "alpha": sum(_alphas) / len(_alphas) if _alphas else 0.0,
+                "r_kg": sum(_rkgs) / len(_rkgs) if _rkgs else 0.0,
+                "r_text": sum(_rtexts) / len(_rtexts) if _rtexts else 0.0,
+                "outcome_rate": sum(_outcomes) / len(_outcomes) if _outcomes else 0.0,
+                "response_len": sum(_resp_lens) / len(_resp_lens) if _resp_lens else 0,
+            })
+
             # Policy loss: -E[A * log π(response | prompt)]
+            model.train()  # enable dropout for training
             sample_loss = torch.zeros((), device=device, dtype=torch.float32)
             for adv, r_ids in zip(advantages, responses_ids):
                 concat = torch.cat([query_ids, r_ids]).unsqueeze(0)
@@ -243,20 +333,36 @@ def run_phase3_grpo(cfg: Phase3GRPOConfig) -> Dict[str, Any]:
                 sample_loss = sample_loss + adv.detach() * out.loss
             sample_loss = sample_loss / cfg.group_size
 
-            # Light-weight KL anchor toward base via cross-entropy regularisation on response.
-            # Skipped here; PPO-style anchor is in :mod:`phase3_ppo`.
             loss_total = loss_total + sample_loss
 
         loss = loss_total / cfg.batch_size
+        # NaN guard: skip update if loss is not finite (prevents silent corruption).
+        if not torch.isfinite(loss):
+            logger.warning("GRPO step %d: loss is not finite (%.4f) — skipping update", n_seen, float(loss))
+            _batch_metrics = _batch_metrics[:-cfg.batch_size] if len(_batch_metrics) >= cfg.batch_size else _batch_metrics
+            continue
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+        _grad_norm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
         optim.step()
         optim.zero_grad(set_to_none=True)
         n_seen += cfg.batch_size
 
+        # Log detailed metrics periodically (every ~4 update steps).
+        _log_every = max(cfg.batch_size * 4, 16)
+        if n_seen % _log_every == 0 and _batch_metrics:
+            _window = _batch_metrics[-_log_every:]
+            _avg = {k: sum(m[k] for m in _window) / len(_window) for k in _window[0]}
+            logger.info(
+                "GRPO step=%d loss=%.4f grad=%.2f | reward=%.2f±%.2f adv_std=%.2f | "
+                "α=%.3f r_kg=%.3f r_text=%.3f | EM=%.1f%% len=%d",
+                n_seen, float(loss), float(_grad_norm),
+                _avg["reward"], _avg["reward_std"], _avg["advantage_std"],
+                _avg["alpha"], _avg["r_kg"], _avg["r_text"],
+                _avg["outcome_rate"] * 100, int(_avg["response_len"]),
+            )
+            _batch_metrics = []  # reset for next window
+
         history.append({"step": n_seen, "loss": float(loss.detach().cpu().item())})
-        if n_seen % (cfg.batch_size * 4) == 0:
-            logger.info("GRPO step=%d loss=%.4f", n_seen, history[-1]["loss"])
 
     final_dir = out_dir / "final"
     if hasattr(model, "save_pretrained"):

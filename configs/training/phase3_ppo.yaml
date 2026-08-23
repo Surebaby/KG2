@@ -24,8 +24,44 @@ training:
   # are training on whatever fold is set here. A fold that differs from Phase
   # 2's means the PRM is scored on questions the policy trained on, and nothing
   # raises — the number just looks held-out.
-  # Left null to reproduce the pre-split runs; set to `train` for the split runs.
-  split: null
+  # 2026-08-22 (retraining_plan §13-1): default flipped null -> train. `null`
+  # made PPO roll out over the WHOLE file including the val/test folds, behind a
+  # single logger.warning that nobody reads; that is exactly how
+  # checkpoints/kg_proweight_ppo_v2 got trained on its own eval folds and had to
+  # be discarded. The only guard used to be launch_split_ppo.sh remembering to
+  # pass --split train -- one omission wasted a 4h run. To deliberately reproduce
+  # a pre-split run, pass --split_allow_none explicitly.
+  split: train
+  # ---------------------------------------------------------------------
+  # Prompt-side KG index (retraining_plan §10.3 / R-2)
+  # ---------------------------------------------------------------------
+  # The index MUST be built over the same silver file+fold this run rolls out on,
+  # otherwise every question misses and the prompts fall back to the silver
+  # subgraph -- which also degrades r_kg, since the same subgraph is what
+  # triple_in_subgraph() verifies citations against. Build it with:
+  #   python scripts/prepare/06_build_question_kg_index.py   #     --silver <the --silver_data file> --min_keep 5 --max_keep 12   #     --output indexes/kg_cache/question_kg_index_v2_train.json
+  # --max_keep MUST equal ppo_max_kg_triples (12) and the silver rebuild's
+  # max_kg_triples, or teacher and student see different KG budgets (§12.3).
+  # 2026-08-22: BUILT and installed. Rebuilt offline from
+  # silver_v1_reannotated.jsonl (the file both launch_split_ppo.sh and
+  # launch_split_ppo_smoke.sh pass to --silver_data) in 174 s; 24,997/24,997
+  # questions covered (0.00% absent, vs 100% absent for the shipped
+  # question_kg_index_v2.json, which is built from the DEV splits). Report:
+  # docs/kg_build_report_train_silver.md. Change this whenever --silver_data
+  # changes -- the two must name the same file.
+  question_kg_index_path: indexes/kg_cache/question_kg_index_v2_train.json
+  # Refuse to start when the index is ABSENT for more than this share of prompts.
+  # The dev-split index missed 100% for the whole of PPO(1)/PPO(2) behind a
+  # warning nobody read. Measured against ABSENT entries only -- a correctly
+  # rebuilt index still leaves questions COVERED BUT EMPTY (entity linking
+  # abstained, or the cache holds no triples for the linked QIDs). MEASURED on a
+  # full offline rebuild of silver_v1_reannotated (--min_keep 5 --max_keep 12,
+  # 174 s): 0.00% absent, but 9.7% empty among the 9,839 accepted prompts PPO
+  # rolls out on (6.3% after the silver kg_subgraph fallback). That 9.7% does not
+  # fall with any rebuild, so a cap on absent+empty would abort on a correct
+  # index.
+  # Set 1.0 to restore warn-only behaviour.
+  max_kg_index_miss_rate: 0.05
   val_ratio: 0.10
   test_ratio: 0.10
   # Separate from `seed`: a seed sweep over RL randomness must not redraw the
@@ -62,7 +98,9 @@ training:
     # and the ppo stage carries ~6.5s of fixed cost per update, so ~+40 min
     # (~4.7 h total, still inside the 5 h budget).
     #
-    # Rejected alternatives: ppo_max_kg_triples 30->20 lowers the probability of
+    # Rejected alternatives: lowering ppo_max_kg_triples (12; see the NOTE at the
+    # end of this file -- an earlier revision of this comment said 30) lowers the
+    # probability of
     # a long draw but sets no hard bound and weakens the KG context this paper
     # measures; max_input_length 6144->5120 would bound it at 2.45 GiB but must
     # equal phase3_sft.yaml's sft_max_length, so it would require re-running
@@ -194,11 +232,54 @@ training:
     # (reward/composite_reward.py:194), so 10.0 made a single invalid
     # trajectory in a batch of 8 swamp every process signal in the batch.
     # Watch custom/kg_reward_share in tensorboard to confirm the ~10%.
-    outcome_weight: 4.0
+    outcome_weight: 4.0  # reverted Plan B (was 8.0): EM-dominance caused OOD collapse
     # R5: scale R_text from (-1,1) down to (-0.3,0.3). ReaRAG's text coherence
     # score is the dominant noise source — scaling it down lets EM and R_KG
     # dominate while keeping the alpha-gate structure intact.
+    #
+    # 2026-08-23 (retraining_plan §9.5): DO NOT retune this in the same run as
+    # center_text_reward below. Both act on the same channel, so changing them
+    # together makes the result unattributable. Centering first; revisit this
+    # value only after a run has measured what the centered channel does.
     text_reward_scale: 0.3
+    # ------------------------------------------------------------------
+    # 2026-08-23 (retraining_plan §9.4-1 / D2): 量纲统一 — R_Text DC removal
+    # ------------------------------------------------------------------
+    # MEASURED over PPO① (`ppo_r10_split`, 750 updates):
+    #     r_kg    mean 0.0896  sd 0.1166   <- the channel the method is named after
+    #     r_text  mean 0.6284  sd 0.1353
+    # The SDs differ by 16%; the MEANS differ by 7x. R_Text is not a signal on a
+    # shared scale, it is a +0.63 constant with a signal on top -- structurally so,
+    # since RearagPromptScorer returns tanh((2.5-nll)/1.5) and typical nll ~1.5
+    # gives tanh(0.67)=0.585.
+    #
+    # Two consequences, only the second of which is a real bug:
+    #   (a) the constant is INVISIBLE to the gradient (GAE's baseline plus TRL's
+    #       advantage whitening remove any action-independent term), so the
+    #       channel's budget was largely spent on nothing;
+    #   (b) it is NOT invisible through alpha, and there it has the wrong sign:
+    #         d r_total/d alpha = (r_kg - 0.3*r_text) * 1.5 = -0.148
+    #       The policy was being paid to push alpha DOWN. alpha rises with
+    #       f_density = |E|/(|V|+eps), so that means "cite a sparser subgraph" --
+    #       a KG-grounding reward rewarding less KG grounding.
+    #
+    # After centering, d r_total/d alpha averages ~0 and the surviving variation
+    # (sd 0.135, same order as r_kg's 0.117) is the part that was ever signal.
+    #
+    # Implementation is a causal EMA baseline, NOT the literal within-batch mean
+    # §9.4-1 writes: at batch_size=4 (~12 step samples) a batch mean carries
+    # se 0.039 = 29% of the signal's own sd, and a batch-relative reward is a
+    # GRPO-style quantity the critic cannot represent. Momentum 0.99 gives a
+    # ~100-sample window, se ~0.014 (10%). The baseline is NOT checkpointed; a
+    # resumed run re-warms it over ~100 steps.
+    #
+    # WHAT TO CHECK in the smoke log (check_ppo_smoke.sh checks 11-12):
+    #   r_text=~0.63 (unchanged, raw scorer) but used=~0.00 (centered), and
+    #   dR/dα no longer pinned negative. If used is also ~0.63 the flag did not
+    #   reach the dataclass; if r_text itself is ~0 the SCORER changed, not this.
+    # Set false to reproduce any pre-2026-08-23 run bit-for-bit.
+    center_text_reward: true
+    text_baseline_momentum: 0.99
     # R7: TensorBoard for real-time training monitoring.
     # TRL logs PPO losses/KL/clipfrac; custom metrics (valid_rate, sft_anchor_loss)
     # are written via a separate SummaryWriter to the same logdir.
@@ -223,7 +304,38 @@ training:
     # min_valid_steps is 2 (not 1) and sft_anchor_weight is 0.10 (not 0.05, so 5x
     # the R7-A weight of 0.02, not 2.5x). The R7-B notes above are kept as the
     # historical rationale; read the values, not the prose, for what runs.
-    min_valid_steps: 2
+    # 2026-08-22 (retraining_plan R-1a): 2 -> 3, to match silver's min_steps=3.
+    # The gap between silver (taught 3.36 steps) and this gate (required 2) is the
+    # room the step collapse exploited: both PPO runs converged to exactly 2 steps
+    # per trajectory, which was fully "valid" under the old gate.
+    #
+    # ⚠️ RISK, stated plainly: R7-A already tried min_valid_steps=3 and valid_rate
+    # stuck at 9.2% with no upward trend over 1600 steps (see the R7-A notes
+    # above). What differs now: sft_anchor_interval is 10 (was 50) and
+    # sft_anchor_weight 0.10 (was 0.02), i.e. ~5x denser and 5x stronger format
+    # pullback, and the measured SFT checkpoint passes this exact predicate at
+    # 0.980. So the R7-A failure is not expected to repeat -- but it is NOT ruled
+    # out, and it is the specific thing the smoke run must check.
+    #
+    # ABORT CRITERION for the smoke run: if valid_rate has not exceeded 0.5 by
+    # update ~50, revert this to 2 and rely on shortfall_coef alone. Do not "wait
+    # and see" past that point -- R7-A showed the flat curve does not recover.
+    min_valid_steps: 3
+    # retraining_plan §9.4-3 / R-1b: step-shortfall penalty. Anchored to
+    # outcome_weight, so the two stay in proportion if either is retuned.
+    # 0.25 => missing 1 of 3 steps costs 0.25 * 4.0 * 1/3 = 0.33, the same order
+    # as the entire process-reward budget of a collapsed 2-step trajectory
+    # (measured: ~2 x 0.163). Charged on the last step, on BOTH valid and invalid
+    # trajectories -- gating it on validity would exempt exactly the 2-step
+    # "valid" trajectories it exists to price.
+    #
+    # Do NOT raise this much further: at high values PPO optimises step count over
+    # EM, which is how kg_reward_share fell to 0.009 under outcome_weight=10.
+    # 0.0 disables it and reproduces every pre-2026-08-22 run.
+    shortfall_coef: 0.25
+    # Measured against silver's min_steps (3), NOT min_valid_steps -- if these two
+    # are ever set apart again, this is the one that should track silver.
+    target_steps: 3
     sft_anchor_weight: 0.10
     sft_anchor_interval: 10
     # ------------------------------------------------------------------
@@ -245,12 +357,17 @@ training:
     # rationale ("let the KL penalty prevent forgetting") is better served by
     # kl_coef, which is an explicit knob, than by shrinking the one reward
     # channel the method is named after.
-    step_reward_scale: 1.5
+    step_reward_scale: 1.5  # reverted Plan B (was 0.5): KG process reward must stay strong
   # 6144 fits 15 passages (~3.7k tok) + KG block + generation so the KG context
   # is never truncated. Consistent with SFT/eval top_k=15.
   #
   # NOTE: ppo_max_kg_triples is NOT settable from this file — scripts/train/
   # phase3_ppo.py never forwards it to Phase3PPOConfig, and schemas.py sets
   # extra="allow", so a key added here would be silently accepted and ignored.
-  # It is fixed at the dataclass default in phase3_ppo.py (R10: 50 → 30).
+  # It is fixed at the dataclass default in phase3_ppo.py, which is **12**
+  # (phase3_ppo.py:178) -- NOT 30. 2026-08-22 (retraining_plan §13-6): this line
+  # used to say "R10: 50 -> 30", so anyone budgeting prompt length from this file
+  # was off by 18 triples. 12 is also the value the inference pipeline uses
+  # (kg_proweight_pipeline.py:60) and the value the rebuilt question-KG index and
+  # the silver rebuild must both be pinned to (retraining_plan §10.3, §12.3).
   max_input_length: 6144

@@ -79,11 +79,10 @@ kgpw-summarize = "scripts.eval.summarize_results:main"
 "Documentation" = "./docs"
 "Paper Design" = "./docs/paper_design.md"
 
-[tool.setuptools]
-packages = ["kgproweight"]
-
-[tool.setuptools.package-dir]
-kgproweight = "kgproweight"
+[tool.setuptools.packages.find]
+# Explicit discovery so newly-added subpackages are picked up automatically.
+include = ["kgproweight*"]
+exclude = ["tests*", "scripts*", "flashrag_src*", "third_party*"]
 
 # ---------------------------------------------------------------------------
 # Tooling

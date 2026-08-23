@@ -9,6 +9,13 @@
 /indexes/
 /checkpoints/
 /outputs/
+# 2026-08-23: these two were NOT ignored, so `git add .` tried to stage 151 GB
+# of model weights and FAISS/BM25 indexes. `/models/` keeps the handful of
+# already-tracked config/tokenizer files working (gitignore does not untrack),
+# it only stops the *.safetensors shards from being added.
+/models/
+/indexes_wiki18/
+/indexes_smoke/bm25/*.npy
 .cache/
 *.bin
 *.safetensors

@@ -46,7 +46,15 @@ def parse_args():
     p.add_argument("--gpu_id", default="0")
     p.add_argument("--save_root", default=None)
     p.add_argument("--no_kg", action="store_true", help="Disable KG injection (alpha=0 ablation)")
-    p.add_argument("--rerank", type=int, default=0, help="Rerank top-K after RRF (0=disabled)")
+    p.add_argument("--rerank", type=int, default=None,
+                   help="Rerank top-K after RRF. Default: follow config's rerank_topk "
+                        "(hybrid_rrf_top50.yaml -> 10). 0=disabled, N=override.")
+    p.add_argument("--alpha_bias_correction", type=float, default=None,
+                   help="AlphaGate inference bias additive correction. "
+                        "Default (None) = 0.0, i.e. NO correction (changed "
+                        "2026-08-23; +0.78 was reverse-engineered to make b_eff a "
+                        "round -1.0 and the mechanism it claims allows at most "
+                        "+0.363). Pass 0.78 to reproduce pre-2026-08-23 runs.")
     return p.parse_args()
 
 
@@ -94,6 +102,13 @@ def main():
     paths = _resolve_paths(args)
     retrieval_overrides, pipeline_module, pipeline_class, record_alpha = _load_yaml_overrides(args.config)
 
+    # R9 v6 fix: two-stage reranking was silently disabled — the config's
+    # ``rerank_topk`` (10) never reached the pipeline because ``--rerank``
+    # defaulted to 0, and without rerank the 50-passage prompt overran 6144
+    # tokens and right-truncation dropped the KG block + assistant anchor.
+    # Now: no flag → follow the config; ``--rerank N`` overrides; ``--rerank 0`` disables.
+    rerank = args.rerank if args.rerank is not None else int(retrieval_overrides.get("rerank_topk", 0) or 0)
+
     for ds in args.datasets:
         for seed in args.seeds:
             save_dir = str(save_root / ds / f"seed_{seed}")
@@ -124,10 +139,11 @@ def main():
                 "entity_cache_path": args.entity_cache_path,
                 "kg_cache_dir": args.kg_cache_dir,
                 "record_alpha": record_alpha,
+                "alpha_bias_correction": args.alpha_bias_correction,
             }
             if args.no_kg:
                 pipeline_kwargs["inject_kg"] = False
-            if args.rerank > 0:
+            if rerank > 0:
                 # Report the ACTUAL configured pool, not a hardcoded "50": with
                 # no --config the retriever returned 15 docs while this line
                 # claimed RRF@50, so logs disagreed with what ran.
@@ -136,13 +152,13 @@ def main():
                     r.get("retrieval_topk")
                     for r in cfg.get("multi_retriever_setting", {}).get("retriever_list", [])
                 ]
-                if pool < args.rerank:
+                if pool < rerank:
                     logger.warning(
                         "rerank_topk=%d >= candidate pool=%d — reranking is a no-op. "
                         "Raise retrieval.retrieval_topk in the config.",
-                        args.rerank, pool,
+                        rerank, pool,
                     )
-                pipeline_kwargs["rerank_topk"] = args.rerank
+                pipeline_kwargs["rerank_topk"] = rerank
                 pipeline_kwargs["retrieval_topk"] = pool
                 pipeline_kwargs["rerank_method"] = retrieval_overrides.get(
                     "rerank_method", "cross-encoder")
@@ -152,7 +168,7 @@ def main():
                     "Two-stage retrieval: per-retriever@%s → RRF@%d → %s@%d → prompt<=%dtok",
                     per_retriever, pool,
                     retrieval_overrides.get("rerank_method", "cross-encoder"),
-                    args.rerank, 3860,
+                    rerank, 3860,
                 )
 
             def _after_run(pipe, save_dir=save_dir):  # noqa: ARG001

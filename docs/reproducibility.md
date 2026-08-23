@@ -47,12 +47,10 @@ The pinned versions live in `requirements.txt`. Critical pins:
 
 ## 3. External API versions
 
-- **Teacher (GPT-4o)**: pin `model="gpt-4o-2024-08-06"` in
-  `configs/training/phase1_silver.yaml` (the date suffix freezes the
-  weights even when OpenAI rolls the alias).
-- **Teacher (DeepSeek-V3)**: `model="deepseek-chat"`. Costs ≈ ¥180 for 25k
-  queries.
-- **IHR Judge (GPT-4o)**: pin to the same date as the Teacher.
+- **Teacher**: `model="deepseek-v4-flash"`. All silver trajectories
+  (`silver_v1_reannotated.jsonl`, 24,998 → 9,839 accepted) were generated
+  with deepseek-v4-flash; no GPT-4o teacher was used.
+- **IHR Judge**: `model="deepseek-v4-pro"`.
 
 ## 4. Hyperparameters
 

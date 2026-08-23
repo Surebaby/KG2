@@ -484,17 +484,7 @@ class HFCausalLMGenerator(BaseGenerator):
         # deal stop params
         stop_sym = None
         if "stop" in generation_params:
-            from flashrag.generator.stop_word_criteria import StopWordCriteria
-
             stop_sym = generation_params.pop("stop")
-            stopping_criteria = [
-                StopWordCriteria(
-                    tokenizer=self.tokenizer,
-                    prompts=input_list,
-                    stop_words=stop_sym,
-                )
-            ]
-            generation_params["stopping_criteria"] = stopping_criteria
 
         generation_params = resolve_max_tokens(params, generation_params, prioritize_new_tokens=True)
 
@@ -520,6 +510,22 @@ class HFCausalLMGenerator(BaseGenerator):
             with torch.inference_mode():
                 torch.cuda.empty_cache()
                 batched_prompts = input_list[idx : idx + batch_size]
+                if stop_sym is not None:
+                    # Build stop criteria per batch so `StopWordCriteria.input_sizes`
+                    # aligns with the prompts actually in this batch. Constructing it
+                    # once over the full `input_list` (the old behaviour) made every
+                    # batch use prompt 0's length as the prompt boundary, so shorter
+                    # prompts leaked a `.`/`\n`-laden prompt tail into the "generated"
+                    # window and stopped after a single token.
+                    from flashrag.generator.stop_word_criteria import StopWordCriteria
+
+                    generation_params["stopping_criteria"] = [
+                        StopWordCriteria(
+                            tokenizer=self.tokenizer,
+                            prompts=batched_prompts,
+                            stop_words=stop_sym,
+                        )
+                    ]
                 inputs = self.tokenizer(
                     batched_prompts,
                     return_tensors="pt",

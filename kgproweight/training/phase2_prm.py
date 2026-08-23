@@ -35,7 +35,9 @@ from kgproweight.data.silver_split import (
 from kgproweight.data.parsers import parsed_step_from_silver_dict
 from kgproweight.data.entity_filter import clean_entities
 from kgproweight.kg.coverage import graph_density
+from kgproweight.reward.citation_features import citation_features
 from kgproweight.kg.entity_linker import EntityLinker
+from kgproweight.kg.kg_filter import filter_and_rank_triples
 from kgproweight.reward.alpha_gate import (
     AlphaCalibrationLoss,
     AlphaGate,
@@ -63,6 +65,12 @@ class _StepSample:
     coverage: float                  # holds step-level link_confidence (Finding 2)
     binary_quality: int              # +1 if accepted, -1 otherwise
     semantic_entropy: float          # populated after the logprob pre-pass
+    # 2026-08-23 (§14): the α-gate's two new PER-STEP citation features. The three
+    # original features hit an R² ceiling of +0.038 on this loss's own target;
+    # cite_any alone reaches +0.300 and both together +0.439. See AlphaGate's
+    # docstring for the full table and the circularity caveat.
+    cite_any: float = 0.0            # 1.0 if the step cited any triple
+    cite_match: float = 0.0          # fraction of cited triples present in the subgraph
     # Conclusions of the PRECEDING steps, oldest first (fix #7). NEGATIVE is
     # assigned by ``PRMAnnotator._is_contradiction(conclusion, prev_conclusions)``,
     # so without them the label is not a function of the input: the same step
@@ -132,6 +140,16 @@ def _build_samples_accepted_only(
     out: List[_SampleWithProvenance] = []
     for t_idx, traj in enumerate(accepted):
         quality = 1 if traj.accepted else -1
+        # R9 v6: filter silver KG to match inference (max_keep=12, hard-delete
+        # noise, score threshold). The raw silver KG has ~105 triples/q; without
+        # this, graph_density is computed on unfiltered noise and the α gate is
+        # calibrated for a distribution never seen at inference.
+        filtered_kg = filter_and_rank_triples(
+            list(traj.kg_subgraph),
+            question=traj.question,
+            max_keep=12,
+            min_keep=5,
+        )
         # Walk steps in order so each sample can carry the conclusions that
         # precede it — the annotator's contradiction test reads exactly this.
         prev_conclusions: List[str] = []
@@ -153,16 +171,23 @@ def _build_samples_accepted_only(
                     step_entities=step_entities,
                     entity_linker=entity_linker,
                 )
+                # Citation features, computed against the SAME filtered subgraph
+                # the density feature uses, so all of them describe one KG view.
+                cite_any, cite_match = citation_features(
+                    parsed.cited_triples, filtered_kg
+                )
                 out.append(
                     _SampleWithProvenance(
                         sample=_StepSample(
                             text=text,
                             label=label,
                             label_class=label_class,
-                            kg_subgraph=list(traj.kg_subgraph),
+                            kg_subgraph=filtered_kg,
                             coverage=float(link_conf),
                             binary_quality=quality,
                             semantic_entropy=0.0,
+                            cite_any=cite_any,
+                            cite_match=cite_match,
                             prev_conclusions=list(prev_conclusions),
                         ),
                         traj_idx=t_idx,
@@ -182,6 +207,13 @@ def _step_samples_from_silver(reader: SilverDatasetReader, *, binary_labels_only
     for traj in reader:
         coverage = float(traj.metadata.get("coverage", 0.0))
         quality = 1 if traj.accepted else -1
+        # R9 v6: filter silver KG (same as _build_samples_accepted_only)
+        filtered_kg = filter_and_rank_triples(
+            list(traj.kg_subgraph),
+            question=traj.question,
+            max_keep=12,
+            min_keep=5,
+        )
         prev_conclusions: List[str] = []
         for s_idx, step in enumerate(traj.steps):
             text = step.text or ""
@@ -198,7 +230,7 @@ def _step_samples_from_silver(reader: SilverDatasetReader, *, binary_labels_only
                         text=text,
                         label=label,
                         label_class=label_class,
-                        kg_subgraph=list(traj.kg_subgraph),
+                        kg_subgraph=filtered_kg,
                         coverage=coverage,
                         binary_quality=quality,
                         semantic_entropy=0.0,
@@ -374,6 +406,8 @@ class _StepDataset(Dataset):
             "graph_density": torch.tensor(graph_density(s.kg_subgraph), dtype=torch.float32),
             "coverage": torch.tensor(s.coverage, dtype=torch.float32),
             "semantic_entropy": torch.tensor(s.semantic_entropy, dtype=torch.float32),
+            "cite_any": torch.tensor(s.cite_any, dtype=torch.float32),
+            "cite_match": torch.tensor(s.cite_match, dtype=torch.float32),
         }
 
 
@@ -392,6 +426,8 @@ def _collate(batch: List[Dict[str, Any]], pad_token_id: int) -> Dict[str, Any]:
         "graph_density": torch.stack([b["graph_density"] for b in batch]),
         "coverage": torch.stack([b["coverage"] for b in batch]),
         "semantic_entropy": torch.stack([b["semantic_entropy"] for b in batch]),
+        "cite_any": torch.stack([b["cite_any"] for b in batch]),
+        "cite_match": torch.stack([b["cite_match"] for b in batch]),
     }
 
 
@@ -696,6 +732,8 @@ def run_phase2(cfg: Phase2Config) -> Dict[str, Any]:
             density = batch["graph_density"].to(cfg.device)
             coverage = batch["coverage"].to(cfg.device)
             entropy_real = batch["semantic_entropy"].to(cfg.device)
+            cite_any = batch["cite_any"].to(cfg.device)
+            cite_match = batch["cite_match"].to(cfg.device)
 
             outputs = base(input_ids=input_ids, attention_mask=attention)
             last_hidden = _last_nonpad_hidden(outputs.last_hidden_state, attention)  # fix #4
@@ -706,7 +744,9 @@ def run_phase2(cfg: Phase2Config) -> Dict[str, Any]:
             # ``coverage`` now carries the continuous per-step link_confidence
             # (Finding 2), NOT a thresholded copy of the calibration target.
             link_confidence = coverage.clamp(0.0, 1.0)
-            alpha = alpha_gate(density, link_confidence, entropy_real)
+            alpha = alpha_gate(
+                density, link_confidence, entropy_real, cite_any, cite_match
+            )
             # Non-degenerate target (fix #2): calibrate α toward "the KG renders a
             # verdict on this step" = label is not NEUTRAL. This is independent of
             # the three gate inputs, so the gate can no longer trivially copy a

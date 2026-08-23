@@ -14,7 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
-from kgproweight.retrieval.hybrid import build_flashrag_config
+from kgproweight.retrieval.hybrid import DEFAULT_TOPK, build_flashrag_config
+from flashrag.utils.pred_parse import ircot_pred_parse
 
 RunMode = Literal["standard", "naive"]
 
@@ -35,10 +36,18 @@ def corag_extract_answer(dataset):
 
 
 def r1_extract_answer(dataset):
-    """R1-Searcher pred processing: extract content inside <answer> tags."""
+    """R1-Searcher pred processing: extract content inside <answer> tags.
+
+    The raw generation is a reasoning chain (prompt ends in ``<think>``) followed
+    by ``<answer>…</answer>``. ``Item.__setattr__`` routes ``item.pred`` into
+    ``output["pred"]``, so overwriting ``pred`` destroys the chain. Preserve the
+    full chain in ``output["raw_pred"]`` so the IHR judge can score the reasoning
+    steps even though EM/F1 score only the extracted answer.
+    """
     import re
     for item in dataset:
         pred = getattr(item, "pred", "") or ""
+        item.output["raw_pred"] = pred
         # Try <answer>...</answer> first
         m = re.search(r"<answer>\s*(.*?)\s*</answer>", pred, re.DOTALL | re.IGNORECASE)
         if m:
@@ -69,6 +78,7 @@ class BaselineSpec:
     user_prompt: Optional[str] = None
     use_kg_retrieval: bool = False
     extras: Dict[str, Any] = field(default_factory=dict)
+    pipeline_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 
 BASELINES: List[BaselineSpec] = [
@@ -101,6 +111,15 @@ BASELINES: List[BaselineSpec] = [
         pipeline_module="flashrag.pipeline.active_pipeline",
         generator_model="llama3-8B-instruct",
         is_reasoning=True,
+        # IRCOT generates one sentence per iteration (stop=['.', '\n']) and needs
+        # enough rounds to reach the "So the answer is:" marker on multi-hop
+        # questions. The stock default (max_iter=2) yields 2 single sentences and
+        # never reaches the answer, so we raise it.
+        pipeline_kwargs={"max_iter": 6},
+        # The runner passes pred_process_fun=None (overriding IRCOT's default),
+        # which would score EM on the full reasoning chain. Force the parser so
+        # only the text after "So the answer is[:]" is scored.
+        extras={"pred_process_fun": ircot_pred_parse},
     ),
     BaselineSpec(
         name="r1_searcher",
@@ -115,7 +134,7 @@ BASELINES: List[BaselineSpec] = [
         user_prompt="Reference passages:\n{reference}\n\nQuestion: {question}\n\n<think>",
         extras={
             "pred_process_fun": r1_extract_answer,
-            "generation_params": {"max_tokens": 1024, "temperature": 0.6, "top_p": 0.9},
+            "generation_params": {"max_tokens": 1024, "temperature": 0.0, "do_sample": False},
         },
     ),
     BaselineSpec(
@@ -150,6 +169,7 @@ def baseline_config(
     test_sample_num: Optional[int] = None,
     seed: int = 42,
     gpu_id: str = "0",
+    topk: int = DEFAULT_TOPK,
 ) -> Dict[str, Any]:
     """Build a FlashRAG config dict for one baseline run."""
     cfg = build_flashrag_config(
@@ -160,11 +180,21 @@ def baseline_config(
         pipeline_class=spec.pipeline_class,
         generator_model=spec.generator_model,
         framework=spec.framework,
+        topk=topk,
         split=split,
         test_sample_num=test_sample_num,
         seed=seed,
         gpu_id=gpu_id,
         is_reasoning=spec.is_reasoning,
     )
-    cfg.update(spec.extras)
+    # Merge extras, but deep-merge ``generation_params`` so a baseline that only
+    # sets ``do_sample`` (e.g. rearag) does not clobber the config's ``max_tokens``
+    # / ``temperature`` defaults. A missing ``max_tokens`` makes HF `generate()`
+    # fall back to `max_length=20`, truncating the ~300-token ReaRAG prompt to
+    # nothing and yielding "No valid answer found".
+    for key, val in spec.extras.items():
+        if key == "generation_params" and isinstance(val, dict):
+            cfg.setdefault("generation_params", {}).update(val)
+        else:
+            cfg[key] = val
     return cfg

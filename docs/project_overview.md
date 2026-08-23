@@ -220,7 +220,7 @@ python scripts/eval/run_kg_proweight.py \
 ```bash
 python scripts/eval/run_ihr_judge.py \
   --predictions <intermediate_data.json> \
-  --judge_model deepseek-chat --sample 50
+  --judge_model deepseek-v4-pro --sample 50
 ```
 
 ---

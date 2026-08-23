@@ -28,7 +28,16 @@ def parse_args():
     p.add_argument("--predictions", required=True, help="Path to FlashRAG intermediate_data.json (or list of preds).")
     p.add_argument("--sample", type=int, default=200, help="Number of items to judge.")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--judge_model", default="gpt-4o-2024-08-06")
+    # 2026-08-22 (retraining_plan §13-2): no default. It used to be
+    # gpt-4o-2024-08-06 while every baseline script defaulted to deepseek-v4-pro,
+    # so omitting the flag silently judged the main method with a DIFFERENT judge
+    # than the baselines it is compared against -- an incomparable number that
+    # raises nothing. Required, so a missing flag is an error instead.
+    p.add_argument("--judge_model", required=True,
+                   help="Judge model id. MUST match the judge used for the "
+                        "baselines being compared against (run_baseline_ihr.py "
+                        "uses deepseek-v4-pro). IHR numbers from different judges "
+                        "are not comparable (AGENTS.md §5).")
     p.add_argument("--output", default=None)
     p.add_argument(
         "--human_csv",

@@ -1,5 +1,8 @@
 # KG-ProWeight 实验操作指南（中文 · Python 命令版）
 
+> ⚠️ **口径快照 (2026-08-18)**: 本指南的操作流程仍可用，但 Teacher / IHR Judge / PPO 超参等数值口径
+> 以 [paper_design_new.md](paper_design_new.md) + [10_口径统一清单.md](paper/10_口径统一清单.md) + 当前代码为准。
+
 > 目标硬件：**NVIDIA RTX PRO 6000 Blackwell 96GB（bf16）**。  
 > 本文是从零复现实验的标准流程，所有步骤均使用 `python` 命令（不使用 `make` / `.sh`）。
 

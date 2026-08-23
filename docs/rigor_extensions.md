@@ -1,5 +1,8 @@
 # Rigour Extensions
 
+> ⚠️ **口径快照 (2026-08-18)**: 下方 "GPT-4o LLM-as-Judge IHR" 的实际评判模型为 **deepseek-v4-pro**；
+> 其余 Teacher / 超参口径以 [paper_design_new.md](paper_design_new.md) + [10_口径统一清单.md](paper/10_口径统一清单.md) 为准。
+
 The paper's experimental design (paper_design.md §5–§7) requires several
 analyses that the legacy `kg2` code base does not implement. This document
 describes each extension, the script that produces it, and the artefact it

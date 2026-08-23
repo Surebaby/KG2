@@ -2,28 +2,50 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import requests
 from rapidfuzz import fuzz
 from rapidfuzz import process as rfprocess
 
+import os as _os
+
 from kgproweight.kg.cache import EntityCache
 from kgproweight.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-WIKIDATA_SEARCH_URL = "https://www.wikidata.org/w/api.php"
+# R9 v6: support reverse proxy for firewalled environments.
+# Set KGPW_WIKIDATA_PROXY to the proxy base URL (e.g. https://proxy.example.com).
+# Set KGPW_WIKIDATA_PROXY_TOKEN to the X-Proxy-Token header value.
+_WIKIDATA_PROXY_BASE = _os.getenv("KGPW_WIKIDATA_PROXY_BASE", "").rstrip("/")
+_WIKIDATA_PROXY_TOKEN = _os.getenv("KGPW_WIKIDATA_PROXY_TOKEN", "")
+
+if _WIKIDATA_PROXY_BASE:
+    _WIKIDATA_BASE_URL = f"{_WIKIDATA_PROXY_BASE}/https://www.wikidata.org"
+else:
+    _WIKIDATA_BASE_URL = "https://www.wikidata.org"
+
+WIKIDATA_SEARCH_URL = f"{_WIKIDATA_BASE_URL}/w/api.php"
 WIKIDATA_USER_AGENT = "KGProWeight/1.0 (research; contact: anonymous@example.com)"
 REQUEST_DELAY = 0.5
+
+# Build default proxy headers once at import time
+DEFAULT_PROXY_HEADERS: Dict[str, str] = {}
+if _WIKIDATA_PROXY_TOKEN:
+    DEFAULT_PROXY_HEADERS["X-Proxy-Token"] = _WIKIDATA_PROXY_TOKEN
 
 # Negative QID types for entity linking
 _DISAMBIGUATION_QIDS: set[str] = {"Q4167410", "Q11266439", "Q13406463"}  # disambiguation, list, category
 _NEGATIVE_DESCRIPTIONS: set[str] = {
     "wikimedia disambiguation page", "wikimedia category", "wikimedia list",
     "wikimedia template", "wikipedia disambiguation page", "wikipedia category",
+    "wikimedia permanent duplicate item", "wikimedia duplicated page",
+    "wikimedia internal item", "wikimedia article covering multiple topics",
 }
 
 # Known problematic entity overrides (emergency patch only)
@@ -51,6 +73,44 @@ _KNOWN_FIXES: Dict[str, Dict[str, str]] = {
 
 def _clean(label: str) -> str:
     return re.sub(r"\s+", " ", label.strip().lower())
+
+
+def build_passage_titles(passages) -> List[str]:
+    """Extract (title/id) strings from retrieved passages for title-support.
+
+    Mirrors the ``id``/``title`` fallback used elsewhere (``filter_by_passage_support``,
+    the inference pipeline) so every consumer reads the same field.
+    """
+    titles: List[str] = []
+    for p in list(passages or []):
+        if isinstance(p, dict):
+            title = p.get("id") or p.get("title") or ""
+        elif isinstance(p, str):
+            title = p
+        else:
+            continue
+        if title:
+            titles.append(str(title))
+    return titles
+
+
+def build_passage_text(passages, max_n: int = 10) -> str:
+    """Concatenate top-N retrieved passages (title + content) into one block.
+
+    Used as the linker's disambiguation context. Reads the same
+    ``contents``/``text`` + ``id``/``title`` fields as
+    ``filter_by_passage_support`` so the linker's context signal and the KG
+    filter's evidence check see the same text.
+    """
+    blocks: List[str] = []
+    for p in list(passages or [])[:max_n]:
+        if isinstance(p, dict):
+            content = p.get("contents") or p.get("text") or ""
+            title = p.get("id") or p.get("title") or ""
+            blocks.append(f"{title} {content}".strip())
+        elif isinstance(p, str):
+            blocks.append(p)
+    return " ".join(b for b in blocks if b).strip()
 
 
 @dataclass
@@ -95,6 +155,7 @@ class EntityLinker:
         genre_model_path: Optional[str] = None,
         request_delay: float = REQUEST_DELAY,
         offline: bool = False,
+        entity_index_path: Optional[str] = None,
     ) -> None:
         self.cache = EntityCache(cache_path)
         self.confidence_threshold = confidence_threshold
@@ -107,6 +168,27 @@ class EntityLinker:
         self._genre = None
         if use_genre:
             self._genre = self._try_load_genre(genre_model_path)
+
+        # R9 v7: offline candidate descriptions (label → [{qid, label, description}]).
+        # When offline, _search_candidates returns these instead of [] so
+        # _score_candidates can still disambiguate against passage context.
+        self._entity_index: Dict[str, List[dict]] = {}
+        if entity_index_path is None:
+            try:
+                from kgproweight.retrieval.bootstrap import resolve_entity_desc_index_path
+                entity_index_path = resolve_entity_desc_index_path()
+            except Exception:
+                entity_index_path = None
+        if entity_index_path and Path(entity_index_path).exists():
+            try:
+                self._entity_index = json.loads(
+                    Path(entity_index_path).read_text(encoding="utf-8"))
+                logger.info("Loaded %d-label entity desc index from %s",
+                            len(self._entity_index), entity_index_path)
+            except Exception as exc:
+                logger.warning("Failed to load entity desc index %s: %s",
+                               entity_index_path, exc)
+                self._entity_index = {}
 
     # ------------------------------------------------------------------
     # Optional GENRE backend
@@ -155,7 +237,7 @@ class EntityLinker:
             "format": "json",
             "limit": 5,
         }
-        headers = {"User-Agent": WIKIDATA_USER_AGENT}
+        headers = {"User-Agent": WIKIDATA_USER_AGENT, **DEFAULT_PROXY_HEADERS}
         try:
             resp = requests.get(WIKIDATA_SEARCH_URL, params=params, headers=headers, timeout=10)
             resp.raise_for_status()
@@ -168,10 +250,32 @@ class EntityLinker:
             logger.warning("Wikidata search failed for '%s': %s", mention, exc)
         return None
 
+    def _local_candidates(self, mention: str) -> List[LinkCandidate]:
+        """Candidates reconstructed from the offline desc index (label → QID list).
+
+        Descriptions are surface strings built from 1-hop subgraph relations, so
+        they are lexical (not free-text) — still sufficient for the linker's
+        word-overlap passage-support term to separate shared surface forms.
+        """
+        label = _clean(mention)
+        entries = self._entity_index.get(label)
+        if not entries:
+            return []
+        return [
+            LinkCandidate(
+                qid=e["qid"],
+                label=e.get("label", mention),
+                description=e.get("description", ""),
+            )
+            for e in entries
+        ]
+
     def _search_candidates(self, mention: str, lang: str = "en") -> List[LinkCandidate]:
         """Return top-10 Wikidata candidates with descriptions for context scoring."""
         if self.offline:
-            return []
+            # R9 v7: no network — reconstruct candidates from the local desc
+            # index so context scoring still runs and can disambiguate.
+            return self._local_candidates(mention)
         params = {
             "action": "wbsearchentities",
             "search": mention,
@@ -180,7 +284,7 @@ class EntityLinker:
             "limit": 10,
             "props": "",
         }
-        headers = {"User-Agent": WIKIDATA_USER_AGENT}
+        headers = {"User-Agent": WIKIDATA_USER_AGENT, **DEFAULT_PROXY_HEADERS}
         try:
             resp = requests.get(WIKIDATA_SEARCH_URL, params=params, headers=headers, timeout=10)
             resp.raise_for_status()
@@ -210,36 +314,44 @@ class EntityLinker:
         question: str,
         expected_types: Optional[List[str]] = None,
         retrieved_titles: Optional[List[str]] = None,
+        passage_text: Optional[str] = None,
     ) -> List[LinkCandidate]:
         """Score Wikidata candidates with full context (R9 v6, per §3.2).
 
-        score = 0.30 * mention_match
-              + 0.30 * context_description_similarity
+        R9 v7 rebalance: retrieved passage *content* is the strongest
+        disambiguation signal for ambiguous surface forms ("Evolution" film vs
+        GNOME software), so a dedicated passage-support term replaces the weak
+        "longer labels are better" coherence prior.
+
+        score = 0.25 * mention_match
+              + 0.20 * context_description_similarity
               + 0.20 * type_compatibility
-              + 0.10 * retrieved_title_support
-              + 0.10 * entity_coherence
+              + 0.20 * passage_support
+              + 0.15 * retrieved_title_support
         """
         q_lower = question.lower()
         m_lower = mention.lower()
         title_set = set(t.lower() for t in (retrieved_titles or []))
+        passage_lower = (passage_text or "").lower()
+        passage_words = set(passage_lower.split()) if passage_lower else set()
 
         for c in candidates:
             score = 0.0
             label_lower = c.label.lower()
             desc_lower = c.description.lower()
-
-            # mention_match (0.30)
-            if label_lower == m_lower:
-                score += 0.30
-            elif m_lower in label_lower or label_lower in m_lower:
-                score += 0.20
-
-            # context_description_similarity (0.30)
             desc_words = set(desc_lower.split())
+
+            # mention_match (0.25)
+            if label_lower == m_lower:
+                score += 0.25
+            elif m_lower in label_lower or label_lower in m_lower:
+                score += 0.15
+
+            # context_description_similarity (0.20)
             q_words = set(q_lower.split())
             overlap = desc_words & q_words
             if overlap:
-                score += 0.30 * min(1.0, len(overlap) / max(1, len(desc_words)))
+                score += 0.20 * min(1.0, len(overlap) / max(1, len(desc_words)))
 
             # type_compatibility (0.20): expected_types OR question-based inference
             type_hit = False
@@ -262,15 +374,26 @@ class EntityLinker:
             if type_hit:
                 score += 0.20
 
-            # retrieved_title_support (0.10)
-            if title_set and label_lower in title_set:
-                score += 0.10
+            # passage_support (0.20): candidate grounded in the retrieved passage
+            # body. For ambiguous surface forms the label is SHARED across
+            # candidates ("Evolution" film vs GNOME software), so the label is
+            # uninformative and the description ("...film..." vs "...software...")
+            # is the real disambiguator — matched against the body, not the title.
+            if passage_words:
+                p_support = 0.0
+                if desc_words:
+                    overlap = desc_words & passage_words
+                    p_support = min(1.0, len(overlap) / max(1, len(desc_words)))
+                # Multi-word label appearing in the body is a strong anchor
+                # (title support only checks exact title match; this catches
+                # "Big Stone Gap" mentioned inside a passage).
+                if len(label_lower.split()) >= 2 and label_lower in passage_lower:
+                    p_support = max(p_support, 0.8)
+                score += 0.20 * p_support
 
-            # entity_coherence (0.10): longer, more specific labels are better
-            if " " in c.label.strip() and len(c.label.strip()) > 8:
-                score += 0.05
-            if c.description and len(c.description) > 20:
-                score += 0.05
+            # retrieved_title_support (0.15)
+            if title_set and label_lower in title_set:
+                score += 0.15
 
             # Negative rules: disambiguation, category, list
             if c.qid in _DISAMBIGUATION_QIDS:
@@ -315,11 +438,14 @@ class EntityLinker:
         question: str = "",
         expected_types: Optional[List[str]] = None,
         retrieved_titles: Optional[List[str]] = None,
+        passage_text: Optional[str] = None,
     ) -> LinkResult:
         """Link a mention to Wikidata QID with full context (R9 v6).
 
         Returns LinkResult with score/margin/abstain/candidates.
         Backward compatible: callers using only mention get old behavior.
+        ``passage_text`` (concatenated retrieved passage bodies) is the primary
+        disambiguation context for ambiguous surface forms.
         """
         clean = _clean(mention)
 
@@ -340,11 +466,12 @@ class EntityLinker:
 
         # Build candidates
         candidates = self._search_candidates(mention)
-        if candidates and question:
+        if candidates and (question or passage_text or retrieved_titles or expected_types):
             candidates = self._score_candidates(
                 mention, candidates, question,
                 expected_types=expected_types,
                 retrieved_titles=retrieved_titles,
+                passage_text=passage_text,
             )
 
         if not candidates:
