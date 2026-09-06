@@ -1,0 +1,9 @@
+# Human-authorized complete A-smoke600 from the ORIGINAL Strong SFT.
+# Same science/guard as the frozen parent600; only gate/output paths differ.
+# Fresh health remains FAIL. This does not authorize matched controls or full PPO.
+includes:
+- phase3_ppo_mixed4_answer_format_v2_a_smoke_seed42.yaml
+training:
+  output_dir: outputs/ppo_mixed4_answer_format_v2_a_smoke600_scoped_seed42_20260906_v1
+  ppo:
+    source_gate_calibration_path: outputs/calibration/source_credit_gate_v2_smoke600_scoped_20260906_v1/gate.json

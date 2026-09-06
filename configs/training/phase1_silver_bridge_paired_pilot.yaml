@@ -1,0 +1,14 @@
+includes:
+  - phase1_silver.yaml
+
+# Paired control/additive-v3 Teacher pilot. The launcher passes bridge_mode
+# explicitly for each arm; all other fields remain identical.
+training:
+  silver_data:
+    teacher_temperature: 0.0
+    max_workers: 4
+    retrieval_top_k: 100
+    bridge_mode: "off"
+    bridge_first_round_topk: 5
+    bridge_max_queries: 2
+    bridge_only_k: 50

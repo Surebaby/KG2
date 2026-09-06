@@ -1,0 +1,8 @@
+includes:
+  - phase2_prm.yaml
+
+# Frozen Phase 2 recovery baseline over the strict quota70 legacy repair.
+training:
+  silver_path: data/silver_data/silver_legacy_repaired_v2_quota70_hotpot_train.jsonl
+  output_dir: checkpoints/prm_alpha_gate_legacy_repaired_v2_quota70_hard_seed42_no_text_head
+  alpha_target: hard_verdict

@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 from typing import Any, Dict, List
 
 from kgproweight.config import ProjectConfig, load_config
+from kgproweight.config.schemas import SilverDataConfig
 from kgproweight.data.flashrag_loader import flashrag_config
 from kgproweight.kg.entity_linker import EntityLinker
 from kgproweight.kg.wikidata_retriever import WikidataSubgraphRetriever
@@ -25,6 +27,7 @@ from kgproweight.training.phase1_distill import (
     Phase1Config,
     StratifiedSilverFilter,
     TeacherClient,
+    phase1_candidate_path,
     run_phase1,
 )
 from kgproweight.utils.flashrag_bootstrap import setup_flashrag
@@ -41,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default=None, help="YAML config (see configs/training/phase1_silver.yaml).")
     p.add_argument("--dataset", default="hotpotqa")
     p.add_argument("--split", default="train")
-    p.add_argument("--max_queries", type=int, default=25000)
+    p.add_argument("--max_queries", type=int, default=None)
     p.add_argument("--max_workers", type=int, default=8)
     # 2026-08-22 (retraining_plan §11): default removed. It read
     # "deepseek-v4-flash", but that value is only reachable in the no---config
@@ -59,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume", action="store_true", help="Skip ids already present in the output file.")
     p.add_argument(
+        "--sample_strategy", choices=["first", "random"], default="first",
+        help="How to choose max_queries from the source split. Formal rebuilds "
+             "and pilots should use deterministic random sampling; 'first' is "
+             "kept only for backward-compatible reproduction.",
+    )
+    p.add_argument(
         "--offline",
         choices=["auto", "on", "off"],
         default="auto",
@@ -67,6 +76,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--rerank", type=int, default=0,
                    help="Enable cross-encoder rerank after RRF (e.g. --rerank 10)")
+    p.add_argument(
+        "--bridge_mode",
+        choices=["off", "additive_v3"],
+        default=None,
+        help="Experimental Phase-1 bridge fusion; default comes from config and is off.",
+    )
     p.add_argument("--allow_eval_split", action="store_true",
                    help="Acknowledge generating silver data from a dev/test split "
                         "(pipeline smoke tests only — output must NOT be trained on).")
@@ -114,7 +129,28 @@ def _check_split_leakage(dataset_name: str, split: str, allow: bool) -> None:
     logger.warning("EVAL-SPLIT LEAKAGE ACKNOWLEDGED: %s", msg)
 
 
-def _load_items(dataset_name: str, split: str, max_queries: int, resume_path: Path | None = None) -> List[Dict[str, Any]]:
+def _select_items(
+    items: List[Dict[str, Any]], max_queries: int, strategy: str, seed: int
+) -> List[Dict[str, Any]]:
+    """Select a stable source subset before applying resume filtering."""
+    if max_queries >= len(items):
+        return list(items)
+    if strategy == "first":
+        return items[:max_queries]
+    if strategy == "random":
+        return random.Random(seed).sample(items, max_queries)
+    raise ValueError(f"Unknown sample strategy: {strategy!r}")
+
+
+def _load_items(
+    dataset_name: str,
+    split: str,
+    max_queries: int,
+    resume_path: Path | None = None,
+    *,
+    sample_strategy: str = "first",
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
     src = Path(data_dir()) / dataset_name / f"{split}.jsonl"
     if not src.exists():
         raise FileNotFoundError(f"{src} missing — run scripts/prepare/03_download_datasets.py")
@@ -141,12 +177,11 @@ def _load_items(dataset_name: str, split: str, max_queries: int, resume_path: Pa
             except json.JSONDecodeError:
                 continue
             qid = str(obj.get("id", ""))
-            if qid in seen_ids:
-                continue
             items.append(obj)
-            if len(items) >= max_queries:
-                break
-    return items
+    selected = _select_items(items, max_queries, sample_strategy, seed)
+    # Select FIRST, then remove completed ids. Otherwise a resumed random run
+    # draws a different subset and is no longer the same experiment.
+    return [obj for obj in selected if str(obj.get("id") or obj.get("qid") or "") not in seen_ids]
 
 
 def main() -> None:
@@ -173,6 +208,12 @@ def main() -> None:
             max_steps=silver.max_steps,
         )
         retrieval_top_k = silver.retrieval_top_k
+        max_kg_triples = silver.max_kg_triples
+        min_kg_keep = silver.min_kg_keep
+        bridge_mode = args.bridge_mode or silver.bridge_mode
+        bridge_first_round_topk = silver.bridge_first_round_topk
+        bridge_max_queries = silver.bridge_max_queries
+        bridge_only_k = silver.bridge_only_k
     else:
         if not args.teacher:
             raise SystemExit(
@@ -182,17 +223,35 @@ def main() -> None:
         teacher_model = args.teacher
         teacher_backend = args.teacher_backend
         temperature = args.temperature
-        max_queries = args.max_queries
+        max_queries = args.max_queries if args.max_queries is not None else 25000
         max_workers = args.max_workers
         out_path = args.output or str(Path(data_dir()) / "silver_data" / "silver_trajectories.jsonl")
         accept = StratifiedSilverFilter()
         retrieval_top_k = DEFAULT_TOPK
+        # Same defaults as SilverDataConfig so the two branches cannot drift.
+        max_kg_triples = SilverDataConfig.model_fields["max_kg_triples"].default
+        min_kg_keep = SilverDataConfig.model_fields["min_kg_keep"].default
+        bridge_mode = args.bridge_mode or SilverDataConfig.model_fields["bridge_mode"].default
+        bridge_first_round_topk = SilverDataConfig.model_fields[
+            "bridge_first_round_topk"
+        ].default
+        bridge_max_queries = SilverDataConfig.model_fields["bridge_max_queries"].default
+        bridge_only_k = SilverDataConfig.model_fields["bridge_only_k"].default
 
     out_p = Path(out_path)
     if args.resume:
-        items = _load_items(args.dataset, args.split, max_queries, resume_path=out_p)
+        resume_path = phase1_candidate_path(out_p)
+        if not resume_path.exists():
+            resume_path = out_p
+        items = _load_items(
+            args.dataset, args.split, max_queries, resume_path=resume_path,
+            sample_strategy=args.sample_strategy, seed=args.seed,
+        )
     else:
-        items = _load_items(args.dataset, args.split, max_queries)
+        items = _load_items(
+            args.dataset, args.split, max_queries,
+            sample_strategy=args.sample_strategy, seed=args.seed,
+        )
 
     retriever = _build_retriever(args.dataset, topk=retrieval_top_k)
 
@@ -252,12 +311,32 @@ def main() -> None:
         kg_retriever=kg_retr,
         prm_annotator=annotator,
         top_k=retrieval_top_k,
-        max_kg_triples=50,
+        # Was hardcoded 50, so training.silver_data.max_kg_triples in the YAML
+        # was read by nobody (SilverDataConfig has extra="allow", so the key was
+        # accepted into model_extra and dropped -- the ppo_max_kg_triples trap).
+        max_kg_triples=max_kg_triples,
+        min_kg_keep=min_kg_keep,
         rerank_topk=args.rerank,
+        bridge_mode=bridge_mode,
+        bridge_first_round_topk=bridge_first_round_topk,
+        bridge_max_queries=bridge_max_queries,
+        bridge_only_k=bridge_only_k,
         max_workers=max_workers,
         accept_filter=accept,
         seed=args.seed,
         teacher_temperature=temperature,
+        extra_metadata={
+            "source_dataset": args.dataset,
+            "source_split": args.split,
+            "sample_strategy": args.sample_strategy,
+            "sample_seed": args.seed,
+            "retrieval_bridge_mode": bridge_mode,
+            "retrieval_rrf_candidate_topk": retrieval_top_k,
+            "retrieval_rerank_topk": args.rerank,
+            "bridge_first_round_topk": bridge_first_round_topk,
+            "bridge_max_queries": bridge_max_queries,
+            "bridge_only_k": bridge_only_k,
+        },
     )
     stats = run_phase1(phase_cfg)
     logger.info("Phase 1 stats: %s", stats)

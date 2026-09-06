@@ -16,7 +16,11 @@ def resolve_corpus_path(explicit: Optional[str] = None) -> str:
     env = os.environ.get("KGPW_CORPUS_PATH")
     if env:
         return str(Path(env).expanduser())
-    return str(index_dir() / "corpus_flashrag.jsonl")
+    default = index_dir() / "corpus_flashrag.jsonl"
+    if default.exists():
+        return str(default)
+    full_wiki18 = project_root() / "indexes_wiki18" / "corpus_flashrag.jsonl"
+    return str(full_wiki18 if full_wiki18.exists() else default)
 
 
 def resolve_dense_index_path(explicit: Optional[str] = None) -> str:
@@ -25,7 +29,11 @@ def resolve_dense_index_path(explicit: Optional[str] = None) -> str:
     env = os.environ.get("KGPW_DENSE_INDEX_PATH")
     if env:
         return str(Path(env).expanduser())
-    return str(index_dir() / "e5_Flat.index")
+    default = index_dir() / "e5_Flat.index"
+    if default.exists():
+        return str(default)
+    full_wiki18 = project_root() / "indexes_wiki18" / "e5_fp16.dat"
+    return str(full_wiki18 if full_wiki18.exists() else default)
 
 
 def resolve_bm25_index_path(explicit: Optional[str] = None) -> str:
@@ -34,7 +42,11 @@ def resolve_bm25_index_path(explicit: Optional[str] = None) -> str:
     env = os.environ.get("KGPW_BM25_INDEX_PATH")
     if env:
         return str(Path(env).expanduser())
-    return str(index_dir() / "bm25")
+    default = index_dir() / "bm25"
+    if default.exists():
+        return str(default)
+    full_wiki18 = project_root() / "indexes_wiki18" / "bm25"
+    return str(full_wiki18 if full_wiki18.exists() else default)
 
 
 def resolve_kg_cache_dir(explicit: Optional[str] = None) -> str:

@@ -1,0 +1,15 @@
+# Experiment ID: ppo_mixed3_rearag_runtime_probe_v2_tk_eligible_k4_seed42
+# GPU runtime wiring probe only; not a training/effect experiment.
+includes:
+  - phase3_ppo_mixed3_rearag_v1_text_kg_v2_1_7200_seed42.yaml
+
+training:
+  silver_path: data/silver_data/mixed3_rearag_runtime_wiring_probe_v2_seed42/ppo_tk_eligible_k4/silver_train.jsonl
+  question_kg_records_path: data/silver_data/mixed3_rearag_runtime_wiring_probe_v2_seed42/ppo_tk_eligible_k4/question_kg_records.jsonl
+  rollout_sampling_weights_path: data/silver_data/mixed3_rearag_runtime_wiring_probe_v2_seed42/ppo_tk_eligible_k4/sampling_weights.jsonl
+  fixed_rollout_schedule_path: data/silver_data/mixed3_rearag_runtime_wiring_probe_v2_seed42/ppo_tk_eligible_k4/fixed_rollout_schedule.jsonl
+  output_dir: outputs/ppo_mixed3_rearag_runtime_probe_v2_tk_eligible_k4_seed42
+  ppo:
+    total_ppo_steps: 4
+    save_every_steps: 4
+

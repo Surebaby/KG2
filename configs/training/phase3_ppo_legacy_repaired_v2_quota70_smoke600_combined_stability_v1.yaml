@@ -1,0 +1,50 @@
+includes:
+  - phase3_ppo_legacy_repaired_v2_quota70_smoke600_explicit_sft_ref.yaml
+
+# MULTI-VARIABLE COMBINATION SMOKE (researcher-approved 2026-08-27).
+#
+# This run deliberately combines the failure-directed changes below to avoid
+# paying for a sequence of one-variable GPU smokes.  It can answer whether the
+# package is jointly sufficient, but any gain MUST NOT be attributed to one
+# component without a later ablation.
+#
+# Evidence from the explicit-SFT-reference smoke:
+# - 23.3% tail length-cap; 16/200 greedy answers ended after token 256;
+# - correct-reference tail/final sequence KL ~=7.4/8.4, so target=40 was stale;
+# - critic EV tail=-1.23 with value std comparable to return std;
+# - 10% matched full-trajectory replay was delivered exactly and is retained.
+training:
+  output_dir: outputs/ppo_legacy_repaired_v2_quota70_hard_seed42_no_text_head_smoke600_combined_stability_v1
+  ppo:
+    # Preserve more complete 3-step traces. Prompt max was measured at 4,255,
+    # so 4,255+384 remains below the 6,144 input budget; chunk stays at four.
+    max_new_tokens: 384
+
+    # Correct-reference KL is in sequence-sum units.  Start with a stronger
+    # SFT pullback, and target the observed healthy boundary instead of the
+    # obsolete bare-base-reference regime around 40.
+    kl_coef: 0.25
+    target_kl: 8.0
+
+    # Critic repair: start from V(s)=0, remove value-only dropout noise, and give
+    # each rollout batch two fitted passes.  vf_coef remains the standard 0.5;
+    # changing it as well would risk value gradients dominating shared LoRA.
+    value_head_init: zero
+    value_head_dropout: 0.0
+    ppo_epochs: 2
+    vf_coef: 0.5
+
+    # Retain the researcher-requested anti-forgetting replay unchanged.
+    sft_replay_ratio: 0.10
+    sft_anchor_weight: 0.10
+    sft_anchor_interval: 0
+
+    # Cost guard: start after 200 trajectories (50 updates), aggregate 15
+    # updates (=60 rollouts), and stop only on a clearly failed regime. FAILED
+    # runs keep history/checkpoints/manifest. These are stop rules, not pass
+    # criteria; completing 600 trajectories still requires held-out validation.
+    health_guard_after_steps: 200
+    health_guard_window: 15
+    health_guard_min_valid_rate: 0.50
+    health_guard_max_length_capped_frac: 0.50
+    health_guard_max_mean_kl: 20.0

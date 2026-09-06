@@ -1,0 +1,10 @@
+# Three dataset groups, K4 each, to exercise both source states plus one replay.
+# Experiment ID: ppo_mixed4_emf1_v1_outcome_probe12_seed42
+includes:
+  - phase3_ppo_mixed4_emf1_v1_outcome_seed42.yaml
+training:
+  output_dir: outputs/ppo_mixed4_emf1_v1_outcome_probe12_seed42
+  fixed_rollout_schedule_path: outputs/audits/ppo_mixed4_emf1_v1_seed42/probe12_schedule.jsonl
+  ppo:
+    total_ppo_steps: 12
+    save_every_steps: 12

@@ -269,3 +269,15 @@ t=0 对 CoRAG 有提升（2wiki 0.13→0.29），对其他模型影响轻微。
 ---
 
 *文件生成: 2026-07-16 | 数据来源: `docs/baselines.md` + `outputs/R9_v3_final_eval/` + `outputs/_baselines/`*
+
+## 九、2026-09-04 append-only 状态更正
+
+第八节中“IRCoT (trace)失败”只描述2026-07-16时的旧状态，现已被后续rerank-10运行取代；不得再引用为
+当前结论。三数据集n=300结果和逐题产物已存在，权威汇总见`docs/paper/baseline_results.md`：HotpotQA、
+2Wiki、MuSiQue的EM分别为`.3767/.3533/.2267`，F1为`.4997/.4633/.3434`。
+
+同时，后续只读预算核查发现，这个FlashRAG trace是IRCoT-style历史系统参考而非论文忠实复现，也不是
+固定top-10的matched control。逐题最终累计`retrieval_result`长度为Hotpot 11–67（均值26.19）、2Wiki
+11–69（28.74）、MuSiQue 12–67（28.64）；超过论文15篇cap的题分别为271/300、266/300、280/300。
+因此旧分数可以保留作系统参考，但新问题拆解实验必须另建同corpus、同query/final-passage/token预算和
+同final reader的对照；不得把trace旧分数直接用于拆解机制因果归因。

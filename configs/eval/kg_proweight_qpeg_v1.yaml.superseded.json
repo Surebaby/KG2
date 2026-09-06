@@ -1,0 +1,8 @@
+{
+  "schema_version": "qpeg-eval-config-status-v1",
+  "status": "DO_NOT_RUN_SUPERSEDED_BEFORE_EVALUATION",
+  "config": "configs/eval/kg_proweight_qpeg_v1.yaml",
+  "reason": "The bound materialization normalized internal question whitespace and can fail exact identity joins. The identity-fixed QPEG-v1.1 subsequently failed the frozen pilot utility gates, so no replacement final evaluation config is promoted.",
+  "confirmation_opened": false,
+  "main_table_result_produced": false
+}

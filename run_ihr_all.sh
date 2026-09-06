@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
-export OPENAI_API_KEY="sk-d48bff8b1c3b4376b849570ab44a3e62"
-export OPENAI_BASE_URL="https://api.deepseek.com"
+: "${OPENAI_API_KEY:?Set OPENAI_API_KEY in the environment; never store it in this script}"
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://api.deepseek.com}"
 cd /root/autodl-tmp/kgpaper
 MODEL="deepseek-v4-pro"
 N=50

@@ -1,0 +1,14 @@
+# Experiment ID: ppo_mixed3_rearag_runtime_probe_v3_proof400_t_noneligible_k4_seed42
+# One K=4 GPU wiring update only; never use as effect/convergence evidence.
+includes:
+  - phase3_ppo_mixed3_rearag_v2_proof400_text7200_seed42.yaml
+
+training:
+  silver_path: data/silver_data/mixed3_rearag_runtime_wiring_probe_v3_proof400_seed42/ppo_t_noneligible_k4/silver_train.jsonl
+  question_kg_records_path: data/silver_data/mixed3_rearag_runtime_wiring_probe_v3_proof400_seed42/ppo_t_noneligible_k4/question_kg_records.jsonl
+  rollout_sampling_weights_path: data/silver_data/mixed3_rearag_runtime_wiring_probe_v3_proof400_seed42/ppo_t_noneligible_k4/sampling_weights.jsonl
+  fixed_rollout_schedule_path: data/silver_data/mixed3_rearag_runtime_wiring_probe_v3_proof400_seed42/ppo_t_noneligible_k4/fixed_rollout_schedule.jsonl
+  output_dir: outputs/ppo_mixed3_rearag_runtime_probe_v3_proof400_t_noneligible_k4_seed42
+  ppo:
+    total_ppo_steps: 4
+    save_every_steps: 4

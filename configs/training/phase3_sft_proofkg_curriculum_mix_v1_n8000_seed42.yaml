@@ -1,0 +1,21 @@
+includes:
+  - phase3_sft.yaml
+
+# Researcher-approved combination smoke (2026-08-29).
+# 4k unchanged Hotpot quota70 replay + 4k balanced 2Wiki gold-derived,
+# train-only Proof-KG curriculum. This is not an automatic-planner experiment.
+training:
+  silver_path: data/silver_data/proofkg_curriculum_mix_v1_n8000_seed42_20260829/silver_curriculum.jsonl
+  question_kg_records_path: data/silver_data/proofkg_curriculum_mix_v1_n8000_seed42_20260829/question_kg_records.jsonl
+  min_question_kg_record_coverage: 1.0
+  require_nonempty_question_kg_records: false
+  sft_init_adapter_path: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+  output_dir: checkpoints/sft_proofkg_curriculum_mix_v1_n8000_seed42
+  # Continued SFT uses a quarter of the original LR to preserve the strong
+  # existing policy while learning exact Proof-KG citation/use behavior.
+  sft_lr: 5.0e-6
+  sft_epochs: 1
+  # This file is already a curated train-only mixture. External dev/test data
+  # remain untouched; do not hash-hold out another 20% of this curriculum.
+  split: null
+  split_allow_none: true

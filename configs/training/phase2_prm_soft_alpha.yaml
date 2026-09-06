@@ -1,0 +1,9 @@
+includes:
+  - phase2_prm.yaml
+
+# Single-variable alpha calibration ablation. Every data/model/split/optimizer
+# setting is inherited from phase2_prm.yaml; only the gate target changes from
+# 1[label_class != NEU] to abs(r_kg) in [0, 1]. The auxiliary 3-way PRM head is
+# unchanged and remains diagnostic-only (PPO does not load it).
+training:
+  alpha_target: soft_abs_rkg

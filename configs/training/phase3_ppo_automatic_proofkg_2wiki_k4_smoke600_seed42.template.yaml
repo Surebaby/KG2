@@ -1,0 +1,47 @@
+includes:
+  - phase3_ppo_legacy_repaired_v2_quota70_smoke600_combined_stability_v1.yaml
+
+# NOT RUNNABLE UNTIL THE TWO VERSIONED INPUTS BELOW ARE MATERIALISED.
+# Combination smoke: automatic Gold-free ProofKG reward + input-conditioned
+# validity + same-question K=4 exploration.  It starts from the original strong
+# quota70 SFT, not either failed ProofKG continued-SFT checkpoint.
+training:
+  silver_path: data/silver_data/automatic_proofkg_2wiki_train_k4_v1/silver_train.jsonl
+  output_dir: outputs/ppo_automatic_proofkg_2wiki_k4_smoke600_seed42
+  sft_checkpoint: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+
+  # Keep the requested 10% anti-forgetting replay, but source it from the
+  # original Hotpot trajectories.  Gold-derived 2Wiki proof traces therefore
+  # cannot leak back through the supervised CE side channel.
+  sft_replay_silver_path: checkpoints/prm_alpha_gate_legacy_repaired_v2_quota70_hard_seed42_no_text_head/silver_with_logprobs.jsonl
+  sft_replay_split: train
+
+  question_kg_index_path: null
+  question_kg_records_path: data/silver_data/automatic_proofkg_2wiki_train_k4_v1/question_kg_records.jsonl
+  min_question_kg_record_coverage: 1.0
+  require_nonempty_question_kg_records: true
+  max_kg_index_miss_rate: 1.0
+  require_exact_kg_index_alignment: false
+
+  # The new silver file must be curated train-only and must exclude every
+  # confirmation/validation qid.  No second split is applied to that frozen file.
+  split: null
+  split_allow_none: true
+
+  # Standard stored passages; no old K=1 rollout schedule can be reused because
+  # K=4 deliberately changes the sampling protocol.
+  passage_overrides_path: null
+  rollout_schedule_path: null
+
+  ppo:
+    proofkg_process_reward: true
+    proofkg_process_weight: 1.0
+    proofkg_f1_weight: 0.10
+    proofkg_dynamic_validity: true
+    proofkg_require_all_eligible: true
+    rollouts_per_prompt: 4
+
+    # Inherited stability controls remain unchanged: batch=4, replay=10%,
+    # kl_coef=0.25, target_kl=8, zero/dropout-free critic, 2 PPO epochs.
+    total_ppo_steps: 600
+    save_every_steps: 200

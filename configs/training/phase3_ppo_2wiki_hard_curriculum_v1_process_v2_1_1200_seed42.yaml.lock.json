@@ -1,0 +1,56 @@
+{
+  "schema_version": "proofkg-hard-curriculum-paired-ppo-lock-1",
+  "experiment_id": "PROOFKG-2WIKI-HARD-V1-PPO-K-V2.1-1200-SEED42",
+  "arm": "process",
+  "config": {
+    "path": "configs/training/phase3_ppo_2wiki_hard_curriculum_v1_process_v2_1_1200_seed42.yaml",
+    "sha256": "5abd10c37f141ff8d2b30a608fc9f796191b41c96773107b2a1c7a70119d05eb"
+  },
+  "tensorboard_dir": "/root/tf-logs/PROOFKG-2WIKI-HARD-V1-PPO-K-V2.1-1200-SEED42",
+  "status": "CONFIGURED_NOT_STARTED",
+  "data_report": {
+    "path": "data/silver_data/automatic_proofkg_2wiki_hard_contrastive_v1/report.json",
+    "sha256": "85e6f7f2e5fa261bc93bdabb5f304bd8a30856855886747aad34396ea6f67e0f"
+  },
+  "inputs": {
+    "silver_train": {
+      "path": "data/silver_data/automatic_proofkg_2wiki_hard_contrastive_v1/silver_train.jsonl",
+      "sha256": "5a52ea04763b2925927d1f0393fd3bd23674db314844d3e7339ccd054f1ce6ac"
+    },
+    "question_kg_records": {
+      "path": "data/silver_data/automatic_proofkg_2wiki_hard_contrastive_v1/question_kg_records.with_execution.jsonl",
+      "sha256": "bf1a2d36e83dd568c8227541996670f9a15ff30769500bb001a6310ccdb069c8"
+    },
+    "sampling_weights": {
+      "path": "data/silver_data/automatic_proofkg_2wiki_hard_contrastive_v1/sampling_weights.jsonl",
+      "sha256": "f0bc0b6316c7c2167144769048b4172438f1b8da020a6edaa00171b10f721744"
+    }
+  },
+  "expected_schedule": {
+    "path": "outputs/audits/2wiki_hard_curriculum_v1_paired_ppo_configs/expected_paired_rollout_schedule.jsonl",
+    "sha256": "94437c9a829b52b3e79a091e456d74886e7298bfaa1508598337fa6ebec36bca"
+  },
+  "expected_schedule_counts": {
+    "recovery": 564,
+    "stability": 636,
+    "unique_qids": 129
+  },
+  "code": {
+    "kgproweight/training/phase3_ppo.py": "f8dc92790d10ff421a1ab5f703ebc9dd03f3221a889aa7a60bbc453be94c20d1",
+    "kgproweight/training/reward_function.py": "91b27b435df33da4d601abef33cbcec7b51ffa1fa6701300c31bcc5cad60e34d",
+    "kgproweight/reward/proofkg_process_v2.py": "1a6eb0861dbff66d687b7597961d27da25645ee79773c2e0cff2e3eac034b43c",
+    "kgproweight/kg/training_question_kg.py": "bc61aef5f254fd9894e5532bb4680b6605c492431e29c7265eabda7e30c2119d",
+    "kgproweight/config/schemas.py": "3a46a98635d8c228168e89a05d7ba25aaac8dff0b0214917b864bc571ab92760",
+    "scripts/train/phase3_ppo.py": "264093f0bc6d81767945b02986623d655aee6657d10748abaa84bfeb06b11f6e"
+  },
+  "sft_adapter": {
+    "path": "checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final/adapter_model.safetensors",
+    "sha256": "7c0be8d6400b637c746dfe18f051cd8b518b23d8f2d960825e565172a1612f24"
+  },
+  "alpha_gate": {
+    "path": "checkpoints/prm_alpha_gate_legacy_repaired_v2_quota70_hard_seed42_no_text_head/alpha_gate.pt",
+    "sha256": "2fb48b5f4835078b75750fd07215dc469ba7e3275c9d9a7a1d9a9f1ed9c2222a"
+  },
+  "single_research_variable": "proofkg_process_reward false (PPO-O) vs true (PPO-K)",
+  "created_at_utc": "2026-09-03T07:54:53.594745+00:00"
+}

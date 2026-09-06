@@ -1,0 +1,24 @@
+includes:
+  - phase3_ppo_legacy_repaired_v2_quota70_smoke600_combined_stability_v1.yaml
+
+# Researcher-approved combination smoke (2026-08-29). It retains every
+# combined_stability setting (explicit SFT ref, stable critic/KL, 10% replay)
+# and replaces the training mixture + KG source. Attribution requires a later
+# ablation; this paid smoke asks whether the package can beat the SFT start.
+training:
+  silver_path: data/silver_data/proofkg_curriculum_mix_v1_n8000_seed42_20260829/silver_curriculum.jsonl
+  output_dir: outputs/ppo_proofkg_curriculum_mix_v1_smoke600_seed42
+  sft_checkpoint: checkpoints/sft_proofkg_curriculum_mix_v1_n8000_seed42/final
+  question_kg_index_path: null
+  question_kg_records_path: data/silver_data/proofkg_curriculum_mix_v1_n8000_seed42_20260829/question_kg_records.jsonl
+  min_question_kg_record_coverage: 1.0
+  require_nonempty_question_kg_records: false
+  require_exact_kg_index_alignment: false
+  split: null
+  split_allow_none: true
+  ppo:
+    # Exact one/two-edge Proof-KGs are sufficient to verify a copied citation.
+    # Legacy experiments retain the historical threshold of three.
+    prm_min_subgraph_for_verify: 1
+    total_ppo_steps: 600
+    save_every_steps: 200

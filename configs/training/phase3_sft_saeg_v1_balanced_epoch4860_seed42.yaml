@@ -1,0 +1,33 @@
+# Experiment ID: SAEG-V1-SFT-BALANCED-EPOCH4860-SEED42
+#
+# Continued-SFT from the frozen strong legacy adapter.  The input file is one
+# exact, deterministic 4,860-example exposure schedule; at effective batch 32
+# this produces ceil(4860 / 32) = 152 optimiser updates.  Checkpoints at
+# 38/76/114/final expose 25/50/75/100% SFT depths for RL-readiness selection.
+includes:
+  - phase3_sft.yaml
+
+training:
+  silver_path: data/silver_data/saeg_v1_sft_balanced_epoch4860_seed42_v1/silver_train.jsonl
+  sft_init_adapter_path: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+  output_dir: checkpoints/sft_saeg_v1_balanced_epoch4860_seed42
+  sft_lr: 2.0e-6
+  sft_epochs: 1
+  sft_batch_size: 4
+  sft_grad_accum: 8
+  # The frozen release audit measured max full sequence=3,287 tokens, so 4,096
+  # retains every training row.  The later SAEG PPO config must use the same
+  # input limit to avoid an SFT/PPO context mismatch.
+  sft_max_length: 4096
+  sft_save_strategy: steps
+  sft_save_steps: 38
+  sft_save_total_limit: null
+  sft_save_only_model: false
+  # AutoDL's default TensorBoard watches /root/tf-logs.  This is observability
+  # only; SFT has no KL signal, so this run reports loss/lr/grad-norm there.
+  sft_log_with: tensorboard
+  sft_logging_dir: /root/tf-logs/SAEG-V1-SFT-BALANCED-EPOCH4860-SEED42
+  # This derived file is already train-only and family-disjoint from every
+  # development/confirmation/reporting cohort.  It has no internal held-out fold.
+  split: null
+  split_allow_none: true

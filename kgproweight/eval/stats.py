@@ -43,7 +43,9 @@ def paired_bootstrap(
     alpha = (1.0 - ci) / 2.0
     lower = float(np.quantile(boot, alpha))
     upper = float(np.quantile(boot, 1.0 - alpha))
-    p_value = float(2 * min((boot <= 0).mean(), (boot >= 0).mean()))
+    # Zero lies in both tails. With many exact-zero paired differences the
+    # doubled empirical tail mass can therefore exceed one; a p-value cannot.
+    p_value = min(1.0, float(2 * min((boot <= 0).mean(), (boot >= 0).mean())))
     return {
         "diff_mean": float(diffs.mean()),
         "lower": lower,

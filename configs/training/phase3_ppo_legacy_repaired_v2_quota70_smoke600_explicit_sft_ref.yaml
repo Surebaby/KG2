@@ -1,0 +1,13 @@
+includes:
+  - phase3_ppo_legacy_repaired_v2_quota70_smoke600.yaml
+
+# Correctness-fix smoke: TRL 0.11.4's PEFT branch ignored the explicit frozen
+# SFT reference and computed KL against the bare base model.  The trainer now
+# forces the explicit reference path and aborts unless the first-batch KL is
+# approximately zero.  No research knob is retuned in this run.
+training:
+  output_dir: outputs/ppo_legacy_repaired_v2_quota70_hard_seed42_no_text_head_smoke600_explicit_sft_ref
+  ppo:
+    kl_coef: 0.15
+    sft_replay_ratio: 0.10
+    sft_anchor_weight: 0.10

@@ -1,0 +1,57 @@
+experiment:
+  id: QUERY-PLANNER-LEARNED-SMOKE-V1-SEED42
+  status: FROZEN_NOT_RUN
+  variable: learned_answer_free_query_planner
+
+data:
+  split_root: data/silver_data/query_planner_supervision_split_v1_seed20260829
+  train_file: train.jsonl
+  dev_file: dev.jsonl
+  confirmation_file: confirmation.jsonl
+  confirmation_locked_during_smoke: true
+  sampling:
+    strategy: balanced_by_dataset_without_replacement
+    train_per_dataset: 4000
+    dev_per_dataset: 300
+    seed: 42
+
+model:
+  base_model: llama3-8B-instruct
+  initialization: base_instruct_no_qa_sft_adapter
+  method: qlora
+  load_in_4bit: true
+  dtype: bf16
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+training:
+  max_seq_length: 384
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.03
+  lr_scheduler_type: cosine
+  num_train_epochs: 1
+  max_grad_norm: 1.0
+  gradient_checkpointing: true
+  seed: 42
+  save_strategy: steps
+  save_steps: 100
+  eval_steps: 100
+  checkpoint_selection: fixed_final_step_no_posthoc_selection
+  output_dir: checkpoints/query_planner_learned_smoke_v1_seed42
+
+evaluation:
+  protocol: outputs/audits/query_planner_learned_v1_preregistration_20260829/protocol.json
+  decode: greedy
+  max_new_tokens: 512
+  inspect_confirmation_during_smoke: false
+  downstream_kg_or_ppo_run: false
+
+resources:
+  recommended_gpu: A100_80GB_or_equivalent
+  minimum_gpu: 24GB_with_4bit_and_batch1
+  local_host_training: false
+  note: runtime remains UNKNOWN until a 20-step throughput probe on the target host

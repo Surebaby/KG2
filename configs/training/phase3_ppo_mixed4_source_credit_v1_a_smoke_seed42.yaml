@@ -1,0 +1,11 @@
+# Source-credit-v1 successor: format repair + Gold-free Graph-credit mask.
+# Original prompt, candidates, reward weights, features and split unchanged.
+# Scientific status: process-utility review required before PPO.
+includes:
+  - phase3_ppo_mixed4_sourcegate_format_v2_a_smoke_seed42.yaml
+
+training:
+  output_dir: outputs/ppo_mixed4_source_credit_v1_a_smoke600_seed42
+  ppo:
+    source_gate_credit_version: v1
+    source_gate_calibration_path: outputs/calibration/source_credit_gate_v1_local_seed42/gate.json

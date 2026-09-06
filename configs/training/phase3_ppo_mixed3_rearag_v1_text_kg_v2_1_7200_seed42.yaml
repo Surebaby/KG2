@@ -1,0 +1,13 @@
+# Experiment ID: ppo_mixed3_rearag_v1_text_kg_v2_1_7200_seed42
+# Paper arm label: PPO-TK
+#
+# Paired treatment arm (PPO-TK). It is intentionally byte-for-byte equivalent
+# to PPO-T at the semantic-config level except for output_dir and
+# proofkg_process_reward=true.
+includes:
+  - phase3_ppo_mixed3_rearag_v1_text7200_seed42.yaml
+
+training:
+  output_dir: outputs/ppo_mixed3_rearag_v1_text_kg_v2_1_7200_seed42
+  ppo:
+    proofkg_process_reward: true

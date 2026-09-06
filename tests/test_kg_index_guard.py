@@ -62,13 +62,25 @@ class _Tok:
         return ""
 
 
+class _CharTok:
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        assert tokenize is False
+        text = "".join(f"<{m['role']}>{m['content']}" for m in messages)
+        return text + ("<assistant>" if add_generation_prompt else "")
+
+    def __call__(self, text, **kw):  # noqa: ARG002
+        return {"input_ids": [ord(ch) for ch in text]}
+
+
 _KG = [("a", "r", "b")]
 
 
-def _cfg(cap=0.05):
+def _cfg(cap=0.05, exact=False):
     return types.SimpleNamespace(
-        ppo_max_kg_triples=12, ppo_max_passages=5, max_input_length=6144,
+        ppo_min_kg_triples=5, ppo_max_kg_triples=12,
+        ppo_max_passages=5, max_input_length=6144,
         max_kg_index_miss_rate=cap, silver_path="SILVER.jsonl",
+        require_exact_kg_index_alignment=exact,
     )
 
 
@@ -98,6 +110,7 @@ def test_absent_error_names_the_rebuild_command():
     msg = str(ei.value)
     assert "06_build_question_kg_index.py" in msg
     assert "--silver SILVER.jsonl" in msg      # the file this run actually reads
+    assert "--min_keep 5" in msg
     assert "--max_keep 12" in msg              # must match ppo_max_kg_triples
     assert "question_kg_index_path" in msg
 
@@ -114,3 +127,86 @@ def test_empty_alone_never_aborts_even_when_large():
     index = {f"q{i}": [] for i in range(100)}   # 100% covered, 100% empty
     rows = P._prepare_prompts(_Reader(_trajs()), _Tok(), _cfg(), question_kg_index=index)
     assert len(rows) == 100
+
+
+def test_silver_fallback_uses_the_same_min_and_max_budget(monkeypatch):
+    seen = {}
+
+    def fake_filter(triples, *, question, min_keep, max_keep):
+        seen.update(question=question, min_keep=min_keep, max_keep=max_keep)
+        return triples
+
+    monkeypatch.setattr(P, "filter_and_rank_triples", fake_filter)
+    rows = P._prepare_prompts(
+        _Reader([_Traj("q0", _KG)]), _Tok(), _cfg(), question_kg_index={"q0": []}
+    )
+    assert len(rows) == 1
+    assert seen == {"question": "q0", "min_keep": 5, "max_keep": 12}
+
+
+def test_identity_safe_record_mode_preserves_short_proof_kg(monkeypatch):
+    """A pre-applied dataset::qid KG must bypass the legacy text-index path."""
+    proof = [("bridge", "relation", "answer")]
+
+    def forbidden_filter(*args, **kwargs):  # noqa: ARG001
+        raise AssertionError("short Proof-KG was incorrectly sent through legacy filtering")
+
+    monkeypatch.setattr(P, "filter_and_rank_triples", forbidden_filter)
+    rows = P._prepare_prompts(
+        _Reader([_Traj("q0", proof)]),
+        _CharTok(),
+        _cfg(cap=0.0),
+        question_kg_index=None,
+    )
+
+    assert rows[0]["spec"].kg_subgraph == proof
+    assert "(bridge, relation, answer)" in rows[0]["prompt"]
+
+
+def test_exact_alignment_rejects_covered_but_different_triples():
+    with pytest.raises(ValueError, match="differ from stored silver KG"):
+        P._prepare_prompts(
+            _Reader([_Traj("q0", _KG)]),
+            _Tok(),
+            _cfg(exact=True),
+            question_kg_index={"q0": [("different", "r", "triple")]},
+        )
+
+
+def test_exact_alignment_accepts_identical_ordered_triples():
+    rows = P._prepare_prompts(
+        _Reader([_Traj("q0", _KG)]),
+        _Tok(),
+        _cfg(exact=True),
+        question_kg_index={"q0": list(_KG)},
+    )
+    assert len(rows) == 1
+
+
+def test_prompt_drops_passages_instead_of_truncating_trailing_kg():
+    traj = _Traj("q0", _KG)
+    traj.retrieved_passages = [{"contents": "x" * 5000}]
+    cfg = _cfg(exact=True)
+    cfg.max_input_length = 1600
+
+    rows = P._prepare_prompts(
+        _Reader([traj]), _CharTok(), cfg, question_kg_index={"q0": list(_KG)},
+    )
+
+    assert rows[0]["num_passages"] == 0
+    assert rows[0]["spec"].retrieved_passages == []
+    assert "[Knowledge Graph Context]" in rows[0]["prompt"]
+    assert "(a, r, b)" in rows[0]["prompt"]
+    assert rows[0]["prompt_tokens"] <= cfg.max_input_length
+
+
+def test_prompt_refuses_to_truncate_kg_when_zero_passages_still_overflow():
+    traj = _Traj("q0", _KG)
+    cfg = _cfg(exact=True)
+    cfg.max_input_length = 10
+
+    with pytest.raises(ValueError, match="refusing to right-truncate"):
+        P._prepare_prompts(
+            _Reader([traj]), _CharTok(), cfg,
+            question_kg_index={"q0": list(_KG)},
+        )

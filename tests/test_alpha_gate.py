@@ -81,15 +81,40 @@ def test_entropy_from_logprobs():
 
 
 def test_calibration_loss():
-    gate = _gate()
     loss_fn = AlphaCalibrationLoss(weight=0.2)
-    alpha = torch.tensor([0.3, 0.8])
+    logits = torch.tensor([-0.7, 1.4])
     targets = torch.tensor([0.5, 0.5])
-    loss = loss_fn(alpha, targets)
+    loss = loss_fn(logits, targets)
     assert loss.item() > 0
     # weight scales the BCE term linearly
     loss_fn2 = AlphaCalibrationLoss(weight=0.4)
-    assert loss_fn2(alpha, targets).item() == pytest.approx(2.0 * loss.item(), rel=1e-5)
+    assert loss_fn2(logits, targets).item() == pytest.approx(2.0 * loss.item(), rel=1e-5)
+
+
+def test_logits_calibration_is_equivalent_to_probability_bce():
+    import torch.nn.functional as F
+
+    logits = torch.tensor([-2.0, -0.1, 0.5, 3.0])
+    targets = torch.tensor([0.0, 0.25, 0.75, 1.0])
+    got = AlphaCalibrationLoss(weight=1.0)(logits, targets)
+    expected = F.binary_cross_entropy(torch.sigmoid(logits), targets)
+    assert got.item() == pytest.approx(expected.item(), rel=1e-6)
+
+
+def test_logits_calibration_remains_finite_when_gate_saturates():
+    logits = torch.tensor([-1000.0, 1000.0], requires_grad=True)
+    targets = torch.tensor([1.0, 0.0])
+    loss = AlphaCalibrationLoss(weight=1.0)(logits, targets)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_alpha_schema_matches_runtime_feature_order():
+    from kgproweight.config.schemas import AlphaGateConfig
+
+    cfg = AlphaGateConfig()
+    assert cfg.feature_dim == AlphaGate.N_FEATURES == len(cfg.initial_W)
 
 
 # ---------------------------------------------------------------------------

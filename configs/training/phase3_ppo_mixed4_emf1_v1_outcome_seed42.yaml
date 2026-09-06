@@ -1,0 +1,107 @@
+# Experiment ID: ppo_mixed4_emf1_v1_outcome12000_seed42
+# PERFORMANCE PILOT SUCCESSOR: data ready; runtime probe/smoke must pass first.
+# Combined engineering/configuration revision, NOT an alpha-method ablation.
+# The first trained candidate uses canonical outcome reward only. No ReaRAG,
+# legacy PRM or learned alpha is consumed. The v4 Reader evidence is unchanged.
+includes:
+  - ../base.yaml
+
+reward:
+  text_reward_backend: rearag  # unused by explicit mixed outcome-only fast path
+  use_real_logprobs: true
+
+training:
+  phase: phase3_ppo
+  seed: 42
+  base_model: llama3-8B-instruct
+  dtype: bf16
+  use_qlora: false
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+  silver_path: data/silver_data/mixed_ppo_three_dataset_v4_proof800_n3000_k4_seed42/silver_train.jsonl
+  output_dir: outputs/ppo_mixed4_emf1_v1_outcome12000_seed42
+  sft_checkpoint: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+  reference_model: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+  sft_replay_silver_path: data/silver_data/sft_replay_legacy_strong_train_rendered3to5_n2000_seed42_v2/silver_train.jsonl
+  sft_replay_split: null
+  alpha_gate_path: null
+  alpha_override: null
+  question_kg_index_path: null
+  question_kg_records_path: data/silver_data/mixed_ppo_three_dataset_v4_proof800_n3000_k4_seed42/question_kg_records.jsonl
+  min_question_kg_record_coverage: 1.0
+  require_nonempty_question_kg_records: false
+  max_kg_index_miss_rate: 1.0
+  require_exact_kg_index_alignment: false
+  rollout_sampling_weights_path: data/silver_data/mixed_ppo_three_dataset_v4_proof800_n3000_k4_seed42/sampling_weights.jsonl
+  fixed_rollout_schedule_path: data/silver_data/mixed_ppo_three_dataset_v4_proof800_n3000_k4_seed42/fixed_rollout_schedule.jsonl
+  passage_overrides_path: null
+  rollout_schedule_path: null
+  split: null
+  split_allow_none: true
+  split_seed: 42
+  max_input_length: 6144
+
+  ppo:
+    runtime_contract_version: v2
+    learning_rate: 1.0e-6
+    batch_size: 4
+    mini_batch_size: 1
+    rollouts_per_prompt: 4
+    rollout_chunk_size: 4
+    ppo_epochs: 2
+    # Counts generated trajectories: 3000 trainer.step calls, not 12000 calls.
+    total_ppo_steps: 12000
+    save_every_steps: 600
+    cliprange: 0.2
+    cliprange_value: 0.2
+    kl_coef: 0.25
+    target_kl: 8.0
+    kl_horizon: 2000.0
+    gamma: 1.0
+    lam: 0.99
+    max_grad_norm: 1.0
+    vf_coef: 0.5
+    value_head_init: zero
+    value_head_dropout: 0.0
+    max_new_tokens: 384
+    max_steps: 5
+    ppo_max_passages: 15  # v4 rows have 10; retain all 15 in the replay source
+    ppo_min_kg_triples: 1
+    ppo_max_kg_triples: 12
+    prm_min_subgraph_for_verify: 1
+    temperature: 1.0
+    top_p: 1.0
+    # Valid: 4*(max_alias canonical_EM + .1*max_alias canonical_F1).
+    # Invalid: -4. Terms are placed on the final response token, including EOS.
+    pure_em_reward: false
+    mixed_outcome_reward: true
+    mixed_text_reward: false
+    proofkg_process_reward: false
+    proofkg_outcome_only_reward: false
+    proofkg_process_version: v2_3  # recorded but NOT consumed by PPO-O
+    proofkg_process_weight: 0.20
+    outcome_weight: 4.0
+    proofkg_f1_weight: 0.10
+    proofkg_dynamic_validity: true
+    proofkg_require_all_eligible: false
+    text_reward_scale: 0.30
+    center_text_reward: true  # unused; keep explicit for future matched controls
+    text_baseline_momentum: 0.99
+    min_valid_steps: 3
+    min_reasoning_chars: 20
+    shortfall_coef: 0.0
+    target_steps: 3
+    # Reader rollout uses 10 passages; replay retains its own frozen 15-passage
+    # SFT rendering through the existing replay loader.
+    sft_replay_ratio: 0.10
+    sft_anchor_weight: 0.10
+    sft_anchor_interval: 0
+    health_guard_after_steps: 200
+    health_guard_window: 15
+    health_guard_min_valid_rate: 0.70
+    health_guard_max_length_capped_frac: 0.20
+    health_guard_max_mean_kl: 10.0
+    early_stopping: false
+    log_with: tensorboard

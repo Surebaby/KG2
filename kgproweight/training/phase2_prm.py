@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -45,7 +45,12 @@ from kgproweight.reward.alpha_gate import (
     entropy_from_logprobs,
 )
 from kgproweight.retrieval.bootstrap import resolve_entity_cache_path
-from kgproweight.utils.logging import dump_manifest, get_logger
+from kgproweight.utils.logging import (
+    artifact_identity,
+    dump_manifest,
+    get_logger,
+    prepare_new_run_dir,
+)
 from kgproweight.utils.paths import model_path
 from kgproweight.utils.seed import set_seed
 
@@ -112,6 +117,24 @@ def _label_to_class(label: float) -> int:
 # A step needs a majority of its citations verified AND relevant to count as
 # positive evidence; below that the KG has not really rendered a verdict.
 _POSITIVE_THRESHOLD = 0.5
+
+
+def _alpha_calibration_target(
+    labels_class: torch.Tensor,
+    labels_rkg: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    """Build the gate target without changing the auxiliary PRM target."""
+    if mode == "hard_verdict":
+        return (labels_class != 1).float()
+    if mode == "soft_abs_rkg":
+        # Gate semantics are KG verdict STRENGTH, not signed reward. A hard
+        # contradiction (-1) must therefore map to full trust (1), neutral to
+        # zero, and partial positive evidence retain its magnitude.
+        return labels_rkg.abs().clamp(0.0, 1.0).float()
+    raise ValueError(
+        f"Unknown alpha_target={mode!r}; expected 'hard_verdict' or 'soft_abs_rkg'"
+    )
 
 
 def _build_samples_accepted_only(
@@ -403,6 +426,7 @@ class _StepDataset(Dataset):
             "input_ids": enc["input_ids"].squeeze(0),
             "attention_mask": enc["attention_mask"].squeeze(0),
             "label_class": torch.tensor(s.label_class, dtype=torch.long),
+            "label_rkg": torch.tensor(s.label, dtype=torch.float32),
             "graph_density": torch.tensor(graph_density(s.kg_subgraph), dtype=torch.float32),
             "coverage": torch.tensor(s.coverage, dtype=torch.float32),
             "semantic_entropy": torch.tensor(s.semantic_entropy, dtype=torch.float32),
@@ -423,6 +447,7 @@ def _collate(batch: List[Dict[str, Any]], pad_token_id: int) -> Dict[str, Any]:
         "input_ids": input_ids,
         "attention_mask": attention,
         "label_class": torch.stack([b["label_class"] for b in batch]),
+        "label_rkg": torch.stack([b["label_rkg"] for b in batch]),
         "graph_density": torch.stack([b["graph_density"] for b in batch]),
         "coverage": torch.stack([b["coverage"] for b in batch]),
         "semantic_entropy": torch.stack([b["semantic_entropy"] for b in batch]),
@@ -460,6 +485,7 @@ class Phase2Config:
     lora_alpha: int = 64
     lora_dropout: float = 0.05
     calibration_weight: float = 0.1
+    alpha_target: str = "hard_verdict"
     # Re-weight the 3-way CE by inverse class frequency. NEG is ~4% of accepted
     # steps, so an unweighted loss lets the head trade NEG away for 4 points of
     # accuracy — which it did (held-out NEG recall 0.152). Weights are computed
@@ -488,6 +514,9 @@ class Phase2Config:
     # kgproweight.data.silver_split), so it is recomputed identically here, in
     # Phase 3, and in evaluation without materialising separate files.
     split: Optional[str] = None
+    # Whole-file training is allowed only for deliberate historical
+    # reproduction.  Default runs must hold val/test out.
+    split_allow_none: bool = False
     val_ratio: float = DEFAULT_VAL_RATIO
     test_ratio: float = DEFAULT_TEST_RATIO
     # Defaults to ``seed`` when None so the split moves with the run's seed only
@@ -556,8 +585,31 @@ def _build_base_model(cfg: Phase2Config):
 
 
 def run_phase2(cfg: Phase2Config) -> Dict[str, Any]:
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.split is None and not cfg.split_allow_none:
+        raise ValueError(
+            "Phase 2 split is None: this would train on the whole silver file, "
+            "including val/test. Set split='train' (normal runs), or set "
+            "split_allow_none=True only to reproduce a historical whole-file run."
+        )
+    if str(cfg.device).startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "Phase 2 requires CUDA, but torch.cuda.is_available() is False. "
+            "Fix the NVIDIA driver/container runtime before reserving an Experiment ID."
+        )
+    if cfg.dtype == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("Phase 2 dtype=bf16 but the active GPU does not support bf16")
+    out_dir, experiment_id = prepare_new_run_dir(
+        cfg.output_dir,
+        extra={
+            "phase": "phase2_prm",
+            "config": asdict(cfg),
+            "input_artifacts": {
+                "silver": artifact_identity(cfg.silver_path),
+                "base_model": artifact_identity(model_path(cfg.base_model)),
+                "entity_cache": artifact_identity(resolve_entity_cache_path()),
+            },
+        },
+    )
     set_seed(cfg.seed)
 
     logger.info("Loading silver data from %s", cfg.silver_path)
@@ -729,6 +781,7 @@ def run_phase2(cfg: Phase2Config) -> Dict[str, Any]:
             input_ids = batch["input_ids"].to(cfg.device)
             attention = batch["attention_mask"].to(cfg.device)
             labels_class = batch["label_class"].to(cfg.device)
+            labels_rkg = batch["label_rkg"].to(cfg.device)
             density = batch["graph_density"].to(cfg.device)
             coverage = batch["coverage"].to(cfg.device)
             entropy_real = batch["semantic_entropy"].to(cfg.device)
@@ -744,15 +797,16 @@ def run_phase2(cfg: Phase2Config) -> Dict[str, Any]:
             # ``coverage`` now carries the continuous per-step link_confidence
             # (Finding 2), NOT a thresholded copy of the calibration target.
             link_confidence = coverage.clamp(0.0, 1.0)
-            alpha = alpha_gate(
+            alpha_logits = alpha_gate.forward_logits(
                 density, link_confidence, entropy_real, cite_any, cite_match
             )
-            # Non-degenerate target (fix #2): calibrate α toward "the KG renders a
-            # verdict on this step" = label is not NEUTRAL. This is independent of
-            # the three gate inputs, so the gate can no longer trivially copy a
-            # feature into the target.
-            kg_has_verdict = (labels_class != 1).float()
-            loss_cal = calibration(alpha, kg_has_verdict)
+            # Configured gate supervision. hard_verdict reproduces the recovery
+            # baseline; soft_abs_rkg is the approved single-variable ablation.
+            # The auxiliary 3-way PRM loss above is identical in both arms.
+            alpha_target = _alpha_calibration_target(
+                labels_class, labels_rkg, cfg.alpha_target
+            )
+            loss_cal = calibration(alpha_logits, alpha_target)
 
             loss = loss_prm + loss_cal
             if text_reward_head is not None:
@@ -835,7 +889,19 @@ def run_phase2(cfg: Phase2Config) -> Dict[str, Any]:
         out_dir,
         extra={
             "phase": "phase2_prm",
+            "experiment_id": experiment_id,
+            "config": asdict(cfg),
             "silver_path": str(cfg.silver_path),
+            "input_artifacts": {
+                "silver": artifact_identity(cfg.silver_path),
+                "base_model": artifact_identity(model_path(cfg.base_model)),
+                "entity_cache": artifact_identity(resolve_entity_cache_path()),
+            },
+            "output_artifacts": {
+                "enriched_silver": artifact_identity(enriched_path),
+                "alpha_gate": artifact_identity(out_dir / "alpha_gate.pt"),
+                "prm_head": artifact_identity(prm_dir),
+            },
             "enriched_silver": str(enriched_path),
             "epochs": cfg.epochs,
             "lr": cfg.lr,
@@ -845,6 +911,19 @@ def run_phase2(cfg: Phase2Config) -> Dict[str, Any]:
             # back — the difference between a held-out result and an in-sample one.
             "split_info": split_info,
             "max_length": cfg.max_length,
+            "prm_target": "three_class_bucket_at_plus_minus_0.5",
+            "prm_loss": "class_weighted_cross_entropy" if cfg.class_weighted_loss else "cross_entropy",
+            "prm_consumed_by_phase3_ppo": False,
+            "label_histogram_neg_neu_pos": counts,
+            "n_fractional_labels": sum(
+                1 for s in samples if float(s.label) not in (-1.0, 0.0, 1.0)
+            ),
+            "alpha_target": cfg.alpha_target,
+            "alpha_loss": "bce_with_logits",
+            "alpha_feature_order": [
+                "graph_density", "link_confidence", "semantic_entropy",
+                "cite_any", "cite_match",
+            ],
             "alpha_W": alpha_gate.W.data.cpu().tolist(),
             "alpha_b": float(alpha_gate.b.data.cpu().item()),
             "alpha_tau": float(alpha_gate.tau.cpu().item()),

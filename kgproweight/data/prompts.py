@@ -55,8 +55,13 @@ Conclusion: <one short factual conclusion>
 Hard requirements:
 - Cite ONLY triples that are present in the supplied Knowledge Graph. If the
   Knowledge Graph is empty, write ``Knowledge Used: []``.
-- If the Knowledge Graph is NOT empty, each step must include at least one
-  triple in ``Knowledge Used``.
+- If the Knowledge Graph is non-empty but has no fact relevant to the current
+  step, write ``Knowledge Used: []``. Never cite a filler triple merely because
+  the graph is non-empty.
+- Each step must contain exactly one single-line ``Knowledge Used: [...]``
+  field. Put no example or hypothetical triples in Reasoning or Conclusion.
+- When citing a triple, copy its complete surface form verbatim from the
+  Knowledge Graph block; entity and relation strings may contain commas.
 - The trace must contain 3 to 7 steps (inclusive).
 - Do NOT include any text after [Final Answer].
 - Keep each Reasoning sentence under 50 words.
@@ -65,7 +70,8 @@ Hard requirements:
 
 Output quality checklist before you answer:
 1) Step count is between 3 and 7.
-2) Every step has at least one KG triple when KG is non-empty.
+2) Every cited triple is relevant and copied verbatim from the KG block; use
+   ``Knowledge Used: []`` when no supplied triple supports the step.
 3) Final answer is short and directly answers the question.
 """
 
@@ -106,7 +112,8 @@ Strict formatting rules:
   with square brackets around the list and parentheses around each triple.
 - Copy triples VERBATIM from the Knowledge Graph block when available.
 - Do NOT invent relations. If the Knowledge Graph is empty, write [].
-- Every step MUST include both a Conclusion and Knowledge Used field.
+- Every step MUST include exactly one single-line Knowledge Used field and one
+  Conclusion field. Do not put hypothetical/example triples in other fields.
 - If you cite no triples, write: Knowledge Used: []
 - Stop generating after [Final Answer].
 """
@@ -131,6 +138,57 @@ INFERENCE_USER_TEMPLATE = SFT_USER_TEMPLATE
 
 
 # ---------------------------------------------------------------------------
+# SAEG-v1 prompts (separate standard KG triples from passage evidence)
+# ---------------------------------------------------------------------------
+
+SAEG_SFT_SYSTEM_PROMPT = """You are a multi-hop reasoning assistant.
+
+Always answer using the exact schema:
+
+[Step 1]
+Reasoning: <natural-language reasoning for this step>
+Knowledge Used: [(head_entity, relation, tail_entity), ...]
+Passage Used: [P1, P2, ...]
+Conclusion: <one short factual conclusion>
+
+[Step 2]
+...
+
+[Final Answer]
+<answer>
+
+Strict evidence rules:
+- Knowledge Used may contain ONLY standard (head, relation, tail) triples copied
+  verbatim from the Wikidata Knowledge Graph block. Use [] when none is used.
+- Passage Used may contain ONLY passage IDs copied from the Passage Evidence
+  block. Use [] when none is used.
+- A passage sentence is evidence text, not a KG triple. Never copy a passage
+  sentence into Knowledge Used and never invent a relation for it.
+- Every step contains exactly one single-line Knowledge Used field and exactly
+  one single-line Passage Used field.
+- Stop after [Final Answer].
+"""
+
+
+SAEG_SFT_USER_TEMPLATE = """Question: {question}
+
+Retrieved Passages:
+{retrieved_block}
+
+[Wikidata Knowledge Graph]
+{kg_block}
+[End Wikidata Knowledge Graph]
+
+[Passage Evidence]
+{passage_evidence_block}
+[End Passage Evidence]
+
+Use only the supplied evidence. Cite standard Wikidata triples in Knowledge
+Used and passage evidence IDs in Passage Used.
+"""
+
+
+# ---------------------------------------------------------------------------
 # RL prompts (Phase 3b PPO)
 # ---------------------------------------------------------------------------
 
@@ -146,9 +204,17 @@ RL_USER_TEMPLATE = SFT_USER_TEMPLATE
 
 KG_BLOCK_TEMPLATE = "  ({head}, {relation}, {tail})"
 RETRIEVED_BLOCK_TEMPLATE = "[{rank}] {text}"
+PASSAGE_EVIDENCE_TEMPLATE = "[{passage_id}] {title}\nSentence: {sentence}"
 
 
-def format_kg_block(triples: Sequence[Sequence[str]], max_triples: int = 50) -> str:
+def format_kg_block(triples: Sequence[Sequence[str]], max_triples: int = 12) -> str:
+    # Default 12 (was 50) to match the student's budget everywhere
+    # (retraining_plan §12.3). Every current caller passes this explicitly, but
+    # a 50 default means any NEW caller that forgets silently renders a 50-triple
+    # block the student was never trained on. Truncation here is POSITIONAL
+    # (list(triples)[:max_triples], no ranking), so the caller must already have
+    # ranked with the same value -- a positional first-12 of a stored top-50
+    # overlaps a true top-12 by only 87.8% (measured, n=200).
     """Render a triple list as one ``(h, r, t)`` per line."""
     if not triples:
         return "  (empty)"
@@ -226,6 +292,28 @@ def format_retrieved_block(
     return "\n".join(out) if out else "  (no passages retrieved)"
 
 
+def format_passage_evidence_block(
+    evidence: Sequence[Mapping[str, object]],
+    max_items: int = 8,
+) -> str:
+    """Render passage evidence as ID-addressable text, never as KG triples."""
+    if not evidence:
+        return "  (empty)"
+    lines: List[str] = []
+    for item in list(evidence)[:max_items]:
+        passage_id = str(item.get("passage_id") or "").strip()
+        title = str(item.get("title") or "").strip()
+        sentence = str(item.get("sentence") or "").strip()
+        if not passage_id or not title or not sentence:
+            continue
+        lines.append(PASSAGE_EVIDENCE_TEMPLATE.format(
+            passage_id=passage_id,
+            title=title,
+            sentence=sentence,
+        ))
+    return "\n".join(lines) if lines else "  (empty)"
+
+
 # ---------------------------------------------------------------------------
 # Message-builders
 # ---------------------------------------------------------------------------
@@ -238,7 +326,7 @@ def build_teacher_messages(
     retrieved_passages: Sequence[Mapping | str],
     kg_triples: Sequence[Sequence[str]],
     top_k: int = DEFAULT_TOPK,
-    max_kg_triples: int = 50,
+    max_kg_triples: int = 12,
 ) -> List[ChatMessage]:
     user = TEACHER_USER_TEMPLATE.format(
         question=question.strip(),
@@ -258,7 +346,7 @@ def build_sft_messages(
     kg_triples: Sequence[Sequence[str]],
     answer_trace: Optional[str] = None,
     top_k: int = DEFAULT_TOPK,
-    max_kg_triples: int = 50,
+    max_kg_triples: int = 12,
 ) -> List[ChatMessage]:
     user = SFT_USER_TEMPLATE.format(
         question=question.strip(),
@@ -274,12 +362,65 @@ def build_sft_messages(
     return msgs
 
 
+def build_saeg_sft_messages(
+    question: str,
+    retrieved_passages: Sequence[Mapping | str],
+    kg_triples: Sequence[Sequence[str]],
+    passage_evidence: Sequence[Mapping[str, object]],
+    answer_trace: Optional[str] = None,
+    top_k: int = DEFAULT_TOPK,
+    max_kg_triples: int = 12,
+    max_passage_evidence: int = 8,
+) -> List[ChatMessage]:
+    """Build the versioned SAEG dual-source prompt.
+
+    This is deliberately separate from ``build_sft_messages`` so legacy
+    experiments retain byte-identical prompt construction.
+    """
+    user = SAEG_SFT_USER_TEMPLATE.format(
+        question=question.strip(),
+        retrieved_block=format_retrieved_block(retrieved_passages, max_passages=top_k),
+        kg_block=format_kg_block(kg_triples, max_triples=max_kg_triples),
+        passage_evidence_block=format_passage_evidence_block(
+            passage_evidence, max_items=max_passage_evidence
+        ),
+    )
+    messages: List[ChatMessage] = [
+        {"role": "system", "content": SAEG_SFT_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+    if answer_trace is not None:
+        messages.append({"role": "assistant", "content": answer_trace})
+    return messages
+
+
+def build_saeg_inference_messages(
+    question: str,
+    retrieved_passages: Sequence[Mapping | str],
+    kg_triples: Sequence[Sequence[str]],
+    passage_evidence: Sequence[Mapping[str, object]],
+    top_k: int = DEFAULT_TOPK,
+    max_kg_triples: int = 12,
+    max_passage_evidence: int = 8,
+) -> List[ChatMessage]:
+    return build_saeg_sft_messages(
+        question=question,
+        retrieved_passages=retrieved_passages,
+        kg_triples=kg_triples,
+        passage_evidence=passage_evidence,
+        answer_trace=None,
+        top_k=top_k,
+        max_kg_triples=max_kg_triples,
+        max_passage_evidence=max_passage_evidence,
+    )
+
+
 def build_rl_messages(
     question: str,
     retrieved_passages: Sequence[Mapping | str],
     kg_triples: Sequence[Sequence[str]],
     top_k: int = DEFAULT_TOPK,
-    max_kg_triples: int = 50,
+    max_kg_triples: int = 12,
 ) -> List[ChatMessage]:
     return build_sft_messages(
         question=question,
@@ -296,7 +437,7 @@ def build_inference_messages(
     retrieved_passages: Sequence[Mapping | str],
     kg_triples: Sequence[Sequence[str]],
     top_k: int = DEFAULT_TOPK,
-    max_kg_triples: int = 50,
+    max_kg_triples: int = 12,
 ) -> List[ChatMessage]:
     return build_sft_messages(
         question=question,

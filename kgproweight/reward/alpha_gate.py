@@ -116,6 +116,25 @@ class AlphaGate(nn.Module):
         never passes them behaves like "no citations observed" instead of
         silently reading uninitialised state.
         """
+        return torch.sigmoid(
+            self.forward_logits(
+                graph_density_t,
+                link_confidence_t,
+                semantic_entropy_t,
+                cite_any_t,
+                cite_match_t,
+            )
+        )
+
+    def forward_logits(
+        self,
+        graph_density_t: torch.Tensor,
+        link_confidence_t: torch.Tensor,
+        semantic_entropy_t: torch.Tensor,
+        cite_any_t: Optional[torch.Tensor] = None,
+        cite_match_t: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return the pre-sigmoid gate logits for stable BCE training."""
         feats = [graph_density_t, link_confidence_t, semantic_entropy_t]
         if self.W.numel() > 3:
             zero = torch.zeros_like(graph_density_t)
@@ -123,8 +142,7 @@ class AlphaGate(nn.Module):
             if self.W.numel() > 4:
                 feats.append(cite_match_t if cite_match_t is not None else zero)
         x = torch.stack(feats, dim=-1)
-        logit = (x @ self.W + self.b) / self.tau
-        return torch.sigmoid(logit)
+        return (x @ self.W + self.b) / self.tau
 
     def forward_single(
         self,
@@ -264,12 +282,17 @@ def compute_features(
 # ---------------------------------------------------------------------------
 
 class AlphaCalibrationLoss(nn.Module):
-    """``L = w · BCE(α, coverage_target)``."""
+    """``L = w · BCEWithLogits(alpha_logit, coverage_target)``.
+
+    This is mathematically equivalent to BCE(sigmoid(logit), target), while
+    avoiding avoidable overflow/underflow at saturated gate values.  The target
+    semantics are deliberately unchanged here.
+    """
 
     def __init__(self, weight: float = 0.1) -> None:
         super().__init__()
         self.weight = weight
-        self.bce = nn.BCELoss()
+        self.bce = nn.BCEWithLogitsLoss()
 
-    def forward(self, alpha: torch.Tensor, coverage_targets: torch.Tensor) -> torch.Tensor:
-        return self.weight * self.bce(alpha, coverage_targets)
+    def forward(self, alpha_logits: torch.Tensor, coverage_targets: torch.Tensor) -> torch.Tensor:
+        return self.weight * self.bce(alpha_logits, coverage_targets)

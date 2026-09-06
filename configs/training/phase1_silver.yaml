@@ -6,11 +6,30 @@ training:
   silver_data:
     teacher_model: deepseek-chat
     teacher_backend: deepseek
-    teacher_temperature: 0.3
+    # 0.0, was 0.3. Silver is a distillation target, not a diversity sample:
+    # sampling noise here shows up as parse failures (16.0% of records had <3
+    # steps) and wrong-fact answers, both of which the filter then discards.
+    teacher_temperature: 0.0
     max_queries: 25000
-    max_workers: 8
+    # 16, was 8. The bottleneck is API latency, not local compute.
+    max_workers: 16
     use_retrieval: true
     retrieval_top_k: 50
+    # Experimental bridge retrieval is opt-in. Formal control remains unchanged.
+    bridge_mode: "off"
+    bridge_first_round_topk: 5
+    bridge_max_queries: 2
+    bridge_only_k: 50
+    # KG budget shown to the Teacher. MUST stay equal to the student's budget
+    # (ppo_max_kg_triples=12, phase3_grpo max_kg_triples=12, phase2_prm
+    # max_keep=12, pipeline max_kg_triples=12) or 44.5% of teacher citations
+    # point at triples the student never sees (retraining_plan §12.3).
+    # If you change this, also rebuild the question-KG index with a matching
+    # --max_keep (scripts/prepare/06_build_question_kg_index.py).
+    max_kg_triples: 12
+    # min_keep for the KG filter. Every student path passes 5; Phase 1 used to
+    # pass nothing (=0), distilling through a stricter filter than inference.
+    min_kg_keep: 5
     min_steps: 3
     max_steps: 7
     min_triple_rate: 0.25

@@ -11,6 +11,7 @@ from kgproweight.kg.entity_linker import (
     LinkCandidate,
     build_passage_text,
     build_passage_titles,
+    passage_title,
 )
 
 
@@ -36,6 +37,16 @@ def test_build_passage_helpers_handle_dict_and_str():
 def test_build_passage_helpers_handle_none():
     assert build_passage_titles(None) == []
     assert build_passage_text(None) == ""
+
+
+def test_wiki18_numeric_id_uses_unquoted_contents_title():
+    passage = {
+        "id": "3722185",
+        "contents": '"Stephen Frears"\nStephen Arthur Frears is a British director.',
+    }
+    assert passage_title(passage) == "Stephen Frears"
+    assert build_passage_titles([passage]) == ["Stephen Frears"]
+    assert build_passage_text([passage]).startswith('Stephen Frears "Stephen Frears"')
 
 
 def test_passage_support_disambiguates_shared_label():

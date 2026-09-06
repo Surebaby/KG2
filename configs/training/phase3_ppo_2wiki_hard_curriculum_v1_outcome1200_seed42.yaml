@@ -1,0 +1,42 @@
+# Experiment ID: PROOFKG-2WIKI-HARD-V1-PPO-O-1200-SEED42
+# Paired control arm. Same ProofKG prompts, qids, weighted sampler, outcome
+# reward, KL/reference/critic/replay and budget as PPO-K; process-v2.1 is the
+# only disabled research variable.
+includes:
+  - phase3_ppo_legacy_repaired_v2_quota70_smoke600_combined_stability_v1.yaml
+
+training:
+  silver_path: data/silver_data/automatic_proofkg_2wiki_hard_contrastive_v1/silver_train.jsonl
+  output_dir: outputs/ppo_2wiki_hard_curriculum_v1_outcome1200_seed42
+  sft_checkpoint: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+  sft_replay_silver_path: checkpoints/prm_alpha_gate_legacy_repaired_v2_quota70_hard_seed42_no_text_head/silver_with_logprobs.jsonl
+  sft_replay_split: train
+
+  question_kg_index_path: null
+  question_kg_records_path: data/silver_data/automatic_proofkg_2wiki_hard_contrastive_v1/question_kg_records.with_execution.jsonl
+  min_question_kg_record_coverage: 1.0
+  require_nonempty_question_kg_records: true
+  max_kg_index_miss_rate: 1.0
+  require_exact_kg_index_alignment: false
+
+  split: null
+  split_allow_none: true
+  passage_overrides_path: null
+  rollout_schedule_path: null
+  rollout_sampling_weights_path: data/silver_data/automatic_proofkg_2wiki_hard_contrastive_v1/sampling_weights.jsonl
+
+  ppo:
+    total_ppo_steps: 1200
+    save_every_steps: 200
+    rollouts_per_prompt: 4
+    pure_em_reward: false
+    proofkg_outcome_only_reward: true
+    proofkg_process_reward: false
+    proofkg_process_version: v2_1
+    proofkg_process_weight: 0.20
+    proofkg_f1_weight: 0.10
+    proofkg_dynamic_validity: true
+    proofkg_require_all_eligible: true
+    sft_replay_ratio: 0.10
+    sft_anchor_weight: 0.10
+    log_with: tensorboard

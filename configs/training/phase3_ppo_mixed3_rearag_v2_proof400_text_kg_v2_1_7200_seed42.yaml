@@ -1,0 +1,10 @@
+# Experiment ID: ppo_mixed3_rearag_v2_proof400_text_kg_v2_1_7200_seed42
+# Paper arm: PPO-TK (paired treatment; enables frozen ProofKG-v2.1 reward)
+# Status: DATA_CONFIG_PASS; GPU runtime probe and training NOT STARTED.
+includes:
+  - phase3_ppo_mixed3_rearag_v2_proof400_text7200_seed42.yaml
+
+training:
+  output_dir: outputs/ppo_mixed3_rearag_v2_proof400_text_kg_v2_1_7200_seed42
+  ppo:
+    proofkg_process_reward: true

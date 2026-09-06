@@ -34,6 +34,18 @@ def parse_args():
     p.add_argument("--grad_accum", type=int, default=4)
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--no_lora", action="store_true")
+    p.add_argument(
+        "--init_adapter_path",
+        default=None,
+        help="Existing LoRA adapter to continue SFT from.",
+    )
+    p.add_argument(
+        "--question_kg_records_path",
+        default=None,
+        help="dataset::qid + question-hash JSONL used to override prompt KG.",
+    )
+    p.add_argument("--min_question_kg_record_coverage", type=float, default=None)
+    p.add_argument("--require_nonempty_question_kg_records", action="store_true")
     add_split_args(p)
     return p.parse_args()
 
@@ -43,10 +55,12 @@ def main():
     if args.config:
         cfg_doc = load_config(args.config, validate=ProjectConfig)
         tcfg = cfg_doc.training
-        silver = args.silver_data or str(
+        silver = args.silver_data or getattr(tcfg, "silver_path", None) or str(
             Path(checkpoint_dir()) / "prm_alpha_gate" / "silver_with_logprobs.jsonl"
         )
-        out_dir = args.output_dir or str(Path(checkpoint_dir()) / "sft_student")
+        out_dir = args.output_dir or tcfg.output_dir or str(
+            Path(checkpoint_dir()) / "sft_student"
+        )
         cfg = Phase3SFTConfig(
             silver_path=silver,
             output_dir=out_dir,
@@ -58,10 +72,39 @@ def main():
             grad_accum=tcfg.sft_grad_accum,
             lr=tcfg.sft_lr,
             max_length=tcfg.sft_max_length,
+            save_strategy=tcfg.sft_save_strategy,
+            save_steps=tcfg.sft_save_steps,
+            save_total_limit=tcfg.sft_save_total_limit,
+            save_only_model=tcfg.sft_save_only_model,
+            log_with=getattr(tcfg, "sft_log_with", None),
+            logging_dir=getattr(tcfg, "sft_logging_dir", None),
             use_lora=not args.no_lora,
             lora_r=tcfg.lora_r,
             lora_alpha=tcfg.lora_alpha,
             lora_dropout=tcfg.lora_dropout,
+            init_adapter_path=(
+                args.init_adapter_path
+                if args.init_adapter_path is not None
+                else getattr(tcfg, "sft_init_adapter_path", None)
+            ),
+            question_kg_records_path=(
+                args.question_kg_records_path
+                if args.question_kg_records_path is not None
+                else getattr(tcfg, "question_kg_records_path", None)
+            ),
+            min_question_kg_record_coverage=(
+                args.min_question_kg_record_coverage
+                if args.min_question_kg_record_coverage is not None
+                else getattr(tcfg, "min_question_kg_record_coverage", 1.0)
+            ),
+            require_nonempty_question_kg_records=(
+                args.require_nonempty_question_kg_records
+                or getattr(tcfg, "require_nonempty_question_kg_records", False)
+            ),
+            split_allow_none=(
+                bool(getattr(args, "split_allow_none", False))
+                or bool(getattr(tcfg, "split_allow_none", False))
+            ),
             **split_kwargs(args, tcfg),
         )
     else:
@@ -82,6 +125,17 @@ def main():
             grad_accum=args.grad_accum,
             lr=args.lr,
             use_lora=not args.no_lora,
+            init_adapter_path=args.init_adapter_path,
+            question_kg_records_path=args.question_kg_records_path,
+            min_question_kg_record_coverage=(
+                1.0
+                if args.min_question_kg_record_coverage is None
+                else args.min_question_kg_record_coverage
+            ),
+            require_nonempty_question_kg_records=(
+                args.require_nonempty_question_kg_records
+            ),
+            split_allow_none=getattr(args, "split_allow_none", False),
             **split_kwargs(args),
         )
 

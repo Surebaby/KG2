@@ -82,7 +82,10 @@ def parse_args():
                    help="Existing v2 index to merge with (entries are keyed by question)")
     p.add_argument("--output", required=True, help="Path for v2 output .json")
     p.add_argument("--report", default="docs/kg_build_report.md", help="Report output")
-    p.add_argument("--max_keep", type=int, default=30, help="Max triples per question")
+    # 12, was 30. The docstring above already says --max_keep MUST equal
+    # ppo_max_kg_triples (12), but the default contradicted it, so an index built
+    # without the flag gave the student a 30-triple view of a 12-triple budget.
+    p.add_argument("--max_keep", type=int, default=12, help="Max triples per question")
     p.add_argument("--min_keep", type=int, default=5,
                    help="Min triples per question; relaxes the score threshold to match "
                         "the inference fallback (which uses min_keep=5). 0 = strict.")

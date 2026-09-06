@@ -320,6 +320,7 @@ _RELATION_LABEL_TO_PID: Dict[str, str] = {
     "instance of": "P31",
     "subclass of": "P279",
     "part of": "P361",
+    "has part": "P527",
     "has part(s)": "P527",
     "country": "P17",
     "country of citizenship": "P27",
@@ -349,6 +350,7 @@ _RELATION_LABEL_TO_PID: Dict[str, str] = {
     "headquarters location": "P159",
     "located in the administrative territorial entity": "P131",
     "location": "P276",
+    "place of detention": "P2632",
     "capital": "P36",
     "shares border with": "P47",
     "sex or gender": "P21",
@@ -356,6 +358,8 @@ _RELATION_LABEL_TO_PID: Dict[str, str] = {
     "language of work or name": "P407",
     "named after": "P138",
     "inception": "P571",
+    "publication date": "P577",
+    "presenter": "P371",
     "dissolved, abolished or demolished date": "P576",
     "contains the administrative territorial entity": "P150",
     "head of government": "P6",
@@ -897,7 +901,8 @@ def filter_by_passage_support(
     for p in passages[:10]:  # top-10 passages (same as prompt)
         if isinstance(p, dict):
             content = p.get("contents") or p.get("text") or ""
-            title = p.get("id") or p.get("title") or ""
+            from kgproweight.kg.entity_linker import passage_title
+            title = passage_title(p)
             text_blocks.append(f"{title} {content}")
         elif isinstance(p, str):
             text_blocks.append(p)

@@ -1,0 +1,25 @@
+includes:
+  - phase3_sft.yaml
+
+# Combination repair after the 8k/50%-ProofKG continued-SFT run degraded the
+# frozen replay and macro pipeline metrics.  This run keeps all 4k unchanged
+# Hotpot replay rows but limits gold-derived 2Wiki ProofKG to 20% of exposure.
+# It does not add KL/distillation/frozen-layer constraints: PPO retains room to
+# improve the policy from the selected SFT state.
+training:
+  silver_path: data/silver_data/proofkg_curriculum_light20_v2_n5000_seed42_20260831/silver_curriculum.jsonl
+  question_kg_records_path: data/silver_data/proofkg_curriculum_light20_v2_n5000_seed42_20260831/question_kg_records.jsonl
+  min_question_kg_record_coverage: 1.0
+  require_nonempty_question_kg_records: false
+  sft_init_adapter_path: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+  output_dir: checkpoints/sft_proofkg_curriculum_light20_v2_n5000_seed42
+  sft_lr: 5.0e-6
+  sft_epochs: 1
+  # About 157 optimiser updates; retain 40/80/120/final for frozen-val
+  # checkpoint selection.  No checkpoint is deleted by a retention limit.
+  sft_save_strategy: steps
+  sft_save_steps: 40
+  sft_save_total_limit: null
+  sft_save_only_model: false
+  split: null
+  split_allow_none: true

@@ -1,0 +1,10 @@
+includes:
+  - phase1_silver.yaml
+
+# Regeneration pilot. The full-data config is inherited unchanged except for
+# concurrency: four workers make failures/accounting easier to inspect before a
+# paid full run. Dataset, train split, deterministic random sample size, rerank
+# and offline mode are explicit launcher arguments.
+training:
+  silver_data:
+    max_workers: 4

@@ -1,0 +1,10 @@
+# Balanced first 150 parent groups: H/W/M 50 each, K4, graph 40 groups.
+# Experiment ID: ppo_mixed4_emf1_v1_outcome_smoke600_seed42
+includes:
+  - phase3_ppo_mixed4_emf1_v1_outcome_seed42.yaml
+training:
+  output_dir: outputs/ppo_mixed4_emf1_v1_outcome_smoke600_seed42
+  fixed_rollout_schedule_path: outputs/audits/ppo_mixed4_emf1_v1_seed42/smoke600_schedule.jsonl
+  ppo:
+    total_ppo_steps: 600
+    save_every_steps: 200

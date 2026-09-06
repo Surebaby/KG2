@@ -1,0 +1,8 @@
+# Bounded A-probe12 successor. Only gate artifact path and output directory differ.
+# Independent utility PASS; health FAIL retained; no smoke/full permission.
+includes:
+- phase3_ppo_mixed4_answer_format_v2_a_probe_seed42.yaml
+training:
+  output_dir: outputs/ppo_mixed4_answer_format_v2_a_probe12_scoped_seed42_20260906_v1
+  ppo:
+    source_gate_calibration_path: outputs/calibration/source_credit_gate_v2_probe12_scoped_20260906_v1/gate.json

@@ -31,20 +31,21 @@ training:
   # containing a genuine outlier get bigger. Still well clear of the OOM at
   # max_length=2048, where a 1357-token sample padded its whole batch to ~1400.
   prm_max_length: 1024
+  # Recovery baseline: preserves the historical verdict/no-verdict target.
+  # The soft-target ablation is phase2_prm_soft_alpha.yaml and differs only in
+  # this field.
+  alpha_target: hard_verdict
 
   # ── train/val/test split ──
-  # Left at null so this file reproduces the checkpoints already trained with it.
-  # Set to "train" for the next run: that holds val/test back and makes a
-  # same-distribution held-out number possible. Until then the only
-  # generalisation evidence is the rejected-trajectory proxy in
-  # scripts/_phase2_prm_holdout.py, which is distribution-shifted, not held-out.
+  # Formal runs train only on the train fold. Historical whole-file reproduction
+  # requires both `split: null` and the explicit CLI flag --split_allow_none.
   #
   # 10% each rather than 5%: NEG is ~3.4% of held-out accepted steps, so a 5%
   # fold holds ~57 NEG steps and a NEG-recall 95% CI of +/-0.12. At 10% it is
   # ~114 steps and +/-0.086, while train still keeps ~20,078 trajectories.
   # Use the SAME values in phase 3, or a later phase trains on what phase 2
   # held out.
-  split: null
+  split: train
   val_ratio: 0.10
   test_ratio: 0.10
   # Separate from `seed` on purpose: a seed sweep over training randomness must

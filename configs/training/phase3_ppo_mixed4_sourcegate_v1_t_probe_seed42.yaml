@@ -1,0 +1,21 @@
+# Full-method successor: A is the primary model; F/T are matched ablations.
+# Status: CONFIG_PREPARED_CALIBRATION_AND_GPU_VALIDATION_PENDING.
+# All modes share frozen inputs, runtime v2, outcome, process placement/scales,
+# and the same calibration artifact. Legacy alpha checkpoints are incompatible.
+includes:
+  - phase3_ppo_mixed4_emf1_v1_outcome_seed42.yaml
+
+training:
+  output_dir: outputs/ppo_mixed4_sourcegate_v1_t_probe12_seed42
+  fixed_rollout_schedule_path: outputs/audits/ppo_mixed4_emf1_v1_seed42/probe12_schedule.jsonl
+  ppo:
+    total_ppo_steps: 12
+    save_every_steps: 12
+    source_gated_reward_version: v1
+    source_gate_mode: text
+    source_gate_calibration_path: outputs/calibration/source_quality_gate_v1_seed42/gate.json
+    mixed_outcome_reward: true
+    mixed_text_reward: true
+    proofkg_process_reward: true
+    proofkg_process_version: v2_3
+    center_text_reward: false  # v1 uses frozen calibration statistics, no EMA

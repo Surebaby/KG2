@@ -37,6 +37,21 @@ TRIPLE_RE = re.compile(
     r"|([A-Z][^–\-\n]+?)\s*[-–]+[>→]\s*([^\n(]+)\s*[-–]+[>→]\s*([A-Z][^\n(]+)"
 )
 
+# Citations are a schema field, not arbitrary parenthesised prose.  The old
+# parser applied TRIPLE_RE to the whole step and interpreted text such as
+# ``(e.g., a composer, a language)`` as a KG citation.  Keep TRIPLE_RE exported
+# for compatibility, but scope actual citation extraction to this one-line
+# field.
+KNOWLEDGE_USED_RE = re.compile(
+    r"(?im)^[ \t]*Knowledge Used\s*:\s*([^\r\n]*)$"
+)
+# A raw parenthesised item is sufficient for telemetry to say that the model
+# attempted a citation.  We deliberately do not coerce an unknown item into a
+# three-tuple: values may contain commas, so such a split is ambiguous without
+# the prompt KG.  Reward continues to consume only ``cited_triples`` matched
+# against ``known_kg``.
+RAW_CITATION_SURFACE_RE = re.compile(r"\([^()\r\n]+\)")
+
 ENTITY_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,4})\b")
 
 
@@ -51,17 +66,91 @@ class ParsedStep:
     cited_triples: List[Tuple[str, str, str]] = field(default_factory=list)
     mentioned_entities: List[str] = field(default_factory=list)
     intermediate_conclusion: Optional[str] = None
+    knowledge_used_field_count: int = 0
+    knowledge_used_valid: bool = False
+    citation_contract_errors: List[str] = field(default_factory=list)
+    # Telemetry-only raw contract observations.  These never enter r_kg, alpha,
+    # trajectory validity, or the Phase-1 accept/retry decision.
+    unknown_citation_surfaces: List[str] = field(default_factory=list)
+    knowledge_used_malformed_content: bool = False
 
     @classmethod
-    def from_text(cls, index: int, text: str) -> "ParsedStep":
+    def from_text(
+        cls,
+        index: int,
+        text: str,
+        known_kg: Optional[Sequence[Sequence[str]]] = None,
+    ) -> "ParsedStep":
+        fields = KNOWLEDGE_USED_RE.findall(text)
         cited: List[Tuple[str, str, str]] = []
-        for m in TRIPLE_RE.finditer(text):
-            if m.group(1):
-                h, r, t = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+        unknown_surfaces: List[str] = []
+        malformed_content = False
+        errors: List[str] = []
+        if len(fields) != 1:
+            errors.append(f"knowledge_used_field_count={len(fields)}")
+
+        for value in fields:
+            value = value.strip()
+            if value == "[]":
+                continue
+
+            residual = value
+            if known_kg is not None:
+                # Match the exact strings rendered in the prompt instead of
+                # splitting on commas: KG values legitimately contain commas
+                # (e.g. ``Washington, D.C.`` and organization names).
+                rendered = []
+                for triple in known_kg:
+                    if len(triple) != 3:
+                        continue
+                    h, r, t = (str(x).strip() for x in triple)
+                    rendered.append((f"({h}, {r}, {t})", (h, r, t)))
+                for surface, triple in sorted(rendered, key=lambda item: len(item[0]), reverse=True):
+                    while surface in residual:
+                        cited.append(triple)
+                        residual = residual.replace(surface, "", 1)
+                # Preserve raw unknown citation attempts for diagnostics before
+                # the legacy contract check collapses unknown and malformed into
+                # one backwards-compatible error code.
+                found_unknown = RAW_CITATION_SURFACE_RE.findall(residual)
+                unknown_surfaces.extend(s.strip() for s in found_unknown)
+                residual_without_unknown = RAW_CITATION_SURFACE_RE.sub("", residual)
+                if re.sub(r"[\[\],\s]", "", residual_without_unknown):
+                    malformed_content = True
             else:
-                h, r, t = m.group(4).strip(), m.group(5).strip(), m.group(6).strip()
-            if h and r and t:
-                cited.append((h, r, t))
+                # Generic parsing remains available when the caller has no KG,
+                # but still only inside the schema field.  KG-aware Phase 1,
+                # PPO reward and evaluation paths pass ``known_kg``.
+                spans = []
+                for match in TRIPLE_RE.finditer(value):
+                    if match.group(1):
+                        h, r, t = (
+                            match.group(1).strip(),
+                            match.group(2).strip(),
+                            match.group(3).strip(),
+                        )
+                    else:
+                        h, r, t = (
+                            match.group(4).strip(),
+                            match.group(5).strip(),
+                            match.group(6).strip(),
+                        )
+                    if h and r and t:
+                        cited.append((h, r, t))
+                        spans.append(match.span())
+                chars = list(value)
+                for start, end in spans:
+                    chars[start:end] = " " * (end - start)
+                residual = "".join(chars)
+                if re.sub(r"[\[\],\s]", "", residual):
+                    malformed_content = True
+
+            # After removing known/extracted triples, a valid field contains
+            # only the surrounding list syntax and separators.
+            if re.sub(r"[\[\],\s]", "", residual):
+                errors.append("unknown_or_malformed_knowledge_used_content")
+            if not (value.startswith("[") and value.endswith("]")):
+                errors.append("knowledge_used_must_be_bracketed_list")
 
         entities = list(dict.fromkeys(e for e in ENTITY_RE.findall(text) if len(e) > 2))
 
@@ -79,6 +168,11 @@ class ParsedStep:
             cited_triples=cited,
             mentioned_entities=entities,
             intermediate_conclusion=conclusion,
+            knowledge_used_field_count=len(fields),
+            knowledge_used_valid=not errors,
+            citation_contract_errors=list(dict.fromkeys(errors)),
+            unknown_citation_surfaces=unknown_surfaces,
+            knowledge_used_malformed_content=malformed_content,
         )
 
 
@@ -115,6 +209,11 @@ def parsed_step_from_silver_dict(step: Dict[str, Any], fallback_index: int = 0) 
         cited_triples=cited,
         mentioned_entities=parsed.mentioned_entities,
         intermediate_conclusion=parsed.intermediate_conclusion,
+        knowledge_used_field_count=parsed.knowledge_used_field_count,
+        knowledge_used_valid=parsed.knowledge_used_valid,
+        citation_contract_errors=parsed.citation_contract_errors,
+        unknown_citation_surfaces=parsed.unknown_citation_surfaces,
+        knowledge_used_malformed_content=parsed.knowledge_used_malformed_content,
     )
 
 
@@ -131,7 +230,10 @@ def _normalize_step_markers(raw: str) -> str:
     return t
 
 
-def parse_steps(raw_output: str) -> List[ParsedStep]:
+def parse_steps(
+    raw_output: str,
+    known_kg: Optional[Sequence[Sequence[str]]] = None,
+) -> List[ParsedStep]:
     """Parse a Teacher / Student trace into ``ParsedStep`` objects."""
     normalised = _normalize_step_markers(raw_output)
     blocks = re.split(r"\[Step\s+(\d+)\]", normalised)
@@ -147,7 +249,7 @@ def parse_steps(raw_output: str) -> List[ParsedStep]:
         body = blocks[i + 1].strip()
         body = re.split(r"\[Final Answer\]|Final Answer\s*[:：]", body, maxsplit=1, flags=re.IGNORECASE)[0].strip()
         if body:
-            steps.append(ParsedStep.from_text(step_index, body))
+            steps.append(ParsedStep.from_text(step_index, body, known_kg=known_kg))
         i += 2
     return steps
 

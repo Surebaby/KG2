@@ -101,3 +101,20 @@ nohup.out
 # ---------------------------------------------------------------------------
 _archive/
 uploads/
+
+# Code-only GitHub releases: keep local research assets outside Git.
+/archive/
+/indexes_smoke/
+/logs/
+/reports/
+/docs/paper/
+/references/
+/.agents/
+/.codex/
+/.claude/
+/R7_deploy_package.tar.gz
+/scripts/_remote_check.py
+/scripts/_ssh_check.sh
+/scripts/deploy/deploy_R7.py
+/scripts/deploy/_ssh_lab.py
+*.docx

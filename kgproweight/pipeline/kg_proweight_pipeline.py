@@ -65,6 +65,8 @@ class KGProWeightPipeline(BasicPipeline):
         rerank_method: str = "cross-encoder",
         cross_encoder_model: str = "models/bge-reranker-v2-m3",
         alpha_bias_correction: Optional[float] = None,
+        kg_supply_mode: str = "legacy",
+        question_kg_records_path: Optional[str] = None,
         generator=None,
         retriever=None,
         **kwargs,
@@ -115,6 +117,25 @@ class KGProWeightPipeline(BasicPipeline):
         # Where each sample's KG came from — logged after run() so a 0% index
         # hit rate (the R9 v6 dev-split gap) is visible instead of silent.
         self._kg_source_counts: Dict[str, int] = {"index": 0, "fallback": 0, "empty": 0}
+
+        # ProofKG-v1 supply (optional, default off). When ``kg_supply_mode`` is
+        # "proofkg_v1", the pipeline reads a versioned per-question ProofKG
+        # record (keyed by ``dataset::qid``) instead of the legacy question-KG
+        # index. The legacy index load below still runs so that falling back to
+        # "legacy" reproduces every historical run bit-for-bit.
+        self.kg_supply_mode = kg_supply_mode
+        self._current_dataset_name: str = ""
+        self._proofkg_records: Dict[str, List[Tuple[str, str, str]]] = {}
+        self._qpeg_records: Dict[str, Dict] = {}
+        self._selective_records: Dict[str, Dict] = {}
+        if kg_supply_mode == "qpeg_v1":
+            self._load_qpeg_records(question_kg_records_path)
+        elif kg_supply_mode == "proofkg_v1":
+            self._load_proofkg_records(question_kg_records_path)
+        elif kg_supply_mode in ("legacy_plus_proofkg", "legacy_plus_complete_proofkg"):
+            self._load_selective_records(question_kg_records_path)
+        elif kg_supply_mode != "legacy":
+            raise ValueError(f"unknown kg_supply_mode={kg_supply_mode!r}")
 
         # R9 v6: load pre-built question→KG index (v2 filtered cache) to align
         # inference KG quality with training. Falls back to live Wikidata on miss.
@@ -195,10 +216,191 @@ class KGProWeightPipeline(BasicPipeline):
                     return [tuple(t) for t in mod if len(t) == 3]
         return None
 
+    def _load_proofkg_records(self, path: Optional[str]) -> None:
+        import json as _json
+        from kgproweight.kg.question_kg import load_question_kg_index
+        if not path:
+            raise ValueError("kg_supply_mode=proofkg_v1 requires question_kg_records_path")
+        _p = Path(path)
+        if not _p.is_file():
+            raise ValueError(f"question_kg_records_path not found: {_p}")
+        _records = [
+            _json.loads(_line)
+            for _line in _p.read_text(encoding="utf-8").splitlines()
+            if _line.strip()
+        ]
+        # load_question_kg_index enforces: canonical schema, question_key ==
+        # dataset::qid (no auto-join), question hash matches the stored question,
+        # triples are non-empty 3-tuples, and no duplicate keys.
+        _index = load_question_kg_index(_records)
+        self._proofkg_records = {
+            _key: [tuple(t) for t in _rec["kg_subgraph"]]
+            for _key, _rec in _index.items()
+        }
+        logger.info("Loaded %d ProofKG-v1 records (kg_supply_mode=%s) from %s",
+                    len(self._proofkg_records), self.kg_supply_mode, _p.name)
+
+    def _load_qpeg_records(self, path: Optional[str]) -> None:
+        import json as _json
+        from kgproweight.kg.qpeg import validate_qpeg_record
+        if not path:
+            raise ValueError("kg_supply_mode=qpeg_v1 requires question_kg_records_path")
+        _p = Path(path)
+        if not _p.is_file():
+            raise ValueError(f"QPEG records not found: {_p}")
+        self._qpeg_records = {}
+        for _line in _p.read_text(encoding="utf-8").splitlines():
+            if not _line.strip():
+                continue
+            _record = _json.loads(_line)
+            validate_qpeg_record(_record)
+            _key = str(_record["question_key"])
+            if _key in self._qpeg_records:
+                raise ValueError(f"duplicate QPEG record key: {_key}")
+            self._qpeg_records[_key] = _record
+        logger.info("Loaded %d QPEG-v1 records from %s", len(self._qpeg_records), _p.name)
+
+    def _load_selective_records(self, path: Optional[str]) -> None:
+        import json as _json
+        from kgproweight.kg.question_kg import question_key
+        from kgproweight.kg.selective_proofkg import validate_selective_proofkg_record
+        if not path:
+            raise ValueError(f"kg_supply_mode={self.kg_supply_mode} requires question_kg_records_path (selective records)")
+        _p = Path(path)
+        if not _p.is_file():
+            raise ValueError(f"selective records not found: {_p}")
+        _records = [
+            _json.loads(_line)
+            for _line in _p.read_text(encoding="utf-8").splitlines()
+            if _line.strip()
+        ]
+        for _rec in _records:
+            # fail-fast on a corrupt/mismatched record; never a silent legacy fallback
+            validate_selective_proofkg_record(
+                _rec, dataset=str(_rec.get("dataset") or ""), qid=str(_rec.get("qid") or "")
+            )
+        self._selective_records = {}
+        for _rec in _records:
+            _key = question_key(str(_rec["dataset"]), str(_rec["qid"]))
+            if _key in self._selective_records:
+                raise ValueError(f"duplicate selective record key: {_key}")
+            self._selective_records[_key] = _rec
+        logger.info("Loaded %d selective ProofKG records (kg_supply_mode=%s) from %s",
+                    len(self._selective_records), self.kg_supply_mode, _p.name)
+
+    def _augment_with_selective(self, legacy, item, arm) -> List[Tuple[str, str, str]]:
+        from kgproweight.kg.question_kg import question_key, question_sha256
+        from kgproweight.kg.selective_proofkg import (
+            merge_legacy_and_proof_edges,
+            select_selective_proof_edges,
+        )
+        _key = question_key(self._current_dataset_name, str(item.id))
+        rec = self._selective_records.get(_key)
+        if rec is None:
+            # join must be 1.0; a missing record is a corrupt asset, not a fallback
+            raise ValueError(f"selective ProofKG record missing for {_key} (join < 1.0)")
+        if rec.get("question_sha256") != question_sha256(str(item.question)):
+            raise ValueError(f"selective record question hash mismatch for {_key}")
+        proof_edges = select_selective_proof_edges(rec, arm=arm)
+        if not proof_edges:
+            # legal record but no trusted edges (or not complete for C): exact legacy
+            return list(legacy)
+        merged, counters = merge_legacy_and_proof_edges(legacy, proof_edges, cap=self.max_kg_triples)
+        self._selective_counters = getattr(self, "_selective_counters", [])
+        self._selective_counters.append(counters)
+        return merged
+
+    def _enforce_proofkg_join(self, dataset) -> None:
+        """Fail-fast identity join for ``kg_supply_mode=proofkg_v1``.
+
+        A partial ProofKG-v1 materialisation must never look like a complete
+        experiment: in this mode the pipeline requires every eval item to have a
+        versioned record keyed by ``dataset::qid`` *before* any generation runs,
+        instead of silently supplying an empty KG on a miss (``_build_kg_context``
+        keeps its empty-on-miss branch as a defensive per-item fallback, but the
+        run-level gate below makes that branch unreachable for the configured
+        question set).
+        """
+        from kgproweight.kg.question_kg import question_key
+        if not self._current_dataset_name:
+            raise ValueError(
+                "kg_supply_mode=proofkg_v1 requires a known dataset_name to join "
+                "records by dataset::qid; got an empty dataset_name."
+            )
+        qids = list(getattr(dataset, "id", []) or [])
+        missing = [
+            qid for qid in qids
+            if question_key(self._current_dataset_name, str(qid)) not in self._proofkg_records
+        ]
+        if missing:
+            raise ValueError(
+                f"kg_supply_mode=proofkg_v1 identity join < 1.0 on "
+                f"{self._current_dataset_name!r}: {len(missing)}/{len(qids)} questions "
+                f"have no ProofKG-v1 record (first missing qids: {missing[:5]!r}). "
+                f"Materialise question_kg_records for this exact question set before "
+                f"running; empty-KG-on-miss is not permitted."
+            )
+
+    def _enforce_qpeg_join(self, dataset) -> None:
+        """Require an identity- and question-hash-exact QPEG record for every item."""
+        from kgproweight.kg.question_kg import question_key, question_sha256
+        if not self._current_dataset_name:
+            raise ValueError("kg_supply_mode=qpeg_v1 requires a known dataset_name")
+        missing: List[str] = []
+        mismatched: List[str] = []
+        for item in dataset:
+            key = question_key(self._current_dataset_name, str(item.id))
+            record = self._qpeg_records.get(key)
+            if record is None:
+                missing.append(str(item.id))
+            elif record.get("question_sha256") != question_sha256(str(item.question)):
+                mismatched.append(str(item.id))
+        if missing or mismatched:
+            raise ValueError(
+                "kg_supply_mode=qpeg_v1 identity/hash join < 1.0 on "
+                f"{self._current_dataset_name!r}: missing={len(missing)}, "
+                f"hash_mismatch={len(mismatched)}; first missing={missing[:5]!r}, "
+                f"first mismatched={mismatched[:5]!r}"
+            )
+
     def _build_kg_context(self, item, passages=None) -> List[Tuple[str, str, str]]:
         if not self.inject_kg:
             return []
 
+        if self.kg_supply_mode == "qpeg_v1":
+            from kgproweight.kg.question_kg import question_key, question_sha256
+            from kgproweight.kg.qpeg import compute_passages_sha256
+            _key = question_key(self._current_dataset_name, str(item.id))
+            _record = self._qpeg_records.get(_key)
+            if _record is None:
+                raise ValueError(f"QPEG record missing for {_key}")
+            if _record.get("question_sha256") != question_sha256(str(item.question)):
+                raise ValueError(f"QPEG question hash mismatch for {_key}")
+            if passages is None or _record.get("passages_sha256") != compute_passages_sha256(passages):
+                raise ValueError(f"QPEG passages hash mismatch for {_key}")
+            self._kg_source_counts["index"] += 1
+            return [tuple(value) for value in _record["kg_subgraph"][: self.max_kg_triples]]
+
+        # ProofKG-v1 supply: look up the versioned per-question record by
+        # dataset::qid, exactly as training consumed it. No live-Wikidata fallback
+        # in this mode — a missing record is an empty KG, not a silent legacy mix.
+        if self.kg_supply_mode == "proofkg_v1":
+            from kgproweight.kg.question_kg import question_key
+            _key = question_key(self._current_dataset_name, str(item.id))
+            if _key in self._proofkg_records:
+                self._kg_source_counts["index"] += 1
+                return list(self._proofkg_records[_key][: self.max_kg_triples])
+            self._kg_source_counts["empty"] += 1
+            return []
+
+        if self.kg_supply_mode in ("legacy_plus_proofkg", "legacy_plus_complete_proofkg"):
+            legacy = self._build_legacy_kg_context(item, passages)
+            arm = "complete" if self.kg_supply_mode == "legacy_plus_complete_proofkg" else "partial"
+            return self._augment_with_selective(legacy, item, arm)
+
+        return self._build_legacy_kg_context(item, passages)
+
+    def _build_legacy_kg_context(self, item, passages=None) -> List[Tuple[str, str, str]]:
         dropout = self._get_dropout_kg(item)
         if dropout is not None:
             return list(dropout)
@@ -262,7 +464,14 @@ class KGProWeightPipeline(BasicPipeline):
     # ------------------------------------------------------------------
 
     def run(self, dataset, do_eval: bool = True, pred_process_fun=None):
+        self._current_dataset_name = getattr(dataset, "dataset_name", "")
         questions = list(dataset.question)
+        # ProofKG-v1 supply: refuse to run on a partial question set rather than
+        # silently emitting empty KG for the uncovered questions.
+        if self.kg_supply_mode == "proofkg_v1":
+            self._enforce_proofkg_join(dataset)
+        elif self.kg_supply_mode == "qpeg_v1":
+            self._enforce_qpeg_join(dataset)
         logger.info("KGProWeight inference on %d samples (top_k=%d, inject_kg=%s)",
                     len(questions), self.retrieval_topk, self.inject_kg)
 
@@ -380,7 +589,12 @@ class KGProWeightPipeline(BasicPipeline):
 
     def _compute_alpha_stats(self, generated_text: str, kg_subgraph, query: str,
                               logprobs=None) -> Dict:
-        steps = parse_steps(generated_text) if generated_text else []
+        # Telemetry/parser change (registered separately from the KG-source
+        # switch): passing known_kg makes citation parsing match the prompt's
+        # exact "(h, r, t)" rendering instead of comma-splitting. It changes
+        # cited_triples → α (cite_any/cite_match) and heuristic IHR only; it does
+        # NOT enter prompt construction, answer extraction, or EM/F1.
+        steps = parse_steps(generated_text, known_kg=kg_subgraph) if generated_text else []
         alphas: List[float] = []
         for step in steps:
             # D1: use real per-token logprobs from generation when available.
@@ -413,7 +627,9 @@ class KGProWeightPipeline(BasicPipeline):
     def _compute_ihr(self, generated_text: str, kg_subgraph) -> Dict:
         if not generated_text or not kg_subgraph:
             return {"ihr_heuristic": None, "n_steps": 0, "n_hallucinated": 0}
-        steps = parse_steps(generated_text)
+        # Same telemetry/parser change as _compute_alpha_stats: known_kg affects
+        # cited_triples → heuristic IHR, not the answer/EM/F1 path.
+        steps = parse_steps(generated_text, known_kg=kg_subgraph)
         labels = self.prm_annotator.annotate_trajectory(steps, kg_subgraph)
         n_neg = sum(1 for x in labels if x == -1)
         total = len(labels)

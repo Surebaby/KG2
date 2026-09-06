@@ -1,0 +1,74 @@
+# Preparation specification, NOT accepted by the legacy silver-data launcher.
+# No SFT/PPO training is authorized or launched by this file.
+experiment_id: SFT-V3-THREE-DOMAIN-FROM-BASE-SEED42-20260906-V1
+status: DATA_PREPARATION_IN_PROGRESS_NOT_TRAINED
+combination_experiment: true
+combination_variables:
+  - three_domain_supervision
+  - exact_ten_visible_passages
+  - two_to_five_concise_supported_steps
+  - independent_teacher_process_review
+
+model:
+  base_model: models/llama3-8b
+  init_adapter_path: null
+  adapter_initialization: fresh_lora
+  comparison_adapter_read_only: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+
+data:
+  format: sft-v3-reviewed-generation-v1
+  strict_loader: kgproweight.data.sft_v3_contract.tokenize_frozen_sft_v3_record
+  candidate_manifest: data/silver_data/sft_v3_three_domain_candidate_pool_n16500_seed42_20260906_v1/manifest.json
+  protected_manifest: outputs/audits/sft_v3_protected_identity_ledger_20260906_v1/manifest.json
+  graph_capacity_manifest: outputs/audits/sft_v3_source_backed_kg_capacity_20260906_v1/manifest.json
+  accepted_release_manifest: null  # mandatory before any training launch
+  targets_per_domain: {train: 2000, validation: 100}
+  datasets: [hotpotqa, 2wikimultihopqa, musique]
+  minimum_steps: 2
+  maximum_steps: 5
+  passages_per_question: 10
+  visible_passage_character_limit: 1200
+  maximum_kg_triples: 12
+  max_assistant_tokens_including_eot: 384
+  max_sequence_tokens: 6144
+  train_on_prompt: false
+  replace_final_with_gold: false
+  drop_passages_to_fit: false
+  truncate_target_to_fit: false
+  semantic_review: independent_gold_blind_model_per_complete_trace
+  gold_usage: original_train_labels_post_generation_admission_only
+  answer_gate: original_normalized_exact_match
+  retries: none
+
+teacher:
+  producer: {model: deepseek-v4-flash, thinking: false, temperature: 0.2, max_tokens: 1800}
+  reviewer: {model: deepseek-v4-pro, thinking: false, temperature: 0.0, max_tokens: 1000}
+  workers: 8
+  proposed_budget_usd: 50
+  budget_authorized: false
+  accounting: peak_cache_miss_upper_estimate_with_inflight_reservation
+  automatic_paid_execution: false
+
+# Proposed parity settings for the later, separately frozen training run.
+# A GPU pilot and checkpoint selection protocol must precede real training.
+training_proposal:
+  seed: 42
+  epochs: 1
+  learning_rate: 0.00002
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 16
+  effective_batch_size_single_gpu: 32
+  dtype: bf16
+  gradient_checkpointing: true
+  lora: {r: 32, alpha: 64, dropout: 0.05, target_modules: [q_proj, k_proj, v_proj, o_proj]}
+  loss: unweighted_assistant_only_causal_cross_entropy
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  logging_steps: 5
+  save_steps: 50
+  save_total_limit: null
+  report_to: tensorboard
+  logging_dir: outputs/tensorboard/sft_v3_three_domain_from_base_seed42
+  checkpoint_selection: freeze_before_training_using_existing_development_protocol
+  automatic_training_launch: false

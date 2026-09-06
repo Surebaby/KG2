@@ -1,0 +1,15 @@
+includes:
+  - phase3_ppo_legacy_repaired_v2_quota70_smoke600_combined_stability_v1.yaml
+
+# RESEARCHER-APPROVED COMBINATION SMOKE (2026-08-28).
+#
+# Relative to combined_stability_v1, the sole primary research variable is the
+# rollout passage input: preserve the old first 10 passages and append up to 5
+# independently retrieved bridge passages.  Reward, loss, KG index, explicit
+# SFT reference, 10% replay, critic settings and KL settings are inherited
+# unchanged.  The schedule is an assertion over the legacy seeded sampler, not
+# a replacement sampling policy.
+training:
+  output_dir: outputs/ppo_legacy_repaired_v2_quota70_hard_seed42_no_text_head_smoke600_hybrid_old10_bridge5_v3
+  passage_overrides_path: data/silver_data/pilots/ppo_smoke_hybrid_train_seed42_20260828/old10_bridge5_v3.jsonl
+  rollout_schedule_path: data/silver_data/pilots/ppo_smoke_hybrid_train_seed42_20260828/schedule600.jsonl

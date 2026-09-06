@@ -23,11 +23,11 @@ reward:
   outcome_em_weight: 1.0
   use_real_logprobs: true
   alpha_gate:
-    initial_W: [1.0, 1.5, -0.8]
+    initial_W: [1.0, 1.5, -0.8, 0.9, 1.0]
     initial_b: -2.0
     temperature: 0.5
     calibration_weight: 0.1
-    feature_dim: 3
+    feature_dim: 5
 
 training:
   seed: 42

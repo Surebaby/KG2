@@ -45,6 +45,7 @@ _RELATION_PRIORITY: dict[str, int] = {
     "P17": 9,   # country
     "P131": 8,  # located in administrative entity
     "P276": 7,  # location
+    "P2632": 6, # place of detention
     "P159": 8,  # headquarters location
     "P36": 7,   # capital
     "P47": 5,   # shares border with
@@ -52,6 +53,7 @@ _RELATION_PRIORITY: dict[str, int] = {
     "P112": 7,  # founded by
     "P571": 8,  # inception (founding date)
     "P576": 8,  # dissolved date
+    "P577": 8,  # publication date
     "P127": 7,  # owned by
     "P176": 7,  # manufacturer
     "P355": 6,  # subsidiary
@@ -64,6 +66,7 @@ _RELATION_PRIORITY: dict[str, int] = {
     "P50": 8,   # author
     "P170": 7,  # creator
     "P175": 7,  # performer
+    "P371": 6,  # presenter
     # Education
     "P69": 7,   # educated at
     "P108": 7,  # employer
@@ -255,6 +258,7 @@ class WikidataSubgraphRetriever:
         cache_dir: Optional[str] = None,
         request_delay: float = REQUEST_DELAY,
         offline: bool = False,
+        include_literal_values: bool = False,
     ) -> None:
         if max_hops not in (1, 2):
             raise ValueError("max_hops must be 1 or 2")
@@ -266,6 +270,11 @@ class WikidataSubgraphRetriever:
         # real subgraphs; a miss returns [] INSTANTLY (no 30s×3 SPARQL timeout,
         # no inter-request sleep). Use when query.wikidata.org is unreachable.
         self.offline = offline
+        # Legacy SPARQL required every tail to have an English rdfs:label,
+        # silently excluding literal dates/numbers even though P569/P570/P571
+        # were in the relation whitelist. Keep the historical default for
+        # reproducibility; new proof-KG experiments opt in explicitly.
+        self.include_literal_values = bool(include_literal_values)
         cache_path = None
         if cache_dir:
             from pathlib import Path
@@ -279,6 +288,18 @@ class WikidataSubgraphRetriever:
 
     def _build_1hop_query(self, qid: str) -> str:
         limit = self.max_neighbors
+        if self.include_literal_values:
+            return f"""
+SELECT ?headLabel ?propLabel ?tailLabel WHERE {{
+  wd:{qid} ?prop ?tail .
+  ?propEntity wikibase:directClaim ?prop .
+  ?propEntity rdfs:label ?propLabel . FILTER(LANG(?propLabel)="en")
+  wd:{qid} rdfs:label ?headLabel . FILTER(LANG(?headLabel)="en")
+  OPTIONAL {{ ?tail rdfs:label ?tailEntityLabel . FILTER(LANG(?tailEntityLabel)="en") }}
+  BIND(IF(isLiteral(?tail), STR(?tail), ?tailEntityLabel) AS ?tailLabel)
+  FILTER(BOUND(?tailLabel))
+}} LIMIT {limit}
+"""
         return f"""
 SELECT ?headLabel ?propLabel ?tailLabel WHERE {{
   wd:{qid} ?prop ?tail .
@@ -291,6 +312,22 @@ SELECT ?headLabel ?propLabel ?tailLabel WHERE {{
 
     def _build_2hop_query(self, qid: str) -> str:
         limit = self.max_neighbors
+        if self.include_literal_values:
+            return f"""
+SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
+  wd:{qid} ?p1 ?mid .
+  ?p1Ent wikibase:directClaim ?p1 .
+  ?p1Ent rdfs:label ?p1Label . FILTER(LANG(?p1Label)="en")
+  wd:{qid} rdfs:label ?headLabel . FILTER(LANG(?headLabel)="en")
+  ?mid rdfs:label ?midLabel . FILTER(LANG(?midLabel)="en")
+  ?mid ?p2 ?tail .
+  ?p2Ent wikibase:directClaim ?p2 .
+  ?p2Ent rdfs:label ?p2Label . FILTER(LANG(?p2Label)="en")
+  OPTIONAL {{ ?tail rdfs:label ?tailEntityLabel . FILTER(LANG(?tailEntityLabel)="en") }}
+  BIND(IF(isLiteral(?tail), STR(?tail), ?tailEntityLabel) AS ?tailLabel)
+  FILTER(BOUND(?tailLabel))
+}} LIMIT {limit}
+"""
         return f"""
 SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
   wd:{qid} ?p1 ?mid .
@@ -319,6 +356,11 @@ SELECT ?headLabel ?p1Label ?midLabel ?p2Label ?tailLabel WHERE {{
         ``{qid}_{hops}`` scheme, making the whole on-disk cache dead weight in
         offline mode. We now cache RAW subgraphs and filter at read time.
         """
+        if self.include_literal_values:
+            # Never fall back to a legacy cache row: those rows are known to be
+            # literal-incomplete, and treating them as a hit would silently
+            # recreate the P569/P570/P571 absence this mode exists to fix.
+            return [f"{qid}_{self.max_hops}_{self.max_neighbors}_literal_v1"]
         return [
             f"{qid}_{self.max_hops}_{self.max_neighbors}",   # current
             f"{qid}_{self.max_hops}_{self.max_neighbors}_all",  # R9 v6 interim

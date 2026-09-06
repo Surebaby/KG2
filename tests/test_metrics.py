@@ -49,6 +49,7 @@ def test_paired_bootstrap_handles_identical_inputs():
     out = paired_bootstrap(a, a, n_resamples=200)
     assert out["diff_mean"] == pytest.approx(0.0)
     assert out["n"] == 3
+    assert out["p_value"] == 1.0
 
 
 def test_paired_bootstrap_detects_difference():

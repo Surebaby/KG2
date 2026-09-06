@@ -53,7 +53,7 @@ def convert_numpy(obj: Union[Dict, list, np.ndarray, np.generic]) -> Any:
         return float(obj)
     else:
         return obj  # Return the object as-is if it's neither a dict, list, nor numpy type
-    
+
 def load_model(model_path: str, use_fp16: bool = False):
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
@@ -113,7 +113,7 @@ def parse_query(model_name, query_list, instruction=None, is_query=True):
         instruction = instruction.strip() + " "
     else:
         instruction = set_default_instruction(model_name, is_query=is_query, is_zh=judge_zh(query_list[0]))
-    
+
     if not _has_printed_instruction:
         if instruction == "":
             warnings.warn('Instruction is not set')
@@ -127,6 +127,24 @@ def parse_query(model_name, query_list, instruction=None, is_query=True):
 
 
 def load_corpus(corpus_path: str):
+    # KG-ProWeight wiki18 contains 21,015,324 rows. HuggingFace Dataset's JSON
+    # loader reached 52.3 GB RSS and was OOM-killed on a 62 GB host before the
+    # first query. bm25s ships a read-only JSONL mmap wrapper backed by the
+    # adjacent `corpus.mmindex.json`, so only retrieved rows are decoded. This
+    # changes storage/access only; row ids and document contents are unchanged.
+    if os.environ.get("KGPW_CORPUS_MMAP", "").lower() in {"1", "true", "yes", "on"}:
+        if not corpus_path.endswith(".jsonl"):
+            raise ValueError("KGPW_CORPUS_MMAP requires a .jsonl corpus")
+        from bm25s.utils.corpus import JsonlCorpus
+
+        corpus = JsonlCorpus(corpus_path, show_progress=True, save_index=True, verbosity=0)
+        first = corpus[0] if len(corpus) else {}
+        if "contents" not in first:
+            raise ValueError(
+                f"Memory-mapped corpus {corpus_path} has no 'contents' field; "
+                "automatic Dataset.map conversion is intentionally unavailable."
+            )
+        return corpus
     if corpus_path.endswith(".jsonl"):
         corpus = datasets.load_dataset('json', data_files=corpus_path, split="train")
     elif corpus_path.endswith(".parquet"):
@@ -208,4 +226,3 @@ def judge_image(x):
     else:
         warnings.warn('image type not supported')
     return False
-    

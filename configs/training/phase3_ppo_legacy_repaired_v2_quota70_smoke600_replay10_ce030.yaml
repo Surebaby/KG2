@@ -1,0 +1,11 @@
+includes:
+  - phase3_ppo_legacy_repaired_v2_quota70_smoke600.yaml
+
+# Single-variable retention smoke after the replay10/CE=0.10 run regressed on
+# the frozen n=200 validation set.  Keep the replay sample ratio and every PPO,
+# reward, generation, data and evaluation setting unchanged; only strengthen
+# the supervised full-trajectory CE update.
+training:
+  output_dir: outputs/ppo_legacy_repaired_v2_quota70_hard_seed42_no_text_head_smoke600_replay10_ce030
+  ppo:
+    sft_anchor_weight: 0.30

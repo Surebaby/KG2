@@ -23,6 +23,7 @@ from kgproweight.kg.wikidata_retriever import (
 from kgproweight.data.silver_dataset import SilverDatasetReader, SilverTrajectory
 from kgproweight.training.phase2_prm import (
     _StepSample,
+    _alpha_calibration_target,
     _label_to_class,
     _step_samples_from_silver,
     build_prm_input,
@@ -163,6 +164,22 @@ def test_fractional_labels_bucket_not_truncate(label, expected):
 
 def test_partial_credit_is_not_neutral():
     assert _label_to_class(0.75) != _label_to_class(0.0)
+
+
+def test_alpha_hard_and_soft_targets_differ_only_on_partial_credit():
+    labels = torch.tensor([-1.0, 0.0, 0.25, 0.75, 1.0])
+    classes = torch.tensor([0, 1, 1, 2, 2])
+    hard = _alpha_calibration_target(classes, labels, "hard_verdict")
+    soft = _alpha_calibration_target(classes, labels, "soft_abs_rkg")
+    assert hard.tolist() == [1.0, 0.0, 0.0, 1.0, 1.0]
+    assert soft.tolist() == pytest.approx([1.0, 0.0, 0.25, 0.75, 1.0])
+
+
+def test_alpha_soft_target_keeps_contradiction_at_full_trust():
+    got = _alpha_calibration_target(
+        torch.tensor([0]), torch.tensor([-1.0]), "soft_abs_rkg"
+    )
+    assert got.item() == 1.0
 
 
 # ---------------------------------------------------------------------------

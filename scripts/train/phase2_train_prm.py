@@ -72,6 +72,11 @@ def parse_args() -> argparse.Namespace:
              "over training randomness does not also reshuffle the held-out set "
              "(default 42).",
     )
+    p.add_argument(
+        "--split_allow_none", action="store_true", default=argparse.SUPPRESS,
+        help="Deliberately train on the whole silver file. Only for reproducing "
+             "historical pre-split runs; results are not held-out.",
+    )
     p.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     p.add_argument("--no_lora", action="store_true")
     p.add_argument("--no_text_head", action="store_true")
@@ -96,8 +101,12 @@ def main() -> None:
     if args.config:
         cfg_doc = load_config(args.config, validate=ProjectConfig)
         tcfg = cfg_doc.training
-        silver = args.silver_data or str(Path(data_dir()) / "silver_data" / "silver_trajectories.jsonl")
-        out_dir = args.output_dir or str(Path(checkpoint_dir()) / "prm_alpha_gate")
+        silver = args.silver_data or getattr(tcfg, "silver_path", None) or str(
+            Path(data_dir()) / "silver_data" / "silver_trajectories.jsonl"
+        )
+        out_dir = args.output_dir or tcfg.output_dir or str(
+            Path(checkpoint_dir()) / "prm_alpha_gate"
+        )
         p2 = Phase2Config(
             silver_path=silver,
             output_dir=out_dir,
@@ -117,6 +126,7 @@ def main() -> None:
             lora_alpha=tcfg.lora_alpha,
             lora_dropout=tcfg.lora_dropout,
             calibration_weight=cfg_doc.reward.alpha_gate.calibration_weight,
+            alpha_target=tcfg.alpha_target,
             train_text_reward_head=not args.no_text_head,
             binary_labels_only=args.binary_labels_only,
             gradient_checkpointing=not args.no_gradient_checkpointing,
@@ -125,6 +135,9 @@ def main() -> None:
             val_ratio=getattr(args, "val_ratio", tcfg.val_ratio),
             test_ratio=getattr(args, "test_ratio", tcfg.test_ratio),
             split_seed=getattr(args, "split_seed", tcfg.split_seed),
+            split_allow_none=getattr(
+                args, "split_allow_none", getattr(tcfg, "split_allow_none", False)
+            ),
             **({"logprob_batch_size": args.logprob_batch_size}
                if getattr(args, "logprob_batch_size", None) else {}),
         )
@@ -150,6 +163,7 @@ def main() -> None:
             val_ratio=getattr(args, "val_ratio", DEFAULT_VAL_RATIO),
             test_ratio=getattr(args, "test_ratio", DEFAULT_TEST_RATIO),
             split_seed=getattr(args, "split_seed", DEFAULT_SPLIT_SEED),
+            split_allow_none=getattr(args, "split_allow_none", False),
             **({"logprob_batch_size": args.logprob_batch_size}
                if getattr(args, "logprob_batch_size", None) else {}),
         )

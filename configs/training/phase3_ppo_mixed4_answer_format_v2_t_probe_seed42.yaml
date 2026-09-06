@@ -1,0 +1,9 @@
+# ANSWER-FORMAT-V2-T-PROBE12-SEED42-20260906
+# Independent objective experiment: original data/prompt/SFT/source gate.
+# Source-credit confirmation clearance remains mandatory; this file grants none.
+includes:
+- phase3_ppo_mixed4_source_credit_v2_features_t_probe_seed42.yaml
+training:
+  output_dir: outputs/ppo_mixed4_answer_format_v2_t_probe12_seed42
+  ppo:
+    answer_format_reward_version: v2

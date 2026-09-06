@@ -28,7 +28,7 @@ def parse_args():
     p.add_argument("--output_dir", default=None)
     p.add_argument("--sft_checkpoint", default=None)
     p.add_argument("--alpha_gate_path", default=None)
-    p.add_argument("--text_reward_backend", default="auto", choices=["rearag", "llama_head", "auto", "dummy"])
+    p.add_argument("--text_reward_backend", default=None, choices=["rearag", "llama_head", "auto", "dummy"])
     p.add_argument("--text_reward_fallback_path", default=None)
     # R10: default=None so "was it passed?" is distinguishable from "it happens
     # to equal the YAML value". With --config these used to be dropped on the
@@ -55,6 +55,31 @@ def parse_args():
     p.add_argument("--max_kg_index_miss_rate", type=float, default=None,
                    help="Abort if the index misses more than this fraction of "
                         "prompts (default from YAML; 1.0 = warn only).")
+    p.add_argument(
+        "--question_kg_records_path",
+        default=None,
+        help="Identity-safe dataset::qid + question-hash KG JSONL. Mutually "
+             "exclusive with --question_kg_index_path.",
+    )
+    p.add_argument("--min_question_kg_record_coverage", type=float, default=None)
+    p.add_argument("--require_nonempty_question_kg_records", action="store_true")
+    p.add_argument(
+        "--require_exact_kg_index_alignment", action="store_true",
+        help="Abort unless every indexed triple list exactly equals the stored "
+             "silver KG for that accepted trajectory.",
+    )
+    p.add_argument(
+        "--passage_overrides_path",
+        default=None,
+        help="Versioned qid->retrieved_passages JSONL for PPO rollout prompts. "
+             "Must be paired with --rollout_schedule_path.",
+    )
+    p.add_argument(
+        "--rollout_schedule_path",
+        default=None,
+        help="Frozen rollout qid schedule used as a fail-fast RNG/data guard. "
+             "Must be paired with --passage_overrides_path.",
+    )
     p.add_argument("--alpha_override", type=float, default=None)
     p.add_argument("--binary_labels_only", action="store_true")
     add_split_args(p)
@@ -72,13 +97,31 @@ def main():
         cfg_doc = load_config(args.config, validate=ProjectConfig)
         tcfg = cfg_doc.training
         ppo_cfg = tcfg.ppo
+        silver = args.silver_data or tcfg.silver_path or silver
+        out_dir = args.output_dir or tcfg.output_dir or out_dir
+        sft = args.sft_checkpoint or tcfg.sft_checkpoint or sft
+        # The mixed PPO-T/PPO-TK route deliberately disables the historical
+        # learned alpha gate.  Preserve an explicit YAML null instead of
+        # silently replacing it with the legacy default checkpoint.  Legacy
+        # configurations retain the historical fallback behaviour.
+        if args.alpha_gate_path is not None:
+            alpha = args.alpha_gate_path
+        elif getattr(ppo_cfg, "mixed_outcome_reward", False):
+            alpha = tcfg.alpha_gate_path
+        else:
+            alpha = tcfg.alpha_gate_path or alpha
         cfg = Phase3PPOConfig(
             silver_path=silver,
             output_dir=out_dir,
             base_model=tcfg.base_model,
             sft_checkpoint=sft,
+            sft_selection_report_path=getattr(tcfg, "sft_selection_report_path", None),
+            sft_replay_silver_path=getattr(tcfg, "sft_replay_silver_path", None),
+            sft_replay_split=getattr(tcfg, "sft_replay_split", None),
             alpha_gate_path=alpha,
-            text_reward_backend=args.text_reward_backend,
+            text_reward_backend=(
+                args.text_reward_backend or cfg_doc.reward.text_reward_backend
+            ),
             text_reward_fallback_path=args.text_reward_fallback_path,
             dtype=tcfg.dtype,
             seed=tcfg.seed if args.seed is None else args.seed,
@@ -91,10 +134,19 @@ def main():
             kl_coef=ppo_cfg.kl_coef,
             gamma=ppo_cfg.gamma,
             lam=ppo_cfg.lam,
+            max_grad_norm=ppo_cfg.max_grad_norm,
             total_steps=(
                 ppo_cfg.total_ppo_steps if args.total_steps is None else args.total_steps
             ),
             vf_coef=ppo_cfg.vf_coef,
+            value_head_init=ppo_cfg.value_head_init,
+            value_head_dropout=ppo_cfg.value_head_dropout,
+            runtime_contract_version=getattr(ppo_cfg, "runtime_contract_version", "legacy"),
+            health_guard_after_steps=ppo_cfg.health_guard_after_steps,
+            health_guard_window=ppo_cfg.health_guard_window,
+            health_guard_min_valid_rate=ppo_cfg.health_guard_min_valid_rate,
+            health_guard_max_length_capped_frac=ppo_cfg.health_guard_max_length_capped_frac,
+            health_guard_max_mean_kl=ppo_cfg.health_guard_max_mean_kl,
             target_kl=ppo_cfg.target_kl,
             kl_horizon=ppo_cfg.kl_horizon,
             early_stopping=ppo_cfg.early_stopping,
@@ -107,6 +159,22 @@ def main():
             text_reward_scale=ppo_cfg.text_reward_scale,
             step_reward_scale=getattr(ppo_cfg, "step_reward_scale", 1.0),
             pure_em_reward=ppo_cfg.pure_em_reward,
+            proofkg_process_reward=ppo_cfg.proofkg_process_reward,
+            proofkg_outcome_only_reward=ppo_cfg.proofkg_outcome_only_reward,
+            proofkg_process_version=ppo_cfg.proofkg_process_version,
+            proofkg_process_weight=ppo_cfg.proofkg_process_weight,
+            proofkg_f1_weight=ppo_cfg.proofkg_f1_weight,
+            proofkg_dynamic_validity=ppo_cfg.proofkg_dynamic_validity,
+            mixed_outcome_reward=getattr(ppo_cfg, "mixed_outcome_reward", False),
+            mixed_text_reward=getattr(ppo_cfg, "mixed_text_reward", False),
+            source_gated_reward_version=ppo_cfg.source_gated_reward_version,
+            source_gate_format_version=ppo_cfg.source_gate_format_version,
+            answer_format_reward_version=ppo_cfg.answer_format_reward_version,
+            source_gate_credit_version=ppo_cfg.source_gate_credit_version,  # Explicit v2 opt-in reaches the runtime loader.
+            source_gate_mode=ppo_cfg.source_gate_mode,
+            source_gate_calibration_path=ppo_cfg.source_gate_calibration_path,
+            proofkg_require_all_eligible=ppo_cfg.proofkg_require_all_eligible,
+            rollouts_per_prompt=ppo_cfg.rollouts_per_prompt,
             # R7: format-as-constraint (replaces step_format_bonus)
             min_valid_steps=getattr(ppo_cfg, "min_valid_steps", 3),
             # §9.4-3 / R-1b: explicit forwarding is mandatory -- schemas.py sets
@@ -120,8 +188,8 @@ def main():
             center_text_reward=getattr(ppo_cfg, "center_text_reward", False),
             text_baseline_momentum=getattr(ppo_cfg, "text_baseline_momentum", 0.99),
             sft_anchor_weight=getattr(ppo_cfg, "sft_anchor_weight", 0.02),
-            sft_anchor_interval=getattr(ppo_cfg, "sft_anchor_interval", 50),
-            sft_replay_ratio=getattr(ppo_cfg, "sft_replay_ratio", 0.15),
+            sft_anchor_interval=getattr(ppo_cfg, "sft_anchor_interval", 0),
+            sft_replay_ratio=getattr(ppo_cfg, "sft_replay_ratio", 0.10),
             log_with=ppo_cfg.log_with,
             use_lora=True,
             lora_r=tcfg.lora_r,
@@ -129,12 +197,21 @@ def main():
             lora_dropout=tcfg.lora_dropout,
             alpha_override=args.alpha_override if args.alpha_override is not None else tcfg.alpha_override,
             binary_labels_only=args.binary_labels_only or tcfg.binary_labels_only,
+            use_real_logprobs=cfg_doc.reward.use_real_logprobs,
+            max_new_tokens=ppo_cfg.max_new_tokens,
+            temperature=ppo_cfg.temperature,
+            top_p=ppo_cfg.top_p,
             max_input_length=getattr(tcfg, "max_input_length", 4096),
             # R10 speed: must be forwarded EXPLICITLY. schemas.py sets
             # extra="allow", so an unrecognised YAML key is accepted silently and
             # then never reaches the dataclass -- the same trap that left
             # ppo_max_kg_triples pinned at its default while the YAML "set" it.
-            rollout_chunk_size=getattr(ppo_cfg, "rollout_chunk_size", 8),
+            rollout_chunk_size=ppo_cfg.rollout_chunk_size,
+            max_steps=ppo_cfg.max_steps,
+            ppo_max_passages=ppo_cfg.ppo_max_passages,
+            ppo_min_kg_triples=ppo_cfg.ppo_min_kg_triples,
+            ppo_max_kg_triples=ppo_cfg.ppo_max_kg_triples,
+            prm_min_subgraph_for_verify=ppo_cfg.prm_min_subgraph_for_verify,
             # §10.3 / R-2: must be forwarded EXPLICITLY -- schemas.py sets
             # extra="allow", so these YAML keys would otherwise be accepted and
             # silently dropped, exactly like ppo_max_kg_triples was.
@@ -148,12 +225,45 @@ def main():
                 if args.max_kg_index_miss_rate is not None
                 else getattr(tcfg, "max_kg_index_miss_rate", 1.0)
             ),
+            require_exact_kg_index_alignment=(
+                args.require_exact_kg_index_alignment
+                or getattr(tcfg, "require_exact_kg_index_alignment", False)
+            ),
+            question_kg_records_path=(
+                args.question_kg_records_path
+                if args.question_kg_records_path is not None
+                else getattr(tcfg, "question_kg_records_path", None)
+            ),
+            min_question_kg_record_coverage=(
+                args.min_question_kg_record_coverage
+                if args.min_question_kg_record_coverage is not None
+                else getattr(tcfg, "min_question_kg_record_coverage", 1.0)
+            ),
+            require_nonempty_question_kg_records=(
+                args.require_nonempty_question_kg_records
+                or getattr(tcfg, "require_nonempty_question_kg_records", False)
+            ),
+            passage_overrides_path=(
+                args.passage_overrides_path
+                if args.passage_overrides_path is not None
+                else tcfg.passage_overrides_path
+            ),
+            rollout_schedule_path=(
+                args.rollout_schedule_path
+                if args.rollout_schedule_path is not None
+                else tcfg.rollout_schedule_path
+            ),
+            rollout_sampling_weights_path=getattr(
+                tcfg, "rollout_sampling_weights_path", None
+            ),
+            fixed_rollout_schedule_path=getattr(
+                tcfg, "fixed_rollout_schedule_path", None
+            ),
             # §13-1: passed explicitly rather than via split_kwargs(), because
             # phase3_sft.py shares that helper and its config has no such field.
             split_allow_none=(
-                getattr(args, "split_allow_none", None)
-                if hasattr(args, "split_allow_none")
-                else getattr(tcfg, "split_allow_none", False)
+                bool(getattr(args, "split_allow_none", False))
+                or bool(getattr(tcfg, "split_allow_none", False))
             ),
             **split_kwargs(args, tcfg),
         )
@@ -163,7 +273,7 @@ def main():
             output_dir=out_dir,
             sft_checkpoint=sft,
             alpha_gate_path=alpha,
-            text_reward_backend=args.text_reward_backend,
+            text_reward_backend=args.text_reward_backend or "auto",
             text_reward_fallback_path=args.text_reward_fallback_path,
             # No --config: fall back to the dataclass defaults when the flag is
             # absent, since args.* is now None rather than a hardcoded number.
@@ -178,6 +288,18 @@ def main():
                else {"question_kg_index_path": args.question_kg_index_path}),
             **({} if args.max_kg_index_miss_rate is None
                else {"max_kg_index_miss_rate": args.max_kg_index_miss_rate}),
+            require_exact_kg_index_alignment=args.require_exact_kg_index_alignment,
+            **({} if args.question_kg_records_path is None
+               else {"question_kg_records_path": args.question_kg_records_path}),
+            **({} if args.min_question_kg_record_coverage is None
+               else {"min_question_kg_record_coverage": args.min_question_kg_record_coverage}),
+            require_nonempty_question_kg_records=(
+                args.require_nonempty_question_kg_records
+            ),
+            **({} if args.passage_overrides_path is None
+               else {"passage_overrides_path": args.passage_overrides_path}),
+            **({} if args.rollout_schedule_path is None
+               else {"rollout_schedule_path": args.rollout_schedule_path}),
             **split_kwargs(args),
         )
 

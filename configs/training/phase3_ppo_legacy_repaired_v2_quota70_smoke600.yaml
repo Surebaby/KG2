@@ -1,0 +1,23 @@
+includes:
+  - phase3_ppo.yaml
+
+# PPO correctness/stability smoke. This is not a formal headline result.
+reward:
+  # Explicit rather than auto: a failed ReaRAG load must abort, never fall back
+  # to an untracked dummy/text head.
+  text_reward_backend: rearag
+
+training:
+  silver_path: checkpoints/prm_alpha_gate_legacy_repaired_v2_quota70_hard_seed42_no_text_head/silver_with_logprobs.jsonl
+  output_dir: outputs/ppo_legacy_repaired_v2_quota70_hard_seed42_no_text_head_smoke600_replay10
+  sft_checkpoint: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+  alpha_gate_path: checkpoints/prm_alpha_gate_legacy_repaired_v2_quota70_hard_seed42_no_text_head/alpha_gate.pt
+  question_kg_index_path: indexes/kg_cache/question_kg_index_legacy_repaired_v2_quota70_hotpot_train.json
+  max_kg_index_miss_rate: 0.0
+  require_exact_kg_index_alignment: true
+  ppo:
+    total_ppo_steps: 600
+    save_every_steps: 200
+    sft_replay_ratio: 0.10
+    sft_anchor_weight: 0.10
+    sft_anchor_interval: 0

@@ -39,7 +39,9 @@ training:
   # otherwise every question misses and the prompts fall back to the silver
   # subgraph -- which also degrades r_kg, since the same subgraph is what
   # triple_in_subgraph() verifies citations against. Build it with:
-  #   python scripts/prepare/06_build_question_kg_index.py   #     --silver <the --silver_data file> --min_keep 5 --max_keep 12   #     --output indexes/kg_cache/question_kg_index_v2_train.json
+  #   python scripts/prepare/06_build_question_kg_index.py \
+  #     --silver <the --silver_data file> --min_keep 5 --max_keep 12 \
+  #     --output indexes/kg_cache/question_kg_index_v2_train.json
   # --max_keep MUST equal ppo_max_kg_triples (12) and the silver rebuild's
   # max_kg_triples, or teacher and student see different KG budgets (§12.3).
   # 2026-08-22: BUILT and installed. Rebuilt offline from
@@ -61,13 +63,18 @@ training:
   # fall with any rebuild, so a cap on absent+empty would abort on a correct
   # index.
   # Set 1.0 to restore warn-only behaviour.
-  max_kg_index_miss_rate: 0.05
+  # Formal-run decision (2026-08-24): require exact question-set coverage.
+  # Covered-but-empty entries remain legal; only ABSENT questions trip this.
+  max_kg_index_miss_rate: 0.0
   val_ratio: 0.10
   test_ratio: 0.10
   # Separate from `seed`: a seed sweep over RL randomness must not redraw the
   # held-out set.
   split_seed: 42
   ppo:
+    # Must match Phase 1/2/inference and the question-KG index builder.
+    ppo_min_kg_triples: 5
+    ppo_max_kg_triples: 12
     learning_rate: 1.0e-6
     # R10 OOM FIX (2026-08-06): 8 -> 4. The 3000-trajectory run died at update
     # ~110/375 with OutOfMemoryError in TRL's batched_forward_pass at
@@ -281,7 +288,7 @@ training:
     center_text_reward: true
     text_baseline_momentum: 0.99
     # R7: TensorBoard for real-time training monitoring.
-    # TRL logs PPO losses/KL/clipfrac; custom metrics (valid_rate, sft_anchor_loss)
+    # TRL logs PPO losses/KL/clipfrac; custom metrics (valid_rate, replay loss)
     # are written via a separate SummaryWriter to the same logdir.
     # Start with: tensorboard --logdir <output_dir>/tensorboard
     log_with: tensorboard
@@ -294,7 +301,7 @@ training:
     #     reward as not writing steps at all (≈0)
     #   - SFT anchor too sparse: PPO drift outpaces correction
     #
-    # R7-B fixes:
+    # Historical R7-B fixes:
     #   min_valid_steps=1: let model enter positive feedback loop by
     #     writing just 1 step — then gradually raise the bar
     #   sft_anchor_interval=10: 5x denser anchors (every 80 trajectories)
@@ -311,11 +318,11 @@ training:
     #
     # ⚠️ RISK, stated plainly: R7-A already tried min_valid_steps=3 and valid_rate
     # stuck at 9.2% with no upward trend over 1600 steps (see the R7-A notes
-    # above). What differs now: sft_anchor_interval is 10 (was 50) and
-    # sft_anchor_weight 0.10 (was 0.02), i.e. ~5x denser and 5x stronger format
-    # pullback, and the measured SFT checkpoint passes this exact predicate at
-    # 0.980. So the R7-A failure is not expected to repeat -- but it is NOT ruled
-    # out, and it is the specific thing the smoke run must check.
+    # above). What differs now: matched full-trajectory replay is sampled at 10%
+    # (the legacy interval anchor is disabled) and its loss weight is 0.10. The
+    # measured historical SFT checkpoint passed this exact predicate at 0.980,
+    # but that does NOT establish the new checkpoint will do so; the smoke run
+    # must check it.
     #
     # ABORT CRITERION for the smoke run: if valid_rate has not exceeded 0.5 by
     # update ~50, revert this to 2 and rely on shortfall_coef alone. Do not "wait
@@ -336,8 +343,14 @@ training:
     # Measured against silver's min_steps (3), NOT min_valid_steps -- if these two
     # are ever set apart again, this is the one that should track silver.
     target_steps: 3
+    # Matched full-trajectory supervised replay. The old interval mechanism used
+    # traj.answer (a bare final answer) and therefore trained against the required
+    # [Step N] format. It is disabled. A fractional-credit scheduler now replays
+    # complete, same-question trajectories at exactly 10% of PPO samples in the
+    # long run (batch=4 no longer truncates the ratio to zero).
     sft_anchor_weight: 0.10
-    sft_anchor_interval: 10
+    sft_anchor_interval: 0
+    sft_replay_ratio: 0.10
     # ------------------------------------------------------------------
     # R8: Content-Aware Gate + SFT Replay
     # ------------------------------------------------------------------
@@ -361,13 +374,7 @@ training:
   # 6144 fits 15 passages (~3.7k tok) + KG block + generation so the KG context
   # is never truncated. Consistent with SFT/eval top_k=15.
   #
-  # NOTE: ppo_max_kg_triples is NOT settable from this file — scripts/train/
-  # phase3_ppo.py never forwards it to Phase3PPOConfig, and schemas.py sets
-  # extra="allow", so a key added here would be silently accepted and ignored.
-  # It is fixed at the dataclass default in phase3_ppo.py, which is **12**
-  # (phase3_ppo.py:178) -- NOT 30. 2026-08-22 (retraining_plan §13-6): this line
-  # used to say "R10: 50 -> 30", so anyone budgeting prompt length from this file
-  # was off by 18 triples. 12 is also the value the inference pipeline uses
-  # (kg_proweight_pipeline.py:60) and the value the rebuilt question-KG index and
-  # the silver rebuild must both be pinned to (retraining_plan §10.3, §12.3).
+  # The KG min/max budget is declared above in `ppo` and explicitly forwarded;
+  # changing it therefore also requires rebuilding silver and the question-KG
+  # index with exactly the same values.
   max_input_length: 6144

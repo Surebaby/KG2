@@ -10,7 +10,9 @@ wiki18 corpus (Answer Recall 73.6%) but with the OLD annotator:
 This script keeps the Teacher output and retrieved_passages VERBATIM (they
 are the expensive, irreplaceable part) and redoes only the KG-side work:
 
-  1. filter_and_rank_triples(max_keep=50)  — 3-layer KG filter
+  1. filter_and_rank_triples(max_keep=12, min_keep=5)  — 3-layer KG filter
+     (12/5 = the student's budget on every stage; see
+     tests/test_kg_budget_alignment.py)
   2. PRMAnnotator.annotate_trajectory()    — continuous R_KG = precision x relevance
   3. StratifiedSilverFilter.decide()       — bucket quotas + answer_score gate
 
@@ -43,7 +45,9 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input", default="data/silver_data/silver_trajectories.jsonl")
     p.add_argument("--output", default="data/silver_data/silver_v1_reannotated.jsonl")
-    p.add_argument("--max_kg_triples", type=int, default=50)
+    p.add_argument("--max_kg_triples", type=int, default=12,
+                   help="Must equal the student budget (12) or the reannotated "
+                        "KG disagrees with what PPO/inference render.")
     p.add_argument("--max_passages", type=int, default=0,
                    help="Truncate stored passages to N (0 = keep all 50). "
                         "Downstream SFT/PPO cap at 15 anyway.")
@@ -101,7 +105,7 @@ def main():
             # So: filtered top-K, then union back any cited triple that the
             # filter dropped but that IS genuinely in the raw subgraph.
             filtered = filter_and_rank_triples(
-                raw_kg, question=question, max_keep=args.max_kg_triples
+                raw_kg, question=question, max_keep=args.max_kg_triples, min_keep=5
             )
             raw_lookup = {
                 (str(h).strip().lower(), str(r).strip().lower(), str(t).strip().lower()): (h, r, t)

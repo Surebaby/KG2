@@ -1,0 +1,18 @@
+# Experiment ID: ppo_mixed3_rearag_v2_proof400_text7200_seed42
+# Paper arm: PPO-T (outcome + ReaRAG text reward; no ProofKG process reward)
+# Status: DATA_CONFIG_PASS; GPU runtime probe and training NOT STARTED.
+#
+# Single change from the frozen v1 PPO-T semantics: the append-only v2 data
+# expands complete, A-class-safe 2Wiki ProofKG from 208 to 400 unique prompts.
+includes:
+  - phase3_ppo_mixed3_rearag_v1_text7200_seed42.yaml
+
+training:
+  silver_path: data/silver_data/mixed_ppo_three_dataset_v2_proof400_n1799_k4_seed42/silver_train.jsonl
+  output_dir: outputs/ppo_mixed3_rearag_v2_proof400_text7200_seed42
+  question_kg_records_path: data/silver_data/mixed_ppo_three_dataset_v2_proof400_n1799_k4_seed42/question_kg_records.jsonl
+  rollout_sampling_weights_path: data/silver_data/mixed_ppo_three_dataset_v2_proof400_n1799_k4_seed42/sampling_weights.jsonl
+  fixed_rollout_schedule_path: data/silver_data/mixed_ppo_three_dataset_v2_proof400_n1799_k4_seed42/fixed_rollout_schedule.jsonl
+
+  ppo:
+    proofkg_process_reward: false

@@ -1,0 +1,281 @@
+"""
+Legacy KG Repair Comparison Experiment Configuration
+
+用于对照实验：Legacy Original vs Legacy v2 vs Hybrid vs NoKG
+
+运行前提：
+  1. Legacy KG coverage audit 已完成
+  2. 根据 audit 结果决定了修复方向
+  3. Legacy KG v2 索引已构建（如果需要）
+  4. Passage-derived edges 已提取（如果需要）
+"""
+
+# ============================================================================
+# Experiment Identity
+# ============================================================================
+
+experiment_id: "LEGACY_KG_REPAIR_COMPARISON_N100_SEED46"
+
+# 基于审计报告决定是否运行此实验
+prerequisite_audit: "reports/legacy_kg_audit/audit_n100_seed46_*.json"
+
+# ============================================================================
+# Cohort Selection
+# ============================================================================
+
+cohort:
+  datasets:
+    - hotpotqa
+    - musique
+    # 2wiki 已有 ProofKG，暂不修改
+
+  size_per_dataset: 100
+  seed: 46
+  split: "dev"  # 不用 train，避免泄漏到训练集
+
+  selection: "stratified_random"  # 按 difficulty 分层
+
+  # 可选：只选择特定瓶颈类型的题目做针对性验证
+  filter_by_bottleneck: null  # 或 ["L3_RELATION_MISSING", "L4_FILTERING_REMOVED_USEFUL"]
+
+# ============================================================================
+# Experimental Arms (四臂对照)
+# ============================================================================
+
+arms:
+  # Arm A: 当前 Legacy KG（baseline）
+  A_legacy_original:
+    description: "Current legacy KG, no modifications"
+    kg_source: "indexes/kg_cache/question_kg_index_v2.json"
+    kg_supply_mode: "stored"  # 使用索引中存储的 KG
+    modifications: []
+
+  # Arm B: Legacy KG v2（只修链接/关系/排序）
+  B_legacy_v2_repaired:
+    description: "Legacy KG v2: improved linking, query-aware ranking, generic relation removal"
+    kg_source: "indexes/kg_cache/question_kg_index_legacy_v2_hotpot_musique.json"
+    kg_supply_mode: "stored"
+    modifications:
+      - "improved_entity_linking_with_passage_context"
+      - "query_aware_relation_ranking"
+      - "precision_first_filtering"
+      - "generic_relation_removal"
+
+    # 记录与 Arm A 的差异
+    delta_from_A:
+      - "Same Wikidata cache, different linking/ranking"
+      - "No new external knowledge source"
+
+  # Arm C: Hybrid Evidence Graph (Legacy v2 + Passage-derived)
+  C_hybrid_evidence:
+    description: "Legacy KG v2 + passage-derived structural edges"
+    kg_source: "combined"
+    kg_supply_mode: "hybrid"
+
+    components:
+      - source: "wikidata"
+        index: "indexes/kg_cache/question_kg_index_legacy_v2_hotpot_musique.json"
+      - source: "passage"
+        index: "indexes/passage_edges/hotpot_musique_n100_seed46.json"
+
+    fusion_strategy: "precision_first_dedup"  # 去重后取 Top-12
+    max_edges: 12
+
+    # 每条边标记来源
+    edge_provenance: true
+
+  # Arm D: No KG (对照基线)
+  D_nokg:
+    description: "No KG baseline"
+    kg_source: null
+    kg_supply_mode: "none"
+
+# ============================================================================
+# Fixed Across Arms (控制变量)
+# ============================================================================
+
+fixed:
+  # 模型
+  model:
+    checkpoint: "models/sft_legacy_repaired_v2_quota70/final"
+    # 或使用其他已验证的 checkpoint
+
+  # 检索（所有 arms 使用相同的 passages）
+  retrieval:
+    corpus: "wiki18"
+    method: "RRF"
+    dense_top_k: 100
+    sparse_top_k: 100
+    rrf_k: 60
+    reranker: "bge-reranker-v2-m3"
+    rerank_top_k: 10
+
+  # 解码
+  decoding:
+    temperature: 0
+    max_tokens: 1500
+    top_p: 1.0
+    do_sample: false
+
+  # 评估
+  evaluation:
+    metrics:
+      - "EM"
+      - "F1"
+      - "parse_rate"
+      - "citation_rate"
+      - "citation_precision"  # 引用的三元组是否在 KG 中
+
+    # 分组统计
+    breakdowns:
+      - "overall"
+      - "by_dataset"
+      - "by_bottleneck_type"  # 根据 audit 中的 bottleneck 分组
+      - "by_answer_length"
+
+# ============================================================================
+# Gates (预注册的停止门)
+# ============================================================================
+
+gates:
+  # Gate 1: Legacy v2 不能显著退化
+  - name: "no_net_harm"
+    condition: "B.EM >= A.EM - 0.02"
+    action_on_fail: "STOP and report negative result"
+    rationale: "If v2 makes things worse, stop immediately"
+
+  # Gate 2: Hybrid 必须有正向效用
+  - name: "positive_utility"
+    condition: "C.EM > D.EM + 0.05 AND C.citation_rate > 0.7"
+    action_on_fail: "Report insufficient evidence of KG utility"
+    rationale: "Hybrid must beat NoKG and actually use the KG"
+
+  # Gate 3: Citation precision（引用的边确实在提供的 KG 中）
+  - name: "citation_validity"
+    condition: "C.citation_precision > 0.9"
+    action_on_fail: "Report hallucinated citations"
+    rationale: "Model should not cite edges that were not provided"
+
+# ============================================================================
+# Reporting
+# ============================================================================
+
+reporting:
+  output_dir: "outputs/legacy_kg_repair_comparison/"
+
+  # 必须报告的内容
+  required_sections:
+    - "overall_metrics_table"  # 四臂的 overall EM/F1/citation_rate
+    - "per_question_breakdown"  # 逐题的四臂对比
+    - "bottleneck_type_analysis"  # 按 audit bottleneck 类型分组
+    - "failure_case_analysis"  # 所有 arms 都失败的题目
+    - "improvement_case_analysis"  # C 相对 A/D 改善的题目
+    - "regression_case_analysis"  # C 相对 A 退化的题目（如果有）
+
+  # 统计显著性检验
+  statistical_tests:
+    - method: "mcnemar"  # Paired test for EM
+      pairs:
+        - ["A", "B"]
+        - ["A", "C"]
+        - ["B", "C"]
+        - ["C", "D"]
+
+    - method: "paired_t_test"  # For F1 scores
+      pairs:
+        - ["A", "B"]
+        - ["A", "C"]
+
+  # 可视化
+  visualizations:
+    - "em_comparison_bar_chart"
+    - "per_bottleneck_type_heatmap"
+    - "citation_rate_vs_em_scatter"
+
+# ============================================================================
+# Reproducibility
+# ============================================================================
+
+reproducibility:
+  # 随机种子
+  seeds:
+    cohort_sampling: 46
+    model_inference: 42  # 固定 temperature=0，此处仅为记录
+
+  # 版本记录
+  versions:
+    audit_version: "legacy-kg-audit-v1"
+    kg_builder_version: "r9v6-kg-2"  # 或 "legacy-v2-builder-1"
+    relation_policy_version: "rel-2"
+
+  # 数据哈希（运行时计算）
+  data_hashes:
+    cohort_questions: null  # 填入 SHA256
+    legacy_kg_index: null
+    legacy_v2_kg_index: null
+    passage_edges_index: null
+
+  # 代码状态
+  git_commit: null  # 填入当前 commit hash
+  git_dirty: false  # 是否有未提交的修改
+
+# ============================================================================
+# Execution
+# ============================================================================
+
+execution:
+  # 并行度
+  num_workers: 4
+
+  # 超时
+  timeout_per_question: 120  # seconds
+
+  # 失败处理
+  on_inference_error: "record_and_continue"  # 或 "stop"
+
+  # Checkpoint
+  save_intermediate: true
+  checkpoint_every: 25  # questions
+
+# ============================================================================
+# Decision Criteria (实验后决策依据)
+# ============================================================================
+
+decision_tree:
+  # 情况 1: Legacy v2 显著改善
+  if_B_better_than_A:
+    threshold: "+5pp EM"
+    action: "Consider replacing legacy KG with v2 in formal pipeline"
+    next_step: "Validate on larger dev set, then rebuild train index"
+
+  # 情况 2: Hybrid 显著改善
+  if_C_better_than_D:
+    threshold: "+5pp EM AND citation_rate > 0.7"
+    action: "Hybrid evidence graph is promising"
+    next_step: "Expand to full dev set, design training integration"
+
+  # 情况 3: 都没改善
+  if_no_improvement:
+    condition: "B.EM < A.EM + 2pp AND C.EM < D.EM + 2pp"
+    action: "Report negative result, legacy KG repair not viable"
+    next_step: "Focus on other directions (e.g., better retrieval, ProofKG expansion)"
+
+# ============================================================================
+# Notes
+# ============================================================================
+
+notes: |
+  This experiment is designed to answer three questions:
+
+  1. Can we fix legacy KG by improving linking and ranking? (B vs A)
+  2. Do passage-derived edges provide value? (C vs B)
+  3. Is the combined system better than no KG? (C vs D)
+
+  All comparisons are on the SAME questions with the SAME passages,
+  so any difference is attributable to KG quality, not retrieval luck.
+
+  Key constraints:
+  - Gold answers/supporting_facts used ONLY for evaluation, never for KG construction
+  - All KG indices version-controlled and content-hashed
+  - Negative results reported honestly, no cherry-picking
+  - Statistical significance required before claiming improvement

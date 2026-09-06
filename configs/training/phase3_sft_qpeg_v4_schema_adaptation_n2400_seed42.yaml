@@ -1,0 +1,23 @@
+includes:
+  - phase3_sft.yaml
+
+# New train-only schema-adaptation experiment. This is not a continuation of
+# the failed QPEG-v3 final cohort: training uses raw-train Gold support only,
+# while evaluation uses separately frozen answer-free dev cohorts.
+training:
+  silver_path: data/silver_data/qpeg_v4_schema_adaptation_n2400_seed42_v2/silver_curriculum.jsonl
+  sft_init_adapter_path: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head/final
+  output_dir: checkpoints/sft_qpeg_v4_schema_adaptation_n2400_seed42
+  sft_lr: 2.0e-6
+  sft_epochs: 1
+  sft_batch_size: 4
+  sft_grad_accum: 8
+  sft_max_length: 6144
+  sft_save_strategy: steps
+  sft_save_steps: 25
+  sft_save_total_limit: null
+  sft_save_only_model: false
+  # The derived file contains only the 1,800 frozen raw-train qids and their
+  # 600 no-graph replay variants. It has no internal val/test rows.
+  split: null
+  split_allow_none: true

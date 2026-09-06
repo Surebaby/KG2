@@ -1,235 +1,77 @@
-# KG-ProWeight
+# TRACE-Gate / KG-ProWeight
 
-> **Knowledge Graph-Anchored Process Rewards for Multi-Hop Retrieval-Augmented Generation**
->
-> Three-phase training framework: Teacher Distillation → α-Gate → PPO with KG-verified process rewards.
+面向多跳 RAG 的图文过程奖励与 PPO 研究代码。代码仓库：[Surebaby/KG2](https://github.com/Surebaby/KG2)。Python 包名保持为 `kgproweight`。
 
-Reference implementation for the KG-ProWeight paper. Provides an end-to-end pipeline for multi-hop RAG with knowledge-graph-grounded reinforcement learning.
+## 当前版本（2026-09-06）
 
----
+当前主线使用原 Strong SFT，结合答案奖励、Text / Graph 过程奖励、六维来源特征的冻结 α 门控和 SFT replay。
 
-## Quickstart
+- 正式 PPO 数据已封版：HotpotQA / 2Wiki / MuSiQue 各 1,000 题，K=4；800 个 strict ProofKG 问题，2,000 条 replay，每题 10 passages。
+- A-smoke600 实际运行到 300 条 rollout、75 个不同问题后，触发原有效率保护规则停止。训练 `FAILED` 与 `step_200`、`aborted_step_300` 均保留。
+- 固定 150 题开发评估已完成：三模型 × legacy / no_graph 两视图，共 900 条预测。逐题评分独立复验通过，原 EM 优先规则仍选中 **Strong SFT**。
+- 本轮尚未证明 PPO 综合提升或 α 独立贡献；这些数字不是正式 canonical900 主表。
 
-```bash
-git clone <this-repo> kgpaper && cd kgpaper
-pip install -e flashrag_src
-pip install -e ".[dev]"
-```
+开发集三域宏平均，单位为百分比：
 
-### Environment
+| 模型 | legacy EM | legacy F1 | no_graph EM | no_graph F1 |
+| --- | ---: | ---: | ---: | ---: |
+| Strong SFT | 24.00 | 34.70 | 25.33 | 36.66 |
+| PPO step_200 | 22.67 | 35.34 | 24.67 | 35.25 |
+| PPO aborted_step_300 | 22.00 | 32.79 | 24.67 | 36.50 |
 
-```bash
-export PYTHONPATH=$(pwd):$(pwd)/flashrag_src
-export KGPW_PROJECT_ROOT=$(pwd)
-export KGPW_DATA_DIR=$KGPW_PROJECT_ROOT/data
-export KGPW_INDEX_DIR=$KGPW_PROJECT_ROOT/indexes
-export KGPW_CHECKPOINT_DIR=$KGPW_PROJECT_ROOT/checkpoints
-export KGPW_OUTPUT_DIR=$KGPW_PROJECT_ROOT/outputs
-export KGPW_FLASHRAG_ROOT=$KGPW_PROJECT_ROOT/flashrag_src
+当前进度以 [RESEARCH_WORKFLOW.md](RESEARCH_WORKFLOW.md) 和 [docs/todo2.md](docs/todo2.md) 顶部为准。历史实验与失败记录保留在研究文档中，不能与当前条件直接混比。
 
-# Model paths (auto-detected from project_root/models/ or env vars)
-export KGPW_LLAMA3_PATH=/path/to/llama3-8b
-export KGPW_REARAG_PATH=/path/to/rearag-9b
-```
+## 安装与本地检查
 
-Model paths are resolved automatically: checks `$PROJECT_ROOT/models/`, then `/root/autodl-tmp/models/`, then HuggingFace.
-
----
-
-## Training
-
-### Phase 1: Generate Silver Data (Teacher LLM → Wikidata-verified trajectories)
+使用 Python 3.10 或更新版本。GPU 训练环境需另行核对 CUDA、模型路径和冻结实验配置。
 
 ```bash
-python scripts/train/phase1_generate_silver.py \
-  --config configs/training/phase1_silver.yaml \
-  --max_queries 25000 \
-  --teacher_model deepseek-chat
+git clone https://github.com/Surebaby/KG2.git
+cd KG2
+python -m pip install -e ".[dev]"
+export PYTHONPATH="$PWD:$PWD/flashrag_src${PYTHONPATH:+:$PYTHONPATH}"
+export KGPW_PROJECT_ROOT="$PWD"
+python -m pytest -q tests/test_ppo_emf1_development_v1.py
 ```
 
-Produces `data/silver_data/silver_trajectories.jsonl` with three-valued labels (+1/-1/0).
+`flashrag_src/flashrag` 是随仓库提供的源码，通过上述 `PYTHONPATH` 使用。
+依赖声明见 [pyproject.toml](pyproject.toml)；已有部署环境的锁定清单见 [scripts/deploy/requirements-lock.txt](scripts/deploy/requirements-lock.txt)。锁定清单记录特定部署环境，新机器仍需兼容性检查。
 
-### Phase 2: Train α-Gate and PRM
+密钥和远端登录凭据通过环境变量或本机凭据管理器配置，变量示例见 [.env.example](.env.example)。
 
-```bash
-python scripts/train/phase2_train_prm.py \
-  --config configs/training/phase2_prm.yaml \
-  --silver_path data/silver_data/silver_trajectories.jsonl
-```
+## 代码入口
 
-Trains process reward model and `alpha_gate.pt` in `checkpoints/prm_alpha_gate/`.
+| 目录 | 内容 |
+| --- | --- |
+| `kgproweight/data/` | 数据契约、提示与解析 |
+| `kgproweight/reward/` | 答案目标、ProofKG、Text 校准与 α 来源门控 |
+| `kgproweight/training/` | SFT、PPO、逐 token 奖励和 replay |
+| `scripts/prepare/` | 数据构建、身份隔离和协议封存 |
+| `scripts/train/` | 校准与训练入口 |
+| `scripts/eval/` | 冻结开发评估、baseline 与选模 |
+| `scripts/diagnose/` | 工程和科研诊断 |
+| `scripts/deploy/` | 环境、远端执行与 TensorBoard |
+| `configs/` | 版本化配置 |
+| `tests/` | 单元与契约测试 |
 
-### Phase 3a: Supervised Fine-Tuning (SFT)
+具体实验使用对应文档给出的配置、数据版本和唯一 Experiment ID。通用脚本和历史 launcher 的存在不表示应直接启动这些任务。
 
-```bash
-python scripts/train/phase3_sft.py \
-  --config configs/training/phase3_sft.yaml \
-  --silver_path data/silver_data/silver_trajectories.jsonl \
-  --output_dir checkpoints/sft_student
-```
+## 研究记录
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `base_model` | llama3-8B-instruct | |
-| `lora_r` | 32 | LoRA rank |
-| `lora_alpha` | 64 | |
-| `learning_rate` | 2e-4 | |
-| `num_epochs` | 3 | |
-| `batch_size` | 4 | per-device |
-| `max_seq_length` | 4096 | |
-| `grad_accum` | 4 | effective batch = 16 |
+- [项目规则](AGENTS.md)
+- [完整奖励与 α 设计复核](docs/ppo_alpha_review_20260905_v1.md)
+- [source-credit-v2 修复](docs/source_credit_v2_repair_20260906.md)
+- [A-smoke600 训练与停止](docs/ppo_a_smoke600_supervision_20260906.md)
+- [三模型开发评估](docs/ppo_a_stopped300_development_eval_20260906.md)
+- [PPO 丢分诊断](docs/ppo_a_stopped300_regression_diagnosis_20260906.md)
+- [AutoDL TensorBoard 配置](docs/ppo_tensorboard_autodl_20260905.md)
 
-**Elite SFT variant** (2,000 quality-filtered samples): `checkpoints/sft_student_elite/final`
+## 代码与实验资产
 
-**Full SFT** (all 9,839 silver samples): `checkpoints/sft_student/final`
+本仓库同步代码、配置、测试和研究进度文档。模型权重、tokenizer 资产、原始数据、索引、checkpoint、完整预测与审计输出、论文草稿和参考 PDF 保留在研究工作区，不包含在此次代码同步中。
 
-### Phase 3b: PPO with KG-Anchored Process Reward
+文档和冻结配置中的 `data/`、`models/`、`checkpoints/`、`indexes/`、`outputs/` 路径指向这些外部实验资产。复现实验前需将对应版本放入原相对路径并核对 SHA；仅克隆代码不能直接复现已封存训练。
 
-```bash
-python scripts/train/phase3_ppo.py \
-  --config configs/training/phase3_ppo.yaml \
-  --sft_checkpoint checkpoints/sft_student_elite/final \
-  --output_dir outputs/r8_experiment
-```
+新版工作树移除已淘汰的 `archive/`、`_archive/`、`scripts/train/try/`、旧 R7 部署包及含硬编码凭据的旧辅助脚本。被运行路径、测试或实验复现使用的版本化模块继续保留。旧提交历史保持可追溯。
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `base_model` | llama3-8B-instruct | |
-| `lora_r` | 32 | LoRA rank |
-| `lora_alpha` | 64 | |
-| `learning_rate` | 1e-5 | PPO learning rate |
-| `batch_size` | 8 | Rollout batch size |
-| `mini_batch_size` | 1 | PPO mini-batch |
-| `ppo_epochs` | 4 | Epochs per batch |
-| `kl_coef` | 0.1 | Initial KL penalty |
-| `target_kl` | 8.0 | Adaptive KL controller target |
-| `kl_horizon` | 2000.0 | KL controller horizon |
-| `gamma` | 0.95 | Discount factor |
-| `lam` | 0.95 | GAE lambda |
-| `cliprange` | 0.2 | PPO clip |
-| `max_grad_norm` | 1.0 | |
-| `total_ppo_steps` | 2000 | Total trajectories seen |
-| `save_every_steps` | 500 | Checkpoint interval |
-| `max_new_tokens` | 384 | Generation length |
-| `temperature` | 1.0 | Rollout sampling |
-| `top_p` | 1.0 | No truncation (must match TRL) |
-| `max_input_length` | 6144 | Prompt truncation |
-
-**Reward parameters:**
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `outcome_weight` | 10.0 | EM bonus for correct answer |
-| `text_reward_scale` | 0.3 | Scale down ReaRAG text reward noise |
-| `min_valid_steps` | 1 | Min steps for trajectory validity |
-| `min_reasoning_chars` | 20 | Content-aware gate (R8) |
-| `sft_anchor_weight` | 0.05 | SFT anchor loss weight |
-| `sft_anchor_interval` | 10 | Anchor every N PPO steps |
-| `sft_replay_ratio` | 0.15 | SFT prompts in PPO batch (R8) |
-
-**Reward formula:**
-```
-R_t = α_t · R_KG(t) + (1-α_t) · R_text(t) · text_reward_scale
-
-Last step bonus (conditional on ValidTrajectory):
-  + outcome_weight × EM(pred, gold)  if trajectory valid
-  + 0                                 otherwise
-```
-
-**ValidTrajectory criteria (R8):**
-- ≥ `min_valid_steps` parsed `[Step N]` blocks
-- Extractable `[Final Answer]`
-- Sequential step indices
-- Non-empty text per step
-- **Reasoning content ≥ `min_reasoning_chars` characters per step** (content gate)
-
----
-
-## Evaluation
-
-```bash
-# Single dataset × seed
-python scripts/eval/run_kg_proweight.py \
-  --checkpoint checkpoints/kg_proweight_R7B/final \
-  --datasets hotpotqa --seeds 42 --test_sample_num 100 \
-  --save_root outputs/eval --gpu_id 0
-
-# IHR (LLM-as-Judge)
-python scripts/eval/run_ihr_judge.py \
-  --predictions outputs/eval/<run>/intermediate_data.json \
-  --judge_model deepseek-chat --sample 200
-```
-
-See `docs/baselines_final.md` for full baseline comparison.
-
-## R9 v5 Results
-
-| Baseline | EM avg | HotpotQA | 2Wiki | MuSiQue |
-|---|---|---|---|---|
-| Full SFT | 0.291 | 0.397 | 0.303 | 0.173 |
-| Elite SFT | 0.257 | 0.353 | 0.273 | 0.143 |
-| **R9 v5 (500 steps)** | **0.240** | 0.34 | 0.25 | 0.13 |
-| CoRAG | 0.167 | 0.367 | 0.133 | 0.000 |
-| R1-Searcher | 0.154 | 0.310 | 0.143 | 0.010 |
-| Zero-shot | 0.103 | 0.203 | 0.080 | 0.027 |
-| Naive RAG | 0.061 | 0.177 | 0.007 | 0.000 |
-
-Key R9 v5 innovations:
-- **Precision × Relevance**: KG reward filters irrelevant triples via lexical evidence overlap
-- **outcome_weight=10.0**: Restores answer correctness as primary training signal
-- **step_reward_scale=0.3**: Prevents citation reward from dominating outcome
-- **Dynamic KG Cache**: 8493 pre-built Q→KG entries, 100% hit rate
-
----
-
-## Monitoring (TensorBoard)
-
-```bash
-tensorboard --logdir outputs/<run>/tensorboard --port 6006 --bind_all
-```
-
-Key metrics:
-
-| Panel | Metric | Healthy range |
-|-------|--------|---------------|
-| `custom/mean_reward` | Average trajectory reward | 1.0–8.0 |
-| `custom/valid_rate` | Trajectory validity rate | 40–80% |
-| `custom/kl_divergence` | KL divergence | 0.5–20 |
-| `custom/clip_fraction` | PPO clip fraction | 0.05–0.30 |
-| `custom/sft_anchor_loss` | SFT anchor CE loss | 1–10 |
-| `r8/reasoning_content_rate` | Steps with content | > 60% |
-| `r8/step_rate` | Step-structured outputs | > 70% |
-
----
-
-## Project Structure
-
-```
-kgpaper/
-├── kgproweight/              # Core Python package
-│   ├── config/               # YAML loader + schemas
-│   ├── data/                 # prompts, parsers, silver dataset
-│   ├── eval/                 # metrics, baselines, stats, IHR
-│   ├── kg/                   # entity linker, Wikidata retriever, cache
-│   ├── pipeline/             # FlashRAG pipeline subclasses
-│   ├── retrieval/            # hybrid RRF top-K
-│   ├── reward/               # α-gate, PRM, text reward, IHR judge
-│   ├── training/             # phase1/2/3, reward function, PPO trainer
-│   └── utils/                # paths, seeds, logging
-├── configs/                  # YAML configs (training, eval, ablation)
-├── flashrag_src/             # FlashRAG dependency (vendored)
-├── scripts/                  # CLI entry points
-│   ├── train/                # phase1_silver, phase2_prm, phase3_sft, phase3_ppo
-│   ├── eval/                 # run_kg_proweight, run_baselines, run_ihr_judge
-│   ├── prepare/              # corpus, indices, datasets, cache
-│   └── deploy/               # AutoDL deployment helpers
-├── docs/                     # Paper, baselines, architecture, logs
-├── tests/                    # pytest suite
-└── references/               # Related papers (PDF)
-```
-
----
-
-## License
-
-Apache 2.0. See [`LICENSE`](LICENSE).
+许可证见 [LICENSE](LICENSE)。

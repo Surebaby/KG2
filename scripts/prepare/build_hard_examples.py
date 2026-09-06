@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-import os as _os; _os.environ.pop("OMP_NUM_THREADS", None); _os.environ["OMP_NUM_THREADS"] = "8"
-import os as _os; _os.environ.pop("OMP_NUM_THREADS", None); _os.environ["OMP_NUM_THREADS"] = "8"
 from __future__ import annotations
+
+import os as _os; _os.environ.pop("OMP_NUM_THREADS", None); _os.environ["OMP_NUM_THREADS"] = "8"
+import os as _os; _os.environ.pop("OMP_NUM_THREADS", None); _os.environ["OMP_NUM_THREADS"] = "8"
 
 # --- Fix AutoDL OMP_NUM_THREADS libgomp crash (before any c-extension import) ---
 import os as _os

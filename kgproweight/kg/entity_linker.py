@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -75,22 +76,50 @@ def _clean(label: str) -> str:
     return re.sub(r"\s+", " ", label.strip().lower())
 
 
+def _normalise_passage_title(value: object) -> str:
+    """Canonicalise wiki18 title surfaces without changing their meaning."""
+    title = unicodedata.normalize("NFC", str(value or "").strip())
+    if len(title) >= 2 and title[0] == title[-1] == '"':
+        try:
+            decoded = json.loads(title)
+        except json.JSONDecodeError:
+            decoded = title[1:-1]
+        if isinstance(decoded, str):
+            title = unicodedata.normalize("NFC", decoded.strip())
+    return title
+
+
+def passage_title(passage: object) -> str:
+    """Return the best human-readable title instead of a numeric corpus id."""
+    if isinstance(passage, dict):
+        explicit = _normalise_passage_title(passage.get("title"))
+        if explicit:
+            return explicit
+        raw_id = _normalise_passage_title(passage.get("id"))
+        contents = str(passage.get("contents") or passage.get("text") or "").strip()
+        first_line = _normalise_passage_title(contents.splitlines()[0]) if contents else ""
+        # Older/synthetic corpora store a useful Wikipedia title in ``id``;
+        # full wiki18 stores an integer document offset there.
+        if raw_id and not raw_id.isdigit():
+            return raw_id
+        return first_line or raw_id
+    if isinstance(passage, str):
+        first_line = passage.strip().splitlines()[0] if passage.strip() else ""
+        return _normalise_passage_title(first_line)
+    return ""
+
+
 def build_passage_titles(passages) -> List[str]:
     """Extract (title/id) strings from retrieved passages for title-support.
 
-    Mirrors the ``id``/``title`` fallback used elsewhere (``filter_by_passage_support``,
-    the inference pipeline) so every consumer reads the same field.
+    Uses :func:`passage_title` so numeric ids and JSON-quoted title lines do not
+    leak into entity linking.
     """
     titles: List[str] = []
     for p in list(passages or []):
-        if isinstance(p, dict):
-            title = p.get("id") or p.get("title") or ""
-        elif isinstance(p, str):
-            title = p
-        else:
-            continue
+        title = passage_title(p)
         if title:
-            titles.append(str(title))
+            titles.append(title)
     return titles
 
 
@@ -106,7 +135,7 @@ def build_passage_text(passages, max_n: int = 10) -> str:
     for p in list(passages or [])[:max_n]:
         if isinstance(p, dict):
             content = p.get("contents") or p.get("text") or ""
-            title = p.get("id") or p.get("title") or ""
+            title = passage_title(p)
             blocks.append(f"{title} {content}".strip())
         elif isinstance(p, str):
             blocks.append(p)

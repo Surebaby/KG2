@@ -1,0 +1,79 @@
+{
+  "schema_version": "automatic-proofkg-ppo-config-lock-1",
+  "generated_at_utc": "2026-08-31T16:14:25.590227+00:00",
+  "experiment_id": "ppo_automatic_proofkg_2wiki_k4_smoke600_seed42",
+  "status": "FINALIZED_NOT_TRAINED",
+  "config": {
+    "path": "/home/zjulab/kgpaper/configs/training/phase3_ppo_automatic_proofkg_2wiki_k4_smoke600_seed42.yaml",
+    "exists": true,
+    "kind": "file",
+    "size_bytes": 2350,
+    "md5": "eee2c40ad89f690ed854f53da68b9e42"
+  },
+  "template": {
+    "path": "/home/zjulab/kgpaper/configs/training/phase3_ppo_automatic_proofkg_2wiki_k4_smoke600_seed42.template.yaml",
+    "exists": true,
+    "kind": "file",
+    "size_bytes": 2097,
+    "md5": "27ed99ed91352ada0e190057c152e143"
+  },
+  "materialization_report": {
+    "path": "/home/zjulab/kgpaper/data/silver_data/automatic_proofkg_2wiki_train_k4_v1/report.json",
+    "exists": true,
+    "kind": "file",
+    "size_bytes": 5451,
+    "md5": "15bc068e82bc1e8af3b9edc777a16025"
+  },
+  "silver_train": {
+    "path": "/home/zjulab/kgpaper/data/silver_data/automatic_proofkg_2wiki_train_k4_v1/silver_train.jsonl",
+    "exists": true,
+    "kind": "file",
+    "size_bytes": 7337201,
+    "md5": "75d475f82b45e499e9121531bb1c7568"
+  },
+  "question_kg_records": {
+    "path": "/home/zjulab/kgpaper/data/silver_data/automatic_proofkg_2wiki_train_k4_v1/question_kg_records.jsonl",
+    "exists": true,
+    "kind": "file",
+    "size_bytes": 1811327,
+    "md5": "6eaf4babbf9c78e9f82e2e4e7d032273"
+  },
+  "protocol": {
+    "total_ppo_steps": 600,
+    "rollouts_per_prompt": 4,
+    "batch_size": 4,
+    "ppo_epochs": 2,
+    "sft_replay_ratio": 0.1,
+    "kl_coef": 0.25,
+    "target_kl": 8.0,
+    "proofkg_process_reward": true,
+    "proofkg_require_all_eligible": true
+  },
+  "materialization_gates": {
+    "question_kg_identity_join_rate": {
+      "expected": 1.0,
+      "actual": 1.0,
+      "passed": true
+    },
+    "proofkg_reward_eligible_rate": {
+      "expected": 1.0,
+      "actual": 1.0,
+      "passed": true
+    },
+    "confirmation_qid_overlap": {
+      "expected": 0,
+      "actual": 0,
+      "passed": true
+    },
+    "confirmation_family_overlap": {
+      "expected": 0,
+      "actual": 0,
+      "passed": true
+    },
+    "source_gold_steps_copied": {
+      "expected": 0,
+      "actual": 0,
+      "passed": true
+    }
+  }
+}

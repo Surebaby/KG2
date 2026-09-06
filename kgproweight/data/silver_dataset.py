@@ -23,6 +23,11 @@ class SilverStepRecord:
     text: str
     label: float  # continuous R_KG = precision × relevance in [-1, 1]
     cited_triples: List[Tuple[str, str, str]] = field(default_factory=list)
+    # SAEG-v1 keeps passage evidence separate from standard KG triples.  These
+    # stable sidecars are optional so every legacy silver file still round
+    # trips unchanged.
+    cited_edge_ids: List[str] = field(default_factory=list)
+    cited_passage_ids: List[str] = field(default_factory=list)
     token_logprobs: Optional[List[float]] = None  # filled by Phase 2 logprob pass
 
     @classmethod
@@ -36,6 +41,8 @@ class SilverStepRecord:
             text=str(d.get("text", "")),
             label=float(d.get("label", 0)),
             cited_triples=triples,
+            cited_edge_ids=[str(x) for x in (d.get("cited_edge_ids") or [])],
+            cited_passage_ids=[str(x) for x in (d.get("cited_passage_ids") or [])],
             token_logprobs=d.get("token_logprobs"),
         )
 
@@ -45,6 +52,8 @@ class SilverStepRecord:
             "text": self.text,
             "label": self.label,
             "cited_triples": [list(t) for t in self.cited_triples],
+            **({"cited_edge_ids": self.cited_edge_ids} if self.cited_edge_ids else {}),
+            **({"cited_passage_ids": self.cited_passage_ids} if self.cited_passage_ids else {}),
             **({"token_logprobs": self.token_logprobs} if self.token_logprobs is not None else {}),
         }
 
@@ -57,6 +66,8 @@ class SilverTrajectory:
     dataset: str
     steps: List[SilverStepRecord]
     kg_subgraph: List[Tuple[str, str, str]] = field(default_factory=list)
+    passage_evidence: List[Dict[str, Any]] = field(default_factory=list)
+    evidence_mode: Optional[str] = None
     retrieved_passages: List[Dict[str, Any]] = field(default_factory=list)
     teacher_output: Optional[str] = None
     teacher_model: Optional[str] = None
@@ -77,6 +88,8 @@ class SilverTrajectory:
             dataset=str(d.get("dataset", "")),
             steps=steps,
             kg_subgraph=kg,
+            passage_evidence=d.get("passage_evidence", []) or [],
+            evidence_mode=d.get("evidence_mode"),
             retrieved_passages=d.get("retrieved_passages", []) or [],
             teacher_output=d.get("teacher_output"),
             teacher_model=d.get("teacher_model"),
@@ -92,6 +105,8 @@ class SilverTrajectory:
             "dataset": self.dataset,
             "steps": [s.to_dict() for s in self.steps],
             "kg_subgraph": [list(t) for t in self.kg_subgraph],
+            **({"passage_evidence": self.passage_evidence} if self.passage_evidence else {}),
+            **({"evidence_mode": self.evidence_mode} if self.evidence_mode is not None else {}),
             "retrieved_passages": self.retrieved_passages,
             "accepted": self.accepted,
             "metadata": self.metadata,

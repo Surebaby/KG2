@@ -1,0 +1,20 @@
+# QPEG-v1 evaluation template.
+#
+# NOT RUNNABLE until Day-1 materialisation has produced and frozen
+# data/derived/qpeg_v1_n1350_seed42/question_graph_records.jsonl.  Final runs
+# must copy this template to a versioned .yaml and bind the record SHA256 in the
+# experiment protocol; do not edit configs/eval/kg_proweight.yaml (legacy).
+
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+eval:
+  datasets: [hotpotqa, 2wikimultihopqa, musique]
+  split: dev
+  save_intermediate_data: true
+  metrics: [em, f1]
+  use_real_alpha: true
+  kg_supply_mode: qpeg_v1
+  question_kg_records_path: data/derived/qpeg_v1_n1350_seed42/question_graph_records.jsonl
+  seeds: [42]

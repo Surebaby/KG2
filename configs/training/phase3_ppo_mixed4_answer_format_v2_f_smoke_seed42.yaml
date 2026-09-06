@@ -1,0 +1,11 @@
+# ANSWER-FORMAT-V2-F-SMOKE600-SEED42-20260906
+# Matched continuation of the answer-format-v2 probe with the original Strong SFT.
+# A retains answer + Graph/Text process rewards + learned alpha; F/T are controls.
+# Fresh source-credit confirmation remains required; clearance is still false.
+# Configuration preparation only: this file does not launch or authorize training.
+includes:
+- phase3_ppo_mixed4_source_credit_v2_features_f_smoke_seed42.yaml
+training:
+  output_dir: outputs/ppo_mixed4_answer_format_v2_f_smoke600_seed42
+  ppo:
+    answer_format_reward_version: v2

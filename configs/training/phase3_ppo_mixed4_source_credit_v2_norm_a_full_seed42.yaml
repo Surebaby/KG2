@@ -1,0 +1,10 @@
+# Experimental v2: representative step-softsign normalization.
+# norm=old alpha held exact; features=six source-use features.
+# Unconfirmed gates fail production load; no PPO training is authorized by this file.
+includes:
+- phase3_ppo_mixed4_source_credit_v1_a_full_seed42.yaml
+training:
+  output_dir: outputs/ppo_mixed4_source_credit_v2_norm_a_full12000_seed42
+  ppo:
+    source_gate_credit_version: v2
+    source_gate_calibration_path: outputs/calibration/source_credit_gate_v2_representative_local_seed42_20260906_v1/norm_only/gate.json

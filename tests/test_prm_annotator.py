@@ -69,6 +69,25 @@ def test_sparse_subgraph_cannot_verify(tmp_path):
     assert ann.label(step, [("Barack Obama", "spouse", "Michelle Obama")], []) == NEUTRAL
 
 
+def test_proof_kg_mode_can_verify_an_exact_single_edge(tmp_path):
+    """Proof-KG explicitly lowers the sparse threshold; legacy stays at 3."""
+    linker = EntityLinker(
+        cache_path=str(tmp_path / "entity_cache.jsonl"),
+        use_genre=False,
+        offline=True,
+    )
+    ann = PRMAnnotator(entity_linker=linker, min_subgraph_for_verify=1)
+    triple = ("Barack Obama", "spouse", "Michelle Obama")
+    step = ParsedStep(
+        index=1,
+        raw_text="Reasoning: Barack Obama is married to Michelle Obama.",
+        cited_triples=[triple],
+        mentioned_entities=["Barack Obama", "Michelle Obama"],
+        intermediate_conclusion="Michelle Obama is Barack Obama's spouse",
+    )
+    assert ann.label(step, [triple], []) == POSITIVE
+
+
 def test_partial_precision_is_fractional(tmp_path):
     """R9: r_kg is CONTINUOUS (precision x relevance), not just {-1, 0, +1}.
 

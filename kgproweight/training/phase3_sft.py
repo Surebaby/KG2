@@ -8,14 +8,15 @@ produces a parseable trace, so reward shaping cannot kick in.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 import torch
 
 from kgproweight.data.prompts import (
     SFT_SYSTEM_PROMPT,
+    build_saeg_sft_messages,
     build_sft_messages,
 )
 from kgproweight.data.silver_dataset import SilverDatasetReader
@@ -24,7 +25,16 @@ from kgproweight.data.silver_split import (
     DEFAULT_TEST_RATIO,
     DEFAULT_VAL_RATIO,
 )
-from kgproweight.utils.logging import dump_manifest, get_logger
+from kgproweight.kg.training_question_kg import (
+    apply_training_question_kg,
+    read_question_kg_records,
+)
+from kgproweight.utils.logging import (
+    artifact_identity,
+    dump_manifest,
+    get_logger,
+    prepare_new_run_dir,
+)
 from kgproweight.utils.paths import model_path
 from kgproweight.utils.seed import set_seed
 
@@ -47,12 +57,29 @@ class Phase3SFTConfig:
     lora_r: int = 32
     lora_alpha: int = 64
     lora_dropout: float = 0.05
+    # Continue training an existing LoRA adapter instead of reinitialising LoRA
+    # on the base model.  This is required for the Proof-KG curriculum smoke.
+    init_adapter_path: Optional[str] = None
+    # Identity-safe per-question prompt/reward KG override.
+    question_kg_records_path: Optional[str] = None
+    min_question_kg_record_coverage: float = 1.0
+    require_nonempty_question_kg_records: bool = False
     weight_decay: float = 0.01
     warmup_ratio: float = 0.03
+    # Keep intermediate model states for pre-registered checkpoint selection.
+    # This is deliberately a persistence/evaluation control, not an extra SFT
+    # regularizer: the optimiser objective and LoRA trainability are unchanged.
+    save_strategy: Literal["no", "steps", "epoch"] = "epoch"
+    save_steps: int = 500
+    save_total_limit: Optional[int] = None
+    save_only_model: bool = False
+    log_with: Optional[str] = None
+    logging_dir: Optional[str] = None
     # Fold to train on. Must match the fold Phase 2 used, or the SFT model has
     # seen the trajectories the PRM head is later evaluated against. ``None``
     # reproduces the pre-split behaviour of training on the whole file.
     split: Optional[str] = None
+    split_allow_none: bool = False
     val_ratio: float = DEFAULT_VAL_RATIO
     test_ratio: float = DEFAULT_TEST_RATIO
     split_seed: Optional[int] = DEFAULT_SPLIT_SEED
@@ -113,13 +140,23 @@ def _build_dataset(reader: SilverDatasetReader, tokenizer, max_length: int):
         asst = _render_assistant_trace(traj)
         if not asst.strip():
             return None
-        msgs = build_sft_messages(
-            question=traj.question,
-            retrieved_passages=list(traj.retrieved_passages)[:n_passages],
-            kg_triples=traj.kg_subgraph,
-            answer_trace=asst,
-            top_k=n_passages,
-        )
+        if traj.evidence_mode is not None or traj.passage_evidence:
+            msgs = build_saeg_sft_messages(
+                question=traj.question,
+                retrieved_passages=list(traj.retrieved_passages)[:n_passages],
+                kg_triples=traj.kg_subgraph,
+                passage_evidence=traj.passage_evidence,
+                answer_trace=asst,
+                top_k=n_passages,
+            )
+        else:
+            msgs = build_sft_messages(
+                question=traj.question,
+                retrieved_passages=list(traj.retrieved_passages)[:n_passages],
+                kg_triples=traj.kg_subgraph,
+                answer_trace=asst,
+                top_k=n_passages,
+            )
         prompt_text = tokenizer.apply_chat_template(
             msgs[:-1], tokenize=False, add_generation_prompt=True
         )
@@ -181,50 +218,28 @@ def _tokenise(ds, tokenizer, max_length: int):
 
 
 def run_phase3_sft(cfg: Phase3SFTConfig) -> Dict[str, Any]:
-    from transformers import (
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        Trainer,
-        TrainingArguments,
-    )
-
-    set_seed(cfg.seed)
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    base_id = model_path(cfg.base_model)
-    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
-    tokenizer = AutoTokenizer.from_pretrained(base_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModelForCausalLM.from_pretrained(
-        base_id, torch_dtype=dtype_map.get(cfg.dtype, torch.bfloat16), device_map="auto"
-    )
-
-    if cfg.use_lora:
-        try:
-            from peft import LoraConfig, TaskType, get_peft_model
-
-            lora = LoraConfig(
-                r=cfg.lora_r,
-                lora_alpha=cfg.lora_alpha,
-                lora_dropout=cfg.lora_dropout,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                bias="none",
-                task_type=TaskType.CAUSAL_LM,
-            )
-            model = get_peft_model(model, lora)
-            model.print_trainable_parameters()
-            # Gradient checkpointing + LoRA: the frozen base inputs need grads so
-            # backprop reaches the LoRA adapters through the checkpointed graph.
-            model.enable_input_require_grads()
-        except Exception as exc:
-            logger.warning("PEFT unavailable (%s); full-parameter SFT.", exc)
-
-    # Filtering at the reader is safe here: unlike Phase 2, SFT does not write
-    # anything back into the trajectories, so a narrowed reader cannot truncate a
-    # downstream artefact.
+    if cfg.save_strategy == "steps" and cfg.save_steps <= 0:
+        raise ValueError("save_steps must be > 0 when save_strategy='steps'")
+    if cfg.save_total_limit is not None and cfg.save_total_limit <= 0:
+        raise ValueError("save_total_limit must be > 0 when provided")
+    if cfg.split is None and not cfg.split_allow_none:
+        raise ValueError(
+            "Phase 3a split is None: this would train on the whole silver file, "
+            "including val/test. Set split='train' (normal runs), or set "
+            "split_allow_none=True only to reproduce a historical whole-file run."
+        )
+    if cfg.init_adapter_path and not Path(cfg.init_adapter_path).is_dir():
+        raise FileNotFoundError(
+            f"init_adapter_path must be an existing adapter directory: {cfg.init_adapter_path}"
+        )
+    if cfg.question_kg_records_path and not Path(cfg.question_kg_records_path).is_file():
+        raise FileNotFoundError(
+            "question_kg_records_path does not exist: "
+            f"{cfg.question_kg_records_path}"
+        )
+    # Validate the fold and every dataset::qid/question-hash join before loading
+    # the model. Bad curriculum data must fail in CPU preflight, not after a GPU
+    # has been reserved.
     reader = SilverDatasetReader(
         cfg.silver_path,
         split=cfg.split,
@@ -244,6 +259,104 @@ def run_phase3_sft(cfg: Phase3SFTConfig) -> Dict[str, Any]:
             len(reader.accepted()), cfg.val_ratio, cfg.test_ratio,
             cfg.build_split_spec().seed,
         )
+    question_kg_stats = None
+    if cfg.question_kg_records_path:
+        records = read_question_kg_records(cfg.question_kg_records_path)
+        question_kg_stats = apply_training_question_kg(
+            reader.accepted(),
+            records,
+            min_coverage=cfg.min_question_kg_record_coverage,
+            require_nonempty=cfg.require_nonempty_question_kg_records,
+        ).to_dict()
+        logger.info("SFT question-KG preflight: %s", question_kg_stats)
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "Phase 3a SFT requires CUDA, but torch.cuda.is_available() is False. "
+            "Fix the NVIDIA driver/container runtime before reserving an Experiment ID."
+        )
+    if cfg.dtype == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("Phase 3a dtype=bf16 but the active GPU does not support bf16")
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        Trainer,
+        TrainingArguments,
+    )
+
+    set_seed(cfg.seed)
+    base_id = model_path(cfg.base_model)
+    out_dir, experiment_id = prepare_new_run_dir(
+        cfg.output_dir,
+        extra={
+            "phase": "phase3_sft",
+            "config": asdict(cfg),
+            "input_artifacts": {
+                "silver": artifact_identity(cfg.silver_path),
+                "base_model": artifact_identity(base_id),
+                "init_adapter": (
+                    artifact_identity(cfg.init_adapter_path)
+                    if cfg.init_adapter_path else None
+                ),
+                "question_kg_records": (
+                    artifact_identity(cfg.question_kg_records_path)
+                    if cfg.question_kg_records_path else None
+                ),
+            },
+        },
+    )
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    tokenizer = AutoTokenizer.from_pretrained(base_id)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_id, torch_dtype=dtype_map.get(cfg.dtype, torch.bfloat16), device_map="auto"
+    )
+
+    if cfg.init_adapter_path and not cfg.use_lora:
+        raise ValueError("init_adapter_path requires use_lora=True")
+    if cfg.init_adapter_path:
+        from peft import PeftModel
+
+        model = PeftModel.from_pretrained(
+            model, cfg.init_adapter_path, is_trainable=True
+        )
+        peft_cfg = next(iter(model.peft_config.values()))
+        actual_targets = set(peft_cfg.target_modules or [])
+        expected_targets = {"q_proj", "k_proj", "v_proj", "o_proj"}
+        if (
+            int(peft_cfg.r) != cfg.lora_r
+            or int(peft_cfg.lora_alpha) != cfg.lora_alpha
+            or actual_targets != expected_targets
+        ):
+            raise ValueError(
+                "init adapter LoRA config does not match requested training config: "
+                f"r={peft_cfg.r}, alpha={peft_cfg.lora_alpha}, "
+                f"targets={sorted(actual_targets)}"
+            )
+        model.print_trainable_parameters()
+        model.enable_input_require_grads()
+        logger.info("Continuing SFT from adapter %s", cfg.init_adapter_path)
+    elif cfg.use_lora:
+        try:
+            from peft import LoraConfig, TaskType, get_peft_model
+
+            lora = LoraConfig(
+                r=cfg.lora_r,
+                lora_alpha=cfg.lora_alpha,
+                lora_dropout=cfg.lora_dropout,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                bias="none",
+                task_type=TaskType.CAUSAL_LM,
+            )
+            model = get_peft_model(model, lora)
+            model.print_trainable_parameters()
+            # Gradient checkpointing + LoRA: the frozen base inputs need grads so
+            # backprop reaches the LoRA adapters through the checkpointed graph.
+            model.enable_input_require_grads()
+        except Exception as exc:
+            logger.warning("PEFT unavailable (%s); full-parameter SFT.", exc)
+
     ds_raw = _build_dataset(reader, tokenizer, cfg.max_length)
     ds_tok = _tokenise(ds_raw, tokenizer, cfg.max_length)
 
@@ -256,10 +369,14 @@ def run_phase3_sft(cfg: Phase3SFTConfig) -> Dict[str, Any]:
         bf16=cfg.dtype == "bf16",
         fp16=cfg.dtype == "fp16",
         logging_steps=20,
-        save_strategy="epoch",
+        save_strategy=cfg.save_strategy,
+        save_steps=cfg.save_steps,
+        save_total_limit=cfg.save_total_limit,
+        save_only_model=cfg.save_only_model,
         weight_decay=cfg.weight_decay,
         warmup_ratio=cfg.warmup_ratio,
-        report_to=[],
+        report_to=[cfg.log_with] if cfg.log_with else [],
+        logging_dir=cfg.logging_dir,
         remove_unused_columns=False,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
@@ -314,12 +431,38 @@ def run_phase3_sft(cfg: Phase3SFTConfig) -> Dict[str, Any]:
     final_dir = out_dir / "final"
     trainer.save_model(str(final_dir))
     tokenizer.save_pretrained(final_dir)
+    intermediate_checkpoints = sorted(
+        (path for path in out_dir.glob("checkpoint-*") if path.is_dir()),
+        key=lambda path: int(path.name.rsplit("-", 1)[-1]),
+    )
 
     dump_manifest(
         out_dir,
         extra={
             "phase": "phase3_sft",
+            "experiment_id": experiment_id,
+            "config": asdict(cfg),
             "silver_path": str(cfg.silver_path),
+            "input_artifacts": {
+                "silver": artifact_identity(cfg.silver_path),
+                "base_model": artifact_identity(base_id),
+                "init_adapter": (
+                    artifact_identity(cfg.init_adapter_path)
+                    if cfg.init_adapter_path else None
+                ),
+                "question_kg_records": (
+                    artifact_identity(cfg.question_kg_records_path)
+                    if cfg.question_kg_records_path else None
+                ),
+            },
+            "output_artifacts": {
+                "final_checkpoint": artifact_identity(final_dir),
+                "loss_history": artifact_identity(loss_path),
+                "intermediate_checkpoints": [
+                    artifact_identity(path) for path in intermediate_checkpoints
+                ],
+            },
+            "global_step": trainer.state.global_step,
             "epochs": cfg.epochs,
             "lr": cfg.lr,
             "seed": cfg.seed,
@@ -327,6 +470,7 @@ def run_phase3_sft(cfg: Phase3SFTConfig) -> Dict[str, Any]:
             "max_length": cfg.max_length,
             "batch_size": cfg.batch_size,
             "grad_accum": cfg.grad_accum,
+            "question_kg_override": question_kg_stats,
             "peak_gpu_gb": (
                 {"allocated": round(torch.cuda.max_memory_allocated() / 1024 ** 3, 2),
                  "reserved": round(torch.cuda.max_memory_reserved() / 1024 ** 3, 2)}

@@ -148,6 +148,70 @@ def test_every_phase_config_agrees_on_the_split():
     assert len(set(specs.values())) == 1, specs
 
 
+def test_formal_phase_configs_default_to_train_fold():
+    from kgproweight.config import ProjectConfig, load_config
+
+    root = Path(__file__).resolve().parents[1]
+    for name in ("phase2_prm.yaml", "phase3_sft.yaml", "phase3_ppo.yaml"):
+        cfg = load_config(str(root / "configs" / "training" / name), validate=ProjectConfig)
+        assert cfg.training.split == "train", name
+
+
+def test_quota70_frozen_configs_bind_all_cross_stage_artifacts():
+    from kgproweight.config import ProjectConfig, load_config
+
+    root = Path(__file__).resolve().parents[1]
+    p2 = load_config(
+        str(root / "configs/training/phase2_prm_legacy_repaired_v2_quota70.yaml"),
+        validate=ProjectConfig,
+    ).training
+    sft = load_config(
+        str(root / "configs/training/phase3_sft_legacy_repaired_v2_quota70.yaml"),
+        validate=ProjectConfig,
+    ).training
+    ppo_doc = load_config(
+        str(root / "configs/training/phase3_ppo_legacy_repaired_v2_quota70_smoke600.yaml"),
+        validate=ProjectConfig,
+    )
+    ppo = ppo_doc.training
+
+    assert "quota70" in p2.silver_path
+    assert sft.silver_path == f"{p2.output_dir}/silver_with_logprobs.jsonl"
+    assert ppo.silver_path == sft.silver_path
+    assert ppo.sft_checkpoint == f"{sft.output_dir}/final"
+    assert ppo.alpha_gate_path == f"{p2.output_dir}/alpha_gate.pt"
+    assert "quota70" in ppo.question_kg_index_path
+    assert ppo.require_exact_kg_index_alignment is True
+    assert ppo.max_kg_index_miss_rate == 0.0
+    assert ppo.ppo.total_ppo_steps == 600
+    assert ppo.ppo.sft_replay_ratio == pytest.approx(0.10)
+    assert ppo.ppo.sft_anchor_interval == 0
+    assert ppo_doc.reward.text_reward_backend == "rearag"
+
+
+def test_soft_alpha_config_changes_only_the_target_from_hard_config():
+    from kgproweight.config import load_config
+
+    root = Path(__file__).resolve().parents[1]
+    hard = load_config(str(root / "configs/training/phase2_prm.yaml"))
+    soft = load_config(str(root / "configs/training/phase2_prm_soft_alpha.yaml"))
+    assert hard["training"]["alpha_target"] == "hard_verdict"
+    assert soft["training"]["alpha_target"] == "soft_abs_rkg"
+    hard["training"].pop("alpha_target")
+    soft["training"].pop("alpha_target")
+    assert hard == soft
+
+
+def test_phase2_and_sft_refuse_implicit_whole_file_training(tmp_path: Path):
+    from kgproweight.training.phase2_prm import Phase2Config, run_phase2
+    from kgproweight.training.phase3_sft import Phase3SFTConfig, run_phase3_sft
+
+    with pytest.raises(ValueError, match="split is None"):
+        run_phase2(Phase2Config(silver_path="missing", output_dir=str(tmp_path / "p2")))
+    with pytest.raises(ValueError, match="split is None"):
+        run_phase3_sft(Phase3SFTConfig(silver_path="missing", output_dir=str(tmp_path / "sft")))
+
+
 def test_split_seed_none_falls_back_to_training_seed():
     from kgproweight.training.phase2_prm import Phase2Config
 

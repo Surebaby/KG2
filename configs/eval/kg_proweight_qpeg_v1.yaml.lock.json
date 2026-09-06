@@ -1,0 +1,15 @@
+{
+  "schema_version": "qpeg-eval-config-lock-v1",
+  "experiment_id": "QPEG-V1-N1350-SEED42-EVAL",
+  "status": "MATERIALIZED_NOT_EVALUATED",
+  "config": "configs/eval/kg_proweight_qpeg_v1.yaml",
+  "records": "data/derived/qpeg_v1_n1350_seed42/question_graph_records.jsonl",
+  "records_sha256": "f7f4051b58031e5ab3d48ef106b9a223c80dfda1e54e07751d21d415b5929af1",
+  "materialization_report_sha256": "58e6f4c6faeed1140ee241856aec65c3b59fdb191277c4c90501fe3457feeccf",
+  "preregistration": "outputs/audits/qpeg_v1_n1350_seed42_preregistration/protocol.json",
+  "extractor_sha256": "ab8210bc9959cce34d7c1a93827e033cea250f751a445ce6852ad493e92f78d1",
+  "pipeline_sha256": "24e18a48f39ec4c4345ef1bed4bd1145dab1b9c7ec4bdf8a14fd8ddc5e54ac0",
+  "gold_access": false,
+  "resource_scope": "question + retrieved Wiki18 top-10 passages",
+  "evaluation_status": "NOT_YET_RUN"
+}

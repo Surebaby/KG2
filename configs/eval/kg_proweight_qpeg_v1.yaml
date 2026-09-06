@@ -1,0 +1,20 @@
+# Frozen QPEG-v1 evaluation configuration.
+# Experiment ID: QPEG-V1-N1350-SEED42-EVAL
+# question_graph_records SHA256:
+# f7f4051b58031e5ab3d48ef106b9a223c80dfda1e54e07751d21d415b5929af1
+# This is a same-resource evaluation: QPEG reads only the question and the
+# retrieved Wiki18 passages already available to the compared systems.
+
+includes:
+  - ../base.yaml
+  - ../retrieval/hybrid_rrf_top50.yaml
+
+eval:
+  datasets: [hotpotqa, 2wikimultihopqa, musique]
+  split: dev
+  save_intermediate_data: true
+  metrics: [em, f1]
+  use_real_alpha: true
+  kg_supply_mode: qpeg_v1
+  question_kg_records_path: data/derived/qpeg_v1_n1350_seed42/question_graph_records.jsonl
+  seeds: [42]

@@ -55,6 +55,17 @@ def parse_args():
                         "2026-08-23; +0.78 was reverse-engineered to make b_eff a "
                         "round -1.0 and the mechanism it claims allows at most "
                         "+0.363). Pass 0.78 to reproduce pre-2026-08-23 runs.")
+    p.add_argument("--kg_supply_mode", default=argparse.SUPPRESS,
+                   choices=["legacy", "qpeg_v1", "proofkg_v1", "legacy_plus_proofkg", "legacy_plus_complete_proofkg"],
+                   help="KG supply for inference. Default follows the eval config's "
+                        "eval.kg_supply_mode (legacy). 'proofkg_v1' reads a versioned "
+                        "per-question ProofKG record via --question_kg_records_path; "
+                        "'qpeg_v1' reads versioned passage-derived QPEG records; "
+                        "'legacy_plus_proofkg' / 'legacy_plus_complete_proofkg' augment "
+                        "legacy with selective trusted ProofKG edges (fail-closed).")
+    p.add_argument("--question_kg_records_path", default=argparse.SUPPRESS,
+                   help="Path to question_kg_records.jsonl (required when "
+                        "--kg_supply_mode=proofkg_v1).")
     return p.parse_args()
 
 
@@ -93,14 +104,21 @@ def _load_yaml_overrides(config_path: Optional[str]) -> Tuple[Dict[str, Any], st
     module = pipeline_cfg.get("module", DEFAULT_PIPELINE[0])
     cls = pipeline_cfg.get("class", DEFAULT_PIPELINE[1])
     record_alpha = bool(eval_cfg.get("use_real_alpha", True))
-    return doc.get("retrieval") or {}, module, cls, record_alpha
+    kg_supply_mode = eval_cfg.get("kg_supply_mode", "legacy")
+    question_kg_records_path = eval_cfg.get("question_kg_records_path")
+    return doc.get("retrieval") or {}, module, cls, record_alpha, kg_supply_mode, question_kg_records_path
 
 
 def main():
     args = parse_args()
     save_root = Path(args.save_root) if args.save_root else Path(output_dir()) / "kg_proweight"
     paths = _resolve_paths(args)
-    retrieval_overrides, pipeline_module, pipeline_class, record_alpha = _load_yaml_overrides(args.config)
+    retrieval_overrides, pipeline_module, pipeline_class, record_alpha, yaml_kg_supply_mode, yaml_qkg_records_path = _load_yaml_overrides(args.config)
+    # CLI explicitly-passes override the YAML eval config; otherwise fall back to
+    # the eval config value (so a materialised ProofKG-v1 template config runs
+    # without needing --kg_supply_mode on the command line).
+    kg_supply_mode = getattr(args, "kg_supply_mode", yaml_kg_supply_mode)
+    question_kg_records_path = getattr(args, "question_kg_records_path", yaml_qkg_records_path)
 
     # R9 v6 fix: two-stage reranking was silently disabled — the config's
     # ``rerank_topk`` (10) never reached the pipeline because ``--rerank``
@@ -140,6 +158,8 @@ def main():
                 "kg_cache_dir": args.kg_cache_dir,
                 "record_alpha": record_alpha,
                 "alpha_bias_correction": args.alpha_bias_correction,
+                "kg_supply_mode": kg_supply_mode,
+                "question_kg_records_path": question_kg_records_path,
             }
             if args.no_kg:
                 pipeline_kwargs["inject_kg"] = False

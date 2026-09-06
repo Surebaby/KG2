@@ -12,4 +12,8 @@ eval:
   save_intermediate_data: true
   metrics: [em, f1]
   use_real_alpha: true
+  # Inference KG supply. "legacy" is the canonical default (question-KG index);
+  # "proofkg_v1" requires question_kg_records_path (set via the ProofKG-v1
+  # template / CLI, not here).
+  kg_supply_mode: legacy
   seeds: [13, 42, 2024]

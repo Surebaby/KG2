@@ -1,0 +1,6 @@
+includes:
+  - phase3_sft.yaml
+
+training:
+  silver_path: checkpoints/prm_alpha_gate_legacy_repaired_v2_quota70_hard_seed42_no_text_head/silver_with_logprobs.jsonl
+  output_dir: checkpoints/sft_legacy_repaired_v2_quota70_hard_seed42_no_text_head

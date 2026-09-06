@@ -1,0 +1,9 @@
+includes:
+  - kg_proweight.yaml
+
+# ProofKG-v1 inference-supply template. NOT runnable until the versioned
+# question_kg_records.jsonl below is materialised and bound (replace the
+# placeholder path + record the file SHA256 in a lock/manifest).
+eval:
+  kg_supply_mode: proofkg_v1
+  question_kg_records_path: data/derived/inference_proofkg_v1/question_kg_records.jsonl

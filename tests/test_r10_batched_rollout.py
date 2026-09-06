@@ -39,7 +39,10 @@ class _StubTokenizer:
         self.pad_token = "<pad>"
 
     def __call__(self, text, return_tensors=None, truncation=False,
-                 max_length=None, padding=False):
+                 max_length=None, padding=False, add_special_tokens=True):
+        # The real chat-template path explicitly disables a second BOS token.
+        # This character stub has no special tokens, but accepts the same API.
+        del add_special_tokens
         texts = [text] if isinstance(text, str) else list(text)
         # Token id must depend on the PROMPT, not on its position in the batch:
         # keying off the enumerate index made the same prompt tokenise

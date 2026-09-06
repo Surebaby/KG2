@@ -29,8 +29,9 @@ training:
   # trajectories, so any fold set here is trained on. If SFT uses the whole file
   # while Phase 2 holds back a test fold, the PRM's held-out fold has already
   # been memorised by the policy it is meant to score.
-  # Left null to reproduce the pre-split runs; set to `train` for the split runs.
-  split: null
+  # Formal runs use `train`. Historical whole-file reproduction requires both
+  # `split: null` and the explicit CLI flag --split_allow_none.
+  split: train
   val_ratio: 0.10
   test_ratio: 0.10
   split_seed: 42

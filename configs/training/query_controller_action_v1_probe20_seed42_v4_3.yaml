@@ -1,0 +1,97 @@
+experiment:
+  id: QUERY-CONTROLLER-ACTION-V1-PROBE20-SEED42-V4-3
+  status: READY_FROZEN_V4_3_PROBE_ONLY
+  phase: dedicated_query_controller_sft_probe
+  primary_variable: observation_conditioned_single_query_action
+  note: This probe is not a QA SFT, planner continuation, or KG-routing experiment.
+
+data:
+  schema_version: query-controller-action-v1
+  train_path: data/silver_data/query_controller_actions_v1_seed42_v4_3/train.jsonl
+  dev_path: data/silver_data/query_controller_actions_v1_seed42_v4_3/dev.jsonl
+  allowed_source_actions: [text]
+  require_all_records_selected: false
+  quotas:
+    train:
+      2wikimultihopqa: {q1: 32, q2_dynamic: 32}
+      musique: {q1: 32, q2_dynamic: 32}
+    dev:
+      2wikimultihopqa: {q1: 16, q2_dynamic: 16}
+      musique: {q1: 16, q2_dynamic: 16}
+
+# Fail closed until the append-only v4.3 protocol and release are frozen.
+# The v4.2 config and its FAIL_STOP run remain immutable historical evidence.
+asset_lock:
+  protocol_path: outputs/audits/query_controller_v1_exact_text_pilot_seed42_protocol_v4_3/protocol.json
+  protocol_report_path: outputs/audits/query_controller_v1_exact_text_pilot_seed42_protocol_v4_3/report.json
+  protocol_manifest_path: outputs/audits/query_controller_v1_exact_text_pilot_seed42_protocol_v4_3/manifest.json
+  release_report_path: data/silver_data/query_controller_actions_v1_seed42_v4_3/report.json
+  release_manifest_path: data/silver_data/query_controller_actions_v1_seed42_v4_3/manifest.json
+  expected_identity:
+    protocol_schema_version: query-controller-v1-pilot-protocol-4.3
+    protocol_report_schema_version: query-controller-v1-pilot-freeze-report-4.3
+    protocol_manifest_schema_version: query-controller-v1-pilot-manifest-4.3
+    protocol_status: FROZEN_V4_3_CLEAN_SINGLE_ADAPTER_RELOAD_SAME_IDENTITIES_2DATASET_ACTIONS_NOT_TRAINED
+    protocol_experiment_id: QUERY-CONTROLLER-V1-EXACT-TEXT-PILOT-SEED42-PROTOCOL-V4_3
+    release_schema_version: query-controller-action-release-v4.3-pair-locked-same-identities
+    release_status: COMPLETE_V4_3_PAIR_LOCKED_SAME_IDENTITIES_NOT_TRAINED
+    release_experiment_id: QUERY-CONTROLLER-ACTION-V1-SEED42-V4-3
+  expected_sha256:
+    protocol: 8ba09daae131c3a2a2860bbc7f28dfb4e71fb46bc03585921a47e0c4aa92a998
+    protocol_report: ad4ed02d40081164d9ea4e15619c604af29b9ae71993e4d31acbdb98f106e19c
+    protocol_manifest: f144e57cb4ff3a2f922e41af75fe6fe4c549f44bf6406a396d3519679debd3d7
+    train: 2ded8b3a8bd9fa42eba657307e8cdf816297d58542f2abba0c8014b9b93789ca
+    dev: 86b405599d845b2b35a5e1e3e9557fce9bd19a85530db7ebc67d96050e59ad19
+    release_report: 2edc3a89f418287d5bf94efbd93bef0b2fc5831dcaa1842a111e328e26e9960a
+    release_manifest: 78e96048fbed87d96322b2333008199a7c72d819e7190e264fca7b760d22483d
+
+model:
+  base_model: llama3-8B-instruct
+  initialization: base_instruct
+  init_adapter_path: null
+  method: qlora
+  load_in_4bit: true
+  dtype: bf16
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: [q_proj, k_proj, v_proj, o_proj]
+
+training:
+  seed: 42
+  max_seq_length: 1024
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.05
+  lr_scheduler_type: cosine
+  num_train_epochs: 1
+  max_steps: 20
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  logging_steps: 1
+  eval_strategy: "no"
+  eval_steps: 20
+  save_strategy: "no"
+  save_steps: 20
+  save_total_limit: 1
+  verify_saved_adapter_reload: true
+  output_dir: outputs/probes/query_controller_action_v1_probe20_seed42_v4_3
+
+logging:
+  report_to: [tensorboard]
+  logging_dir: outputs/probes/query_controller_action_v1_probe20_seed42_v4_3/tensorboard
+
+guardrails:
+  assistant_only_ce: true
+  target_truncation: forbidden
+  exact_json_target: true
+  final_answer_supervision: forbidden
+  source_action_text_only: true
+  confirmation_data: forbidden
+  existing_output_reuse: forbidden
+  gpu_launch_requires_human_approval: true
+  formal_pilot_config: configs/training/query_controller_action_v1_pilot_seed42.yaml
+  formal_pilot_output_dir: checkpoints/query_controller_action_v1_pilot_seed42
+  formal_pilot_must_be_created_and_frozen_separately: true
